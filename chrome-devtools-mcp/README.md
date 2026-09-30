@@ -1,24 +1,24 @@
 # @local/chrome-devtools-mcp
 
-A **configuration-only dsh bundle** that connects the
-[`chrome-devtools-mcp`](https://www.npmjs.com/package/chrome-devtools-mcp) server to this
-Harness profile through the shipped `@deepseek-ai/dsh-mcp-client` bridge.
+一个**纯配置型 dsh 组合包**：通过官方自带的 `@deepseek-ai/dsh-mcp-client` 桥接，把
+[`chrome-devtools-mcp`](https://www.npmjs.com/package/chrome-devtools-mcp) 服务器接进当前
+Harness profile。
 
-It exists so the MCP connection is a managed bundle (installed / enabled / removed from the
-**Plugins** page) instead of a hand-written row in the profile's `cordis.patch.yml`.
+它存在的意义，是让这条 MCP 连接变成一个**受管理的组合包**（在 **Plugins** 页面里安装、
+启用、卸载），而不是 profile 的 `cordis.patch.yml` 里手写的一行。
 
-## Files
+## 文件
 
-| File | Role |
+| 文件 | 作用 |
 |---|---|
-| `package.json` | Bundle manifest; `dsh.bundle.patch` points at the patch below |
-| `cordis.patch.yml` | Inserts one `dsh-mcp-client` row (`serverName: chrome-devtools`) |
-| `locale/{en,zh}.json` | Title and description shown on the Plugins card |
-| `icon.svg` | Card artwork |
+| `package.json` | 组合包清单；`dsh.bundle.patch` 指向下面的 patch |
+| `cordis.patch.yml` | 插入一行 `dsh-mcp-client`（`serverName: chrome-devtools`） |
+| `locale/{en,zh}.json` | Plugins 卡片上的标题与描述 |
+| `icon.svg` | 卡片图标 |
 
-There is no `index.js`: the bundle carries configuration only, so it has no Host code.
+**没有 `index.js`**：本包只承载配置，没有宿主代码。
 
-## How it connects
+## 它是怎么连的
 
 ```yaml
 serverName: chrome-devtools
@@ -27,21 +27,20 @@ command: npx
 args: ['-y', 'chrome-devtools-mcp@latest', '--autoConnect', '--no-usage-statistics', '--no-performance-crux']
 ```
 
-`npx` is resolved from the host `PATH`, so this needs node/npm installed and npm registry
-access on first run. The package is cached under `~/.npm/_npx/`, so later starts reuse it.
-Tools appear to the model as `mcp__chrome-devtools__<tool>`.
+`npx` 从宿主 `PATH` 解析，所以需要装好 node/npm，且首次运行要能访问 npm 源。包会缓存
+在 `~/.npm/_npx/`，之后启动直接复用。工具对模型呈现为 `mcp__chrome-devtools__<tool>`。
 
-## Install / remove
+## 安装 / 卸载
 
-Install through the Plugins page, or with the `plugin_manager` tool:
+在 Plugins 页面安装，或用 `plugin_manager` 工具：
 
-- install: `action: install_bundle`, `target: <absolute path of this directory>`
-- remove: `action: remove_bundle`, `target: @local/chrome-devtools-mcp`
+- 安装：`action: install_bundle`，`target: <本目录的绝对路径>`
+- 卸载：`action: remove_bundle`，`target: @local/chrome-devtools-mcp`
 
-**Keep this directory in place.** `install_bundle` links the profile to this path rather than
-copying it, so moving or deleting the directory breaks the bundle.
+**保持本目录在原位。** `install_bundle` 是把 profile 链接到这个路径、而不是复制，所以
+移动或删除目录会让组合包失效。
 
-## Changing the settings
+## 改配置
 
-Edit `cordis.patch.yml` here, then toggle the bundle off/on (or restart Harness) to
-recompose. The file lives outside the profile, so it is not watched by HMR.
+编辑这里的 `cordis.patch.yml`，然后把组合包关掉再打开（或重启 Harness）以重新组合。
+该文件在 profile 之外，不受 HMR 监视。

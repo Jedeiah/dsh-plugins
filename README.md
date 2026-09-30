@@ -1,6 +1,6 @@
 # dsh 插件集
 
-自用的 **dsh 组合包（bundle）** 集合，每个插件一个顶层目录。
+**dsh 组合包（bundle）** 的集合，每个插件一个顶层目录。
 
 每个目录都是一个**独立、可单独安装**的组合包：`package.json` 里声明 `dsh.bundle.patch`，patch 文件插入该插件的行；带界面/交互的插件再声明 `dsh.client` 提供客户端半边。
 
@@ -43,3 +43,7 @@
 ## 已知的 dsh 侧问题
 
 - **停用一行带客户端半边的插件后再启用，客户端半边不会重新挂载**，需要重启 App 才能恢复（表现为该行的界面/配置页消失，内置插件面板报 `loaded without registering ... via __ModuleLoader__.load`）。已上报：[deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)。在修好之前：**别用行开关去临时静音**，改用插件自己的配置（例如把音量调 0）。
+
+## 许可
+
+[MIT](LICENSE)，与 dsh 本身一致。
