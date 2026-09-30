@@ -1,0 +1,8 @@
+# Turn Notifier — chimes when the agent finishes a turn or is waiting for you.
+#
+# The row mounts the package's Host half (a no-op); the behavior lives in the
+# Client half declared by `dsh.client` in package.json.
+
+- insert:
+    - id: turn-notifier
+      name: '@local/turn-notifier'

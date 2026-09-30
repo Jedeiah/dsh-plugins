@@ -1,0 +1,23 @@
+# Chrome DevTools MCP — provided by the local bundle @local/chrome-devtools-mcp.
+#
+# This row was moved out of the profile's `cordis.patch.yml` so the server can be
+# managed from the Plugins page instead of by hand. It inserts the shipped
+# `@deepseek-ai/dsh-mcp-client` bridge, which spawns chrome-devtools-mcp over
+# stdio and registers its tools as `mcp__chrome-devtools__<tool>`.
+#
+# `chrome-devtools-mcp` is resolved by `npx` on the host PATH and cached under
+# ~/.npm/_npx, so the host needs node/npm and registry access on first run.
+
+- insert:
+    - id: chrome-devtools-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: chrome-devtools
+        transport: stdio
+        command: npx
+        args:
+          - '-y'
+          - 'chrome-devtools-mcp@latest'
+          - '--autoConnect'
+          - '--no-usage-statistics'
+          - '--no-performance-crux'

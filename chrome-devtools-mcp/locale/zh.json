@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome DevTools MCP",
+    "description": "接入 chrome-devtools-mcp 服务，为模型提供浏览器调试工具：页面管理、快照、截图、DOM/JS 求值、控制台、网络请求与性能分析。"
+  }
+}

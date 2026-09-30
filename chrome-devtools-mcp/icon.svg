@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="Chrome DevTools MCP">
+  <rect x="4" y="7" width="40" height="34" rx="6" fill="none" stroke="#4C8DFF" stroke-width="3"/>
+  <line x1="4" y1="17" x2="44" y2="17" stroke="#4C8DFF" stroke-width="3"/>
+  <circle cx="11" cy="12" r="1.8" fill="#4C8DFF"/>
+  <circle cx="17" cy="12" r="1.8" fill="#4C8DFF"/>
+  <circle cx="23" cy="12" r="1.8" fill="#4C8DFF"/>
+  <path d="M20 22.5 L20 35.5 L24.2 31.6 L27.1 37.4 L29.8 36.1 L26.9 30.4 L32.4 30.0 Z"
+        fill="#4C8DFF" stroke="#4C8DFF" stroke-width="1.2" stroke-linejoin="round"/>
+</svg>

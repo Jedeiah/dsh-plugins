@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome DevTools MCP",
+    "description": "Connects the chrome-devtools-mcp server, giving the model browser debugging tools: pages, snapshots, screenshots, DOM/JS evaluation, console, network, and performance traces."
+  }
+}
