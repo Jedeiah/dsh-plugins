@@ -97,10 +97,7 @@ const en = {
   unavailable: 'The notifier row is switched off, so there is nothing to configure right now.',
   saveFailed: 'The deployment did not accept that value; it was left for you to correct.',
   saving: 'Loading settings…',
-  openSettings: 'Turn notifier settings',
-  pageIntro: 'The same settings the composer bell opens: three groups, volume, chimes and repeat count. Changes apply immediately.',
-  dialogTitle: 'Turn notifier',
-  close: 'Close',
+  pageIntro: 'Three groups, volume, chimes and repeat count. Changes apply immediately. To go quiet use Mute — do not switch the plugin row off.',
   groupWhen: 'When it rings',
   groupHow: 'How it rings',
   groupRepeat: 'Repeats and stopping',
@@ -110,13 +107,6 @@ const en = {
   waitingLabel: 'It stops to wait for you (approval or question)',
   preview: 'Preview',
   stopHint: 'Any pointer or key activity stops the repeats immediately.',
-  done: 'Done',
-  restoreAll: 'Restore all defaults',
-  statusPrefix: 'Now: ',
-  statusIdle: 'idle',
-  statusRunning: 'running',
-  statusWaiting: 'waiting for you',
-  statusMuted: 'muted',
   unavailable: 'The notifier row is switched off, so there is nothing to configure right now.',
 };
 
@@ -145,9 +135,7 @@ const zh = {
   saveFailed: '本部署没有接受这个值，已保留供你修改。',
   saving: '正在读取设置…',
   openSettings: '回合提醒设置',
-  pageIntro: '和输入框旁的铃铛是同一套设置：三组开关、音量、音调与重复次数，改完立即生效。',
-  dialogTitle: '回合提醒',
-  close: '关闭',
+  pageIntro: '三组开关、音量、音调与重复次数，改完立即生效。临时安静请用「静音」，不要停用插件行。',
   groupWhen: '什么时候响',
   groupHow: '怎么响',
   groupRepeat: '重复与停止',
@@ -157,8 +145,6 @@ const zh = {
   waitingLabel: '停下来等你操作（审批 / 提问）',
   preview: '试听',
   stopHint: '鼠标或键盘一动，正在重复的提醒立即停止。',
-  done: '完成',
-  restoreAll: '全部恢复默认',
   statusPrefix: '当前：',
   statusIdle: '空闲',
   statusRunning: '正在跑',
@@ -690,28 +676,38 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    /** The dock dialog: the shared body inside the shell's Modal. */
-    function TurnNotifierDialog(props) {
-      const { t, store, audio, running, pending, open, onClose } = props;
-      if (open !== true) return null;
-      return h(primitives.Modal, {
-        open: true,
-        onClose,
-        closeLabel: t('close'),
-        title: t('dialogTitle'),
-        footer: h(React.Fragment, null, [
-          h(primitives.Button, {
-            key: 'restore',
-            variant: 'outline',
-            onClick: () => {
-              for (const field of ['repeatCount', 'intervalMs', 'volume', 'waveform', 'finishedPattern', 'interactionPattern']) store.reset(field);
-            },
-            children: t('restoreAll'),
-          }),
-          h(primitives.Button, { key: 'done', variant: 'primary', onClick: onClose, children: t('done') }),
-        ]),
-        children: h(TurnNotifierGroups, { t, store, audio, running, pending, showStatus: true }),
-      });
+    /**
+     * The row's configuration page on the Plugins page, the same body the dialog
+     * shows. The owner hands the page its form as `{ state, mutate }`; the
+     * adapter below narrows that to the store shape the body already consumes, so
+     * one form backs the dock dialog, this page and the bundle card at once.
+     */
+    function TurnNotifierRowConfig(props) {
+      const { t, view, form, audio } = props;
+      if (view === 'summary') return t('summary');
+      if (form?.state === undefined) return null;
+      if (form.state.status === 'loading') return h('div', { role: 'status' }, t('saving'));
+      if (form.state.status !== 'ready') return h('div', { style: STYLE.notice }, t('unavailable'));
+      // One stable bridge for the whole page: the owner hands a fresh `{state,
+      // mutate}` object every render, so an adapter created per render would give
+      // `useStoreValue` a new dependency each time and spin in a setState loop.
+      // The bridge's identity never changes; the page's explicit `snapshot` is
+      // what makes a new revision visible, and the owner re-renders on changes.
+      rowBridge.current = form;
+      return h('div', { key: 'page' }, [
+        form.state.writable === true ? null : h('div', { key: 'readonly', style: STYLE.notice }, t('readOnly')),
+        h('p', { key: 'intro', style: { margin: '0 0 12px', opacity: 0.75, lineHeight: 1.6 } }, t('pageIntro')),
+        h(TurnNotifierGroups, {
+          key: 'groups',
+          t,
+          store: ROW_STORE,
+          snapshot: project(form.state),
+          audio,
+          running: undefined,
+          pending: undefined,
+          showStatus: false,
+        }),
+      ]);
     }
 
     /**
@@ -749,7 +745,7 @@ window.__ModuleLoader__.load({
     }
 
     /** The dock bell: opens the settings dialog and reflects muted state. */
-    function createDockEntry(store, audio) {
+    function createNotifier(store, audio) {
       return function TurnNotifierDock(props) {
         const { t, sessionId, useSessionStatus } = props;
         const settings = useStoreValue(store);
@@ -786,7 +782,7 @@ window.__ModuleLoader__.load({
               opacity: settings.muted ? 0.35 : 0.75,
             },
           }, h(primitives.IconAlarmClockOutlineRegular, { size: 16 }))),
-          h(TurnNotifierDialog, {
+          h(TurnNotifierGroups, {
             key: 'dialog',
             t,
             store,
@@ -826,10 +822,6 @@ window.__ModuleLoader__.load({
             for (const type of UNLOCK_EVENTS) window.removeEventListener(type, unlock);
           };
         }, 'turn-notifier: audio unlock');
-
-        ctx.slots.inject(SLOT_NAME, () =>
-          ctx.slots.register({ name: SLOT_NAME, id: ENTRY_ID, order: 90 }, createDockEntry(store, audio)),
-        );
 
         // The chime behavior stays its own invisible entry: it needs the session
         // status hook only and must keep observing while the dialog is closed.

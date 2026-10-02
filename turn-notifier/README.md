@@ -40,23 +40,10 @@
 | `finishedPattern` | `880:170, 1318.5:300` | — | "答完"的音调 |
 | `interactionPattern` | `1046.5:140, 1318.5:140, 1046.5:200` | — | "需要你操作"的音调 |
 
-### 在组件里改（推荐，1.6.0 起）
+### 在 Plugins 页改（推荐）
 
-**改了本插件的客户端半边（`client.js`）之后，必须完全退出并重开 App**：宿主在启动时把 bundle 字节快照进内存，并按 `mtime/ctime/size` 生成带 `rev` 的资源 URL，响应头又是 `immutable` 一年缓存——只重载页面拿到的仍是启动时那一份。判定方法：插件卡片上的版本号（现在是 **1.6.0**）+ 输入框右侧是否出现铃铛。
+**改了本插件的客户端半边（`client.js`）之后，必须完全退出并重开 App**：宿主在启动时把 bundle 字节快照进内存，并按 `mtime/ctime/size` 生成带 `rev` 的资源 URL，响应头又是 `immutable` 一年缓存——只重载页面拿到的仍是启动时那一份。判定方法：插件卡片上的版本号（现在是 **1.6.3**）。
 
-
-输入框右侧有一个**小闹钟图标**（静音时变淡）——点它开设置对话框：
-
-```
-回合提醒              现在：等待你操作
-── 什么时候响 ──  答完一轮 ✓ / 停下来等你 ✓ / 静音
-── 怎么响 ────   音量滑杆 · 波形 · 两条音调（各带「试听」）
-── 重复与停止 ──  响几声 · 间隔几秒 · 一动鼠标键盘就停
-```
-
-- 输入框旁的对话框、Plugins 页卡片里的配置区、以及卡片中可点开的那一行，三处**共用同一个组件与同一份表单**（`ctx.configForms.get('turn-notifier')`），不可能出现三套界面或两套值；
-- 「试听」按当前音量与波形当场播放，音调写错格式会**当场标红**并禁用试听；
-- 「全部恢复默认」清掉所有用户覆盖值（静音除外）。
 
 ### 在界面里改（Plugins 页卡片）
 
@@ -95,7 +82,7 @@
 | `package.json` | 组合包清单：`dsh.bundle.patch` 与 `dsh.client` 声明 |
 | `cordis.patch.yml` | 插入 `turn-notifier` 那一行 |
 | `index.js` | 宿主半边：`Config` schema（九个可调项，含静音与两个触发场景开关）+ 页面策略 |
-| `client.js` | 客户端模块：状态监听、合成提示音、重复/取消逻辑，以及三处共用一套排版的设置界面 |
+| `client.js` | 客户端模块：状态监听、合成提示音、重复/取消逻辑，以及 Plugins 页上的行配置页 |
 | `locale/{en,zh}.json`、`icon.svg` | 插件卡片的文案与图标 |
 
 ## 为什么 `peerDependencies` 里要写 schemastery
@@ -112,20 +99,19 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 
 ## 工作原理
 
-**三处界面、一套组件、一份表单。**
+**一个设置入口（1.6.3 起）。**
 
 | 入口 | 槽位 | 说明 |
 |---|---|---|
-| 输入框旁的铃铛 → 对话框 | `conversation.composer.dock` | 有状态行、试听与静音，随手可开 |
 | Plugins 页卡片里可点开的行（右侧 `›`） | `plugins.row.config`（key = `<包名>#<行 id>`） | 与 session-purge 同构；按 `whileServed(['turn-notifier'])` 注册，宿主不提供该设置命名空间时整页不出现 |
 
 **不再有"卡片配置区"。** 1.6.0 曾在 `plugins.bundle.config` 另放一份，导致同一个卡片里出现"配置区 + 组件行页"两份入口（1.6.1 已删）。现在两处入口渲染的都是 `TurnNotifierGroups`（三组：什么时候响 / 怎么响 / 重复与停止），读写同一个 `ctx.configForms.get('turn-notifier')`，不存在两套界面或两套值。
 
-**关于"停用/启用后 `›` 消失"**：`session-purge` 在同样操作下能保住行页，差异在**激活面**——它把 `configForms` 当**可选**服务（`ctx.get('configForms')` + `whileServed` 守卫），而本插件原先把它写进模块级 `inject`。写进 `inject` 意味着"服务不齐就不激活"：行在停用→启用的重建窗口里如果等不到它，插件就停在未激活状态，`apply` 不再执行，行页与铃铛一起消失（deepseek-harness#8452 的同一族现象）。1.6.2 起本插件与 `session-purge` 同形：`inject` 只留 `slots`/`locale`，`configForms` 缺失时退化为按 schema 默认值只读（铃铛与响铃照常），行页只在宿主确实提供该命名空间时注册。
+**关于"停用/启用后 `›` 消失"**：`session-purge` 在同样操作下能保住行页，本插件不能——**确切机制仍在取证中**（有一个独立排查任务在用浏览器自动化复现，目标是给出 `arrive()` 早退 / 备用 URL / 批构成三者的定论）。已确认的事实：行页只由客户端半边注册，宿主侧没有兜底页；runner 在停用时确实会 dispose 插件实例并 `invalidate` 模块，所以理论上支持重新挂载。临时办法是**重载界面（⌘R）**。
 
 若仍然出现 `›` 消失，**重载界面（⌘R）**即可恢复；想临时安静请用设置里的静音开关，不要动行开关。行配置页由宿主在每次渲染时新给一个 `{ state, mutate }`，插件侧用一个**身份稳定**的桥接对象 + 显式快照把新 revision 传进去——适配器若每次渲染都新建，`useStoreValue` 的依赖会不停变化并陷入 setState 循环。
 
-**响铃行为是另一个隐形条目**（同一槽位、id `turn-notifier-alert`）：它只订阅 `useSessionStatus`，与铃铛/对话框互不影响。
+**响铃行为是独立的隐形条目**（同一槽位、id `turn-notifier-alert`，渲染 `null`）：它只订阅 `useSessionStatus`，与设置页互不影响。
 
 **想安静请用静音开关，不要停用行。** 停用再启用带客户端半边的插件行之后，浏览器半边不会被重新挂载（dsh 的已知问题 deepseek-harness#8452：模块表认为包已加载、不再执行它的 `apply`），界面与配置页会一直缺席，直到**重载界面（⌘R）**——为此本插件提供 `muted`，行开关留给真正想移除插件时用。
 
@@ -146,7 +132,7 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 | 逻辑 | 开发期曾用测试台覆盖过 **52 项断言**（状态跳变、会话切换不误报、**会话暂时从状态表消失不误报**、重复与取消、配置驱动行为、波形/音调配置生效、音调校验拒绝非法值、配置页结构与 key、写库时机、卸载清理）。按当时的验证约定，该测试台**已删除**，不再随包提供 |
 | 语法与清单 | `node --check`、JSON 解析、patch YAML 解析 |
 | 已安装后的实时槽位 | 客户端 `Slots.listSubTree`：root `conversation.composer.dock` 应有 `turn-notifier` 与 `turn-notifier-alert`；root `plugins.row.config` 应有 key `@jedeiah/turn-notifier#turn-notifier`（不再有 `plugins.bundle.config` 条目） |
-| 1.6.0 的界面 | 开发期临时探针（不随包提供）：物化客户端模块 → `apply` → 渲染三处入口，断言三组标题、复选框/滑杆/下拉/试听/静音/恢复默认齐备，勾选经 `store.write`（对话框）与 `form.mutate`（行页，带 revision）落地，用到的 `@deepseek-ai/dsh-client-ui-primitives` 名字逐一存在于安装导出表，字典键中英齐全无冗余 |
+| 行配置页 | 开发期临时探针（不随包提供）：物化客户端模块 → `apply` → 渲染行页，断言三组标题、复选框/滑杆/下拉/试听/静音/恢复默认齐备、写入经 `form.mutate` 带 revision 落地、用到的 `@deepseek-ai/dsh-client-ui-primitives` 名字存在于安装导出表、字典键中英齐全无冗余 |
 | 配置 schema | 宿主 `Config.listConfigs`（name = `@jedeiah/turn-notifier`）：状态应为 `schema`（= fiber 存活且 Config 是原生 schemastery schema），并列出全部字段 |
 
 **无法自动验证、需要你亲测的两件事：**
@@ -161,6 +147,6 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 ## 已知限制
 
 - **开发期测试台已按约定删除。** 它模拟过 React 与 DOM，违反了当时"禁止模拟 React/DOM"的约定；最后一轮代码审核中它抓到了一个真 bug（会话暂时离开状态表会误报"回合结束"），确认修复后即移除，包内不再包含测试代码。
-- 对话框里的文本框是**失焦/回车**提交，不是官方那套"暂存 + 保存/放弃"模型；数字、开关与下拉是即时提交。
+- 文本框是**失焦/回车**提交，不是官方那套"暂存 + 保存/放弃"模型；数字、开关与下拉是即时提交。
 - 界面原语（`Modal` / `Button` / `Tooltip` / 图标）通过 loader 的 `require` 解析 `@deepseek-ai/dsh-client-ui-primitives`——官方把它当作"隐式 baseline external"，**不要在依赖里再声明或打包副本**（见 `dsh-client-ui-workspace/README.zh.md` 的 lane 说明）。
 - 状态跳变的判定依赖 `useSessionStatus` 给的 `running` / `pendingInteraction`；如果槽位不提供这个 hook，插件**降级为不响**而不是崩溃。
