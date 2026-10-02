@@ -149,7 +149,7 @@ try {
 |---|---|
 | `web_fetch https://example.com/` | **HTTP 200** ✅ |
 | `web_fetch https://api.github.com/repos/deepseek-ai/deepseek-harness` | **HTTP 200** ✅ —— 当初报告里**必被拒**的那条 URL |
-| `web_fetch http://127.0.0.1:19387/` | **仍被拒** ✅ `resolves to a non-public IP address` |
+| `web_fetch http://127.0.0.1:8080/` | **仍被拒** ✅ `resolves to a non-public IP address` |
 | 同一时刻 `nslookup example.com` | `198.18.0.79` —— 代理 fake-ip **确实开着** ✅ |
 
 即"开着代理能抓公网"与"内网仍被挡住"**同时成立**。
