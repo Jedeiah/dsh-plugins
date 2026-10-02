@@ -4,8 +4,8 @@
  * Two contributions, both mounted on this bundle's single row:
  *   1. an invisible entry in `conversation.composer.dock` that rings when the
  *      viewed session finished a turn or is waiting for the user;
- *   2. the bundle's configuration page in `plugins.bundle.config`, keyed by this
- *      bundle's package name.
+ *   2. the row's configuration page in `plugins.row.config`, keyed
+ *      `<package>#<row id>`, so the row in the Plugins card opens the settings.
  *
  * Sharing one row is deliberate: a browser half is mounted on the row whose
  * specifier is exactly this package name, so both live and die with the row.
@@ -733,6 +733,7 @@ window.__ModuleLoader__.load({
       // what makes a new revision visible, and the owner re-renders on changes.
       rowBridge.current = form;
       return h('div', { key: 'page' }, [
+        form.state.writable === true ? null : h('div', { key: 'readonly', style: STYLE.notice }, t('readOnly')),
         h('p', { key: 'intro', style: { margin: '0 0 12px', opacity: 0.75, lineHeight: 1.6 } }, t('pageIntro')),
         h(TurnNotifierGroups, {
           key: 'groups',
@@ -799,29 +800,6 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /**
-     * The bundle card's own page on the Plugins page. It shows exactly the body
-     * the dock dialog and the row's configuration page show, fed by the same
-     * settings store, so all three surfaces are one form with one layout.
-     */
-    function TurnNotifierSettings(props) {
-      const { t, view, settingsStore, audio } = props;
-      if (view === 'summary') return t('summary');
-      if (settingsStore === undefined) return h('div', { style: STYLE.notice }, t('unavailable'));
-      const state = settingsStore.getSnapshot();
-      if (state.status === 'unavailable' || state.writable !== true) {
-        return h('div', { style: STYLE.notice }, state.status === 'unavailable' ? t('unavailable') : t('readOnly'));
-      }
-      return h(TurnNotifierGroups, {
-        t,
-        store: settingsStore,
-        audio: audio ?? createAudio(),
-        running: undefined,
-        pending: undefined,
-        showStatus: false,
-      });
-    }
-
     return {
       inject: ['slots', 'locale', 'configForms'],
       apply(ctx) {
@@ -863,13 +841,6 @@ window.__ModuleLoader__.load({
           locale: LOCALE_NS,
           inject: () => ({ audio }),
         }, TurnNotifierRowConfig))), 'turn-notifier: row configuration page');
-
-        ctx.effect(() => ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
-          name: 'plugins.bundle.config',
-          key: BUNDLE_NAME,
-          locale: LOCALE_NS,
-          inject: () => ({ settingsStore: store, audio }),
-        }, TurnNotifierSettings)), 'turn-notifier: settings page');
 
       },
     };

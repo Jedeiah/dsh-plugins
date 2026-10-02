@@ -60,7 +60,7 @@
 
 ### 在界面里改（Plugins 页卡片）
 
-打开 **Plugins（插件）页 → 展开本插件卡片**：配置区就是同一套三组排版；卡片里那一行 `turn-notifier` 也可点开（键 `@jedeiah/turn-notifier#turn-notifier`），打开的是同一个页面。
+打开 **Plugins（插件）页 → 展开本插件卡片 → 点开 `turn-notifier` 那一行（右侧 `›`）**：同一个三组页面（键 `@jedeiah/turn-notifier#turn-notifier`）。
 
 - 数字框和音调框：**失焦或回车才提交**，边打字边写库不会发生；开关、下拉、滑杆即时提交。
 - 波形下拉框：选完立即生效。
@@ -117,10 +117,11 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 | 入口 | 槽位 | 说明 |
 |---|---|---|
 | 输入框旁的铃铛 → 对话框 | `conversation.composer.dock` | 有状态行、试听与静音，随手可开 |
-| Plugins 页卡片的配置区 | `plugins.bundle.config`（key = 包名） | 与对话框同一组件 |
-| Plugins 页卡片里可点开的行 | `plugins.row.config`（key = `<包名>#<行 id>`） | 与 session-purge 同构；按 `whileServed(['turn-notifier'])` 注册，宿主不提供该设置命名空间时整页不出现 |
+| Plugins 页卡片里可点开的行（右侧 `›`） | `plugins.row.config`（key = `<包名>#<行 id>`） | 与 session-purge 同构；按 `whileServed(['turn-notifier'])` 注册，宿主不提供该设置命名空间时整页不出现 |
 
-三处渲染的都是 `TurnNotifierGroups`（三组：什么时候响 / 怎么响 / 重复与停止），读写同一个 `ctx.configForms.get('turn-notifier')`，所以不存在"两套界面两套值"。行配置页由宿主在每次渲染时新给一个 `{ state, mutate }`，插件侧用一个**身份稳定**的桥接对象 + 显式快照把新 revision 传进去——适配器若每次渲染都新建，`useStoreValue` 的依赖会不停变化并陷入 setState 循环。
+**不再有"卡片配置区"。** 1.6.0 曾在 `plugins.bundle.config` 另放一份，导致同一个卡片里出现"配置区 + 组件行页"两份入口（1.6.1 已删）。现在两处入口渲染的都是 `TurnNotifierGroups`（三组：什么时候响 / 怎么响 / 重复与停止），读写同一个 `ctx.configForms.get('turn-notifier')`，不存在两套界面或两套值。
+
+**停用/启用插件行之后，行右侧的 `›` 会消失** —— 这是 deepseek-harness#8452 的直接表现：客户端半边被卸载后不会重新挂载，`whileServed` 注册的行页随之消失。**重载界面（⌘R）即可恢复**；想临时安静请用设置里的静音开关，不要动行开关。行配置页由宿主在每次渲染时新给一个 `{ state, mutate }`，插件侧用一个**身份稳定**的桥接对象 + 显式快照把新 revision 传进去——适配器若每次渲染都新建，`useStoreValue` 的依赖会不停变化并陷入 setState 循环。
 
 **响铃行为是另一个隐形条目**（同一槽位、id `turn-notifier-alert`）：它只订阅 `useSessionStatus`，与铃铛/对话框互不影响。
 
@@ -142,7 +143,7 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 |---|---|
 | 逻辑 | 开发期曾用测试台覆盖过 **52 项断言**（状态跳变、会话切换不误报、**会话暂时从状态表消失不误报**、重复与取消、配置驱动行为、波形/音调配置生效、音调校验拒绝非法值、配置页结构与 key、写库时机、卸载清理）。按当时的验证约定，该测试台**已删除**，不再随包提供 |
 | 语法与清单 | `node --check`、JSON 解析、patch YAML 解析 |
-| 已安装后的实时槽位 | 客户端 `Slots.listSubTree`：root `conversation.composer.dock` 应有 `turn-notifier` 与 `turn-notifier-alert`；root `plugins.bundle.config` 应有 key `@jedeiah/turn-notifier`；root `plugins.row.config` 应有 key `@jedeiah/turn-notifier#turn-notifier` |
+| 已安装后的实时槽位 | 客户端 `Slots.listSubTree`：root `conversation.composer.dock` 应有 `turn-notifier` 与 `turn-notifier-alert`；root `plugins.row.config` 应有 key `@jedeiah/turn-notifier#turn-notifier`（不再有 `plugins.bundle.config` 条目） |
 | 1.6.0 的界面 | 开发期临时探针（不随包提供）：物化客户端模块 → `apply` → 渲染三处入口，断言三组标题、复选框/滑杆/下拉/试听/静音/恢复默认齐备，勾选经 `store.write`（对话框）与 `form.mutate`（行页，带 revision）落地，用到的 `@deepseek-ai/dsh-client-ui-primitives` 名字逐一存在于安装导出表，字典键中英齐全无冗余 |
 | 配置 schema | 宿主 `Config.listConfigs`（name = `@jedeiah/turn-notifier`）：状态应为 `schema`（= fiber 存活且 Config 是原生 schemastery schema），并列出全部字段 |
 
