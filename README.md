@@ -17,7 +17,30 @@
 
 **方式二（工具）**：`plugin_manager` → `action: install_bundle`，`target: <插件目录绝对路径>`。
 
-> ⚠️ **安装方式是 `link:` 软链，不是复制。** 装完**不要移动或删除插件目录**，否则 bundle 会失效（典型表现：`包元信息错误`、或该行 `failed to import`、或行启用了但功能不出现）。
+**方式三（不用 clone，直接从 GitHub 只装其中一个）**
+
+本仓库是单仓多包。pnpm 支持用 `#path:` 精确到子目录，所以可以直接装任意一个插件：
+
+```bash
+dsh plugin --profile <你的profile> add "git+https://github.com/Jedeiah/dsh-plugins.git#path:turn-notifier"
+
+# 简写形式（github: 是 git URL 的简写）
+dsh plugin --profile <你的profile> add "github:Jedeiah/dsh-plugins#path:turn-notifier"
+```
+
+把 `turn-notifier` 换成 `web-fetch-fakeip` 或 `chrome-devtools-mcp` 就能装别的。要点：
+
+- `#path:` 后面**不要多写斜杠**（写成 `#path:/turn-notifier` 会失败）—— 已在 pnpm 11.22 实测。
+- **私有仓库需要 git 凭据**；要分享给别人，先把仓库设为公开，或改用 tarball（`pnpm pack` 后分发 `.tgz`）。
+- 这种方式会**克隆整个仓库**（不是 sparse checkout），仓库小所以无所谓。
+- 装出来的是 **git 依赖**（不是 `link:`），升级 = 重新 `add` 一次。
+
+> **为什么本仓库的插件能这样装？** 官方《打包与安装插件》警告：git 安装拉的是**源码**、
+> 不会运行构建脚本，所以 TypeScript 包到手时缺 `lib/` 输出、加载会失败。本仓库的插件全是
+> **纯 JS、零构建**（直接写 `index.js` / `client.js`，没有 `src/`、没有 tsdown），因此不受这条
+> 限制。**新增插件时请保持这一点**，否则 `#path:` 这种安装方式会失效。
+
+> ⚠️ 方式一、方式二装出来的是 `link:` 软链，不是复制。**不要移动或删除插件目录**，否则 bundle 会失效（典型表现：`包元信息错误`、或该行 `failed to import`、或行启用了但功能不出现）。
 
 卸载：Plugins 页里 Remove，或 `plugin_manager` → `action: remove_bundle`。
 
