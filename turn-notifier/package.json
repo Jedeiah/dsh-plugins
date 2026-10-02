@@ -3,7 +3,7 @@
   "version": "1.5.1",
   "private": true,
   "type": "module",
-  "description": "Rings a chime when the agent finishes a turn or is waiting for you, repeating every few seconds until you touch the mouse or keyboard.",
+  "description": "回合提醒：智能体答完一轮、或停下来等你操作时响铃；不动鼠标就按设定间隔重复（默认 5 秒 ×3），一动鼠标键盘立刻停。两套音调、波形、音量、次数都能在 Plugins 页面里配置。",
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",

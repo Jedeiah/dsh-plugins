@@ -3,7 +3,7 @@
   "version": "5.0.0",
   "private": true,
   "type": "module",
-  "description": "Reuses the shipped HTTP fetch provider and only adds an address allowance for a local TUN proxy's fake-ip range, so web_fetch keeps working with Clash / Shadowrocket on.",
+  "description": "抓取兼容 fake-ip 代理：复用官方 HTTP 抓取提供方的整条流水线，只额外放行本地 TUN 代理（Clash / Shadowrocket）的 fake-ip 段，让 web_fetch 开着代理时也能正常工作。",
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",

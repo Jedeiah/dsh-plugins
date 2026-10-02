@@ -1,4 +1,6 @@
 {
-  "title": "抓取 · 兼容 fake-ip 代理",
-  "description": "接替内置的 http 抓取提供方，额外放行本地代理（Clash / Shadowrocket TUN）的 fake-ip 段；开了代理也能用 web_fetch。"
+  "meta": {
+    "title": "抓取 · 兼容 fake-ip 代理",
+    "description": "复用官方 HTTP 抓取提供方的整条流水线，只额外放行本地 TUN 代理（Clash / Shadowrocket）的 fake-ip 段；开着代理也能用 web_fetch。"
+  }
 }

@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Connects the Chrome DevTools MCP server (chrome-devtools-mcp over stdio) to this dsh profile.",
+  "description": "把 Chrome DevTools MCP 服务器（chrome-devtools-mcp，stdio 桥接）接进本 dsh profile：原先手写在 profile patch 里的那几行现在由本组合包管理。",
   "icon": "./icon.svg",
   "exports": {
     "./package.json": "./package.json",
