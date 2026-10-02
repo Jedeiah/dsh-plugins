@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Turn Notifier Settings",
+    "description": "The settings page of @jedeiah/turn-notifier: it registers the notifier row's configuration page from a bundle of its own, so switching that row off and on again cannot take the page with it."
+  }
+}

@@ -1,17 +1,19 @@
 /**
  * Client half of the Turn Notifier bundle.
  *
- * Two contributions, both mounted on this bundle's single row:
- *   1. an invisible entry in `conversation.composer.dock` that rings when the
- *      viewed session finished a turn or is waiting for the user;
- *   2. the row's configuration page in `plugins.row.config`, keyed
- *      `<package>#<row id>`, so the row in the Plugins card opens the settings.
+ * One contribution: an invisible entry in `conversation.composer.dock` that
+ * rings when the viewed session finished a turn or is waiting for the user. No
+ * UI, no text — everything the user sees or edits lives elsewhere.
  *
- * Sharing one row is deliberate: a browser half is mounted on the row whose
- * specifier is exactly this package name, so both live and die with the row.
- * Switching the row off turns the whole plugin off; switching it on must bring
- * both back — which is why `dsh.client` must NOT set `immediately`, because
- * removing or replacing a bootstrap entry requires a full page refresh.
+ * The settings page is NOT here: it used to be, mounted on this same row, and
+ * that is exactly why it disappeared. A browser half is mounted on the row whose
+ * specifier is exactly this package name, so switching this row off takes the
+ * half down and switching it back on does not mount it again (known dsh issue
+ * deepseek-harness#8452: the module table reports the bundle as already loaded,
+ * so `apply` never re-runs) — the page died with the row and never came back.
+ * It now lives in the paired bundle `@jedeiah/turn-notifier-settings`, which is
+ * not meant to be switched off and registers the page against *this* row. This
+ * half only has to keep ringing, so it stays as thin as possible.
  *
  * Tunables come from the Host row's `Config` (see ../index.js) through
  * `ctx.configForms`. They are read in the browser, so changing them takes effect
@@ -22,10 +24,8 @@
 
 /** This bundle's package name: the browser module id. */
 const BUNDLE_NAME = '@jedeiah/turn-notifier';
-/** Profile row id; also the Host settings namespace. */
+/** Profile row id; also the Host settings namespace the settings bundle edits. */
 const ENTRY_ID = 'turn-notifier';
-/** Dictionary namespace owned by this plugin. */
-const LOCALE_NS = 'plugin.turnNotifier';
 
 /** Slot this plugin's notification entry occupies. */
 const SLOT_NAME = 'conversation.composer.dock';
@@ -73,80 +73,6 @@ const PATTERNS = Object.freeze({
   ]),
 });
 
-/** English copy. */
-const en = {
-  summary: 'Ring count, interval, volume, waveform and chimes.',
-  repeatCount: 'Rings per alert',
-  repeatCountHint: 'Including the first chime. 1–10.',
-  intervalSeconds: 'Repeat interval',
-  intervalSecondsHint: 'Seconds between chimes, after the first. 1–60.',
-  volume: 'Volume',
-  volumeHint: 'From 0 (silent) to 1 (full).',
-  waveform: 'Waveform',
-  waveformHint: 'Timbre of every tone.',
-  waveform_sine: 'Sine (soft)',
-  waveform_square: 'Square (bright)',
-  waveform_triangle: 'Triangle (mellow)',
-  finishedPattern: 'Finished chime',
-  finishedPatternHint: 'Tones as frequencyHz:durationMs, comma separated, played in order. Example: 880:170, 1318.5:300',
-  interactionPattern: 'Waiting chime',
-  interactionPatternHint: 'Same notation. Example: 1046.5:140, 1318.5:140, 1046.5:200',
-  invalidPattern: 'Write tones as frequencyHz:durationMs, separated by commas.',
-  seconds: 's',
-  readOnly: 'This deployment stores settings read-only.',
-  unavailable: 'The notifier row is switched off, so there is nothing to configure right now.',
-  saveFailed: 'The deployment did not accept that value; it was left for you to correct.',
-  saving: 'Loading settings…',
-  pageIntro: 'Three groups, volume, chimes and repeat count. Changes apply immediately. To go quiet use Mute — do not switch the plugin row off.',
-  groupWhen: 'When it rings',
-  groupHow: 'How it rings',
-  groupRepeat: 'Repeats and stopping',
-  muteLabel: 'Mute',
-  muteHint: 'Use this switch to go quiet. Do not switch the plugin row off instead: after off→on the browser half is not remounted (known dsh issue deepseek-harness#8452), so this page stays away until the page is reloaded.',
-  turnEndLabel: 'A turn finishes',
-  waitingLabel: 'It stops to wait for you (approval or question)',
-  preview: 'Preview',
-  stopHint: 'Any pointer or key activity stops the repeats immediately.',
-  unavailable: 'The notifier row is switched off, so there is nothing to configure right now.',
-};
-
-/** Simplified Chinese copy. */
-const zh = {
-  summary: '响铃次数、间隔、音量、波形与音调。',
-  repeatCount: '每次提醒响几声',
-  repeatCountHint: '含第一次。取值 1–10。',
-  intervalSeconds: '重复间隔',
-  intervalSecondsHint: '第一次之后每次间隔几秒。取值 1–60。',
-  volume: '音量',
-  volumeHint: '0（静音）到 1（最大）。',
-  waveform: '波形',
-  waveformHint: '所有音使用的波形。',
-  waveform_sine: '正弦（柔和）',
-  waveform_square: '方波（明亮）',
-  waveform_triangle: '三角（圆润）',
-  finishedPattern: '答完的音调',
-  finishedPatternHint: '格式「频率Hz:时长ms」，逗号分隔，按顺序播放。例如 880:170, 1318.5:300',
-  interactionPattern: '等待的音调',
-  interactionPatternHint: '格式相同。例如 1046.5:140, 1318.5:140, 1046.5:200',
-  invalidPattern: '请按「频率Hz:时长ms」书写，用逗号分隔。',
-  seconds: '秒',
-  readOnly: '本部署的设置为只读。',
-  unavailable: '回合提醒那一行处于停用状态，现在没有可配置的内容。',
-  saveFailed: '本部署没有接受这个值，已保留供你修改。',
-  saving: '正在读取设置…',
-  pageIntro: '三组开关、音量、音调与重复次数，改完立即生效。临时安静请用「静音」，不要停用插件行。',
-  groupWhen: '什么时候响',
-  groupHow: '怎么响',
-  groupRepeat: '重复与停止',
-  muteLabel: '静音',
-  muteHint: '临时安静用这个开关。不要用停用插件行来代替——停用再启用后浏览器半边不会重新挂载（dsh 的已知问题 deepseek-harness#8452），设置页会一直缺席到重载界面为止。',
-  turnEndLabel: '智能体答完一轮',
-  waitingLabel: '停下来等你操作（审批 / 提问）',
-  preview: '试听',
-  stopHint: '鼠标或键盘一动，正在重复的提醒立即停止。',
-  unavailable: '回合提醒那一行处于停用状态，现在没有可配置的内容。',
-};
-
 /** Shared control surface, so every input, select and reset link matches. */
 const CONTROL = Object.freeze({
   background: 'var(--dsw-alias-bg-layer-2)',
@@ -158,21 +84,11 @@ const CONTROL = Object.freeze({
   fontFamily: 'inherit',
 });
 
-/** Token-only styling, so light and dark follow the host theme automatically. */
-const STYLE = Object.freeze({
-  /** Inline notice/error lines shared by the settings surfaces. */
-  notice: { opacity: 0.7, fontSize: 12, lineHeight: 1.6 },
-  error: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, lineHeight: 1.5 },
-});
 window.__ModuleLoader__.load({
   id: BUNDLE_NAME,
   factory(require) {
     const React = require('react');
     const h = React.createElement;
-    // Official primitives are a platform seed shared by every client bundle, so
-    // the dialog gets the shell's portal, focus handling and control styling
-    // instead of a hand-rolled overlay.
-    const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
 
     /** Clamp a value into an integer range, falling back when unusable. */
     function clampInteger(value, min, max, fallback) {
@@ -454,29 +370,16 @@ window.__ModuleLoader__.load({
       subscribe: () => () => {},
     });
 
-
-    /** The row page's current owner form; see {@link TurnNotifierRowConfig}. */
-    const rowBridge = { current: undefined };
-
-    /** Stable store identity for the row page, delegating to {@link rowBridge}. */
-    const ROW_STORE = Object.freeze({
-      getSnapshot: () => project(rowBridge.current?.state),
-      subscribe: () => () => undefined,
-      write: (field, value) => Promise.resolve(rowBridge.current?.mutate([{ op: 'set', path: [field], value }], rowBridge.current.state.revision)).then((accepted) => accepted !== false),
-      reset: (field) => Promise.resolve(rowBridge.current?.mutate([{ op: 'unset', path: [field] }], rowBridge.current.state.revision)).then((accepted) => accepted !== false),
-    });
-
-
     /**
      * Append one lifecycle marker to a browser-local trace.
      *
-     * The row's configuration entry can only be registered by a client half that
-     * actually executed, so when a row stops showing its `›` the question is
-     * always "did `apply` run again?" — which is invisible from outside the app.
-     * This trace answers it from disk: browser localStorage lives in the app's
-     * LevelDB, so the operator never has to open DevTools. The host half writes a
-     * matching trace to `~/.dsh/turn-notifier-trace.log`, and the two together
-     * place the failure on the Host or the browser side.
+     * Whether this half re-ran after its row was switched back on is invisible
+     * from outside the app: the chime either comes back or it does not, and
+     * nothing says which half failed to re-apply. This trace answers it from
+     * disk: browser localStorage lives in the app's LevelDB, so the operator
+     * never has to open DevTools. The host half writes a matching trace to
+     * `~/.dsh/turn-notifier-trace.log`, and the two together place the failure
+     * on the Host or the browser side.
      *
      * It is temporary diagnostics: remove once the row-toggle behavior is settled.
      *
@@ -495,246 +398,15 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** One uppercase group heading with its rows. */
-    function dialogGroup(key, title, rows) {
-      return h('section', { key, style: { marginBottom: 16 } }, [
-        h('h4', { key: 'title', style: { margin: '0 0 8px', fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', opacity: 0.55 } }, title),
-        ...rows,
-      ]);
-    }
-
-    /** A checkbox row: the switch and its label on one line, hint underneath. */
-    function toggleRow(key, label, checked, disabled, onToggle, hint) {
-      return h('div', { key, style: { marginBottom: 10 } }, [
-        h('label', { key: 'row', style: { display: 'flex', gap: 8, alignItems: 'center', cursor: disabled ? 'default' : 'pointer' } }, [
-          h('input', {
-            key: 'box',
-            type: 'checkbox',
-            checked,
-            disabled,
-            onChange: (event) => onToggle(event.target.checked),
-          }),
-          h('span', { key: 'text', style: { fontWeight: 600 } }, label),
-        ]),
-        hint === undefined ? null : h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12, lineHeight: 1.5, marginLeft: 24 } }, hint),
-      ]);
-    }
-
-    /** A tone-pattern row: text field, live validation and a preview button. */
-    function patternRow(props) {
-      const { key, t, label, hint, value, disabled, onEdit, onCommit, onPreview } = props;
-      const tones = parsePattern(value, null);
-      return h('div', { key, style: { marginBottom: 12 } }, [
-        h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, label),
-        h('div', { key: 'line', style: { display: 'flex', gap: 8, alignItems: 'center' } }, [
-          h('input', {
-            key: 'input',
-            type: 'text',
-            value,
-            disabled,
-            onChange: (event) => onEdit(event.target.value),
-            onBlur: onCommit,
-            onKeyDown: (event) => {
-              if (event.key === 'Enter') event.currentTarget.blur();
-            },
-            style: {
-              flex: 1,
-              minWidth: 0,
-              padding: '5px 7px',
-              background: 'transparent',
-              color: 'inherit',
-              border: `1px solid ${tones === null ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-border-l1)'}`,
-              borderRadius: 4,
-            },
-          }),
-          h(primitives.Button, {
-            key: 'preview',
-            variant: 'outline',
-            disabled: disabled || tones === null,
-            onClick: () => onPreview(value),
-            children: t('preview'),
-          }),
-        ]),
-        h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12, lineHeight: 1.5, marginTop: 4 } }, tones === null ? t('invalidPattern') : hint),
-      ]);
-    }
-
-    /**
-     * The Settings dialog opened from the dock bell.
-     *
-     * It edits exactly the same form the Plugins-page card edits
-     * (`ctx.configForms.get(ENTRY_ID)`), so the two surfaces can never disagree;
-     * the redesign is layout and affordances, not a second source of truth.
-     */
-    /**
-     * The settings body: three groups, shared by the dock dialog and the row's
-     * configuration page so the two can never drift apart. Every value comes from
-     * the same form (`ctx.configForms.get(ENTRY_ID)`).
-     */
-    function TurnNotifierGroups(props) {
-      const { t, store, snapshot, audio } = props;
-      // Hooks must run unconditionally: subscribe to the live store when one is
-      // given, otherwise to a frozen stand-in, and let an explicit snapshot win.
-      const live = useStoreValue(store ?? FALLBACK_STORE);
-      const settings = snapshot ?? live;
-      const [drafts, setDrafts] = React.useState({});
-      const [failed, setFailed] = React.useState(false);
-
-      const write = (field, value) => {
-        store.write(field, value).then((ok) => setFailed(ok === false));
-      };
-      const draftOf = (field, current) => (drafts[field] !== undefined ? drafts[field] : current);
-      const edit = (field, text) => setDrafts((current) => ({ ...current, [field]: text }));
-      const commit = (field) => {
-        const text = drafts[field];
-        if (text === undefined) return;
-        setDrafts((current) => {
-          const next = { ...current };
-          delete next[field];
-          return next;
-        });
-        write(field, text.trim() === '' ? DEFAULTS[field] : text.trim());
-      };
-      const preview = (reason, text) => {
-        const tones = parsePattern(text, PATTERNS[reason]);
-        audio.ring(reason, { ...settings, tones: { ...settings.tones, [reason]: tones } });
-      };
-      const disabled = settings.writable !== true;
-
-      return h(React.Fragment, null, [
-        dialogGroup('when', t('groupWhen'), [
-          toggleRow('turnEnd', t('turnEndLabel'), settings.notifyOnTurnEnd, disabled, (next) => write('notifyOnTurnEnd', next)),
-          toggleRow('waiting', t('waitingLabel'), settings.notifyOnWaiting, disabled, (next) => write('notifyOnWaiting', next)),
-          toggleRow('mute', t('muteLabel'), settings.muted, disabled, (next) => write('muted', next), t('muteHint')),
-        ]),
-        dialogGroup('how', t('groupHow'), [
-          h('div', { key: 'volume', style: { marginBottom: 10 } }, [
-            h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, `${t('volume')} · ${settings.volume.toFixed(2)}`),
-            h('input', {
-              key: 'slider',
-              type: 'range',
-              min: 0,
-              max: 1,
-              step: 0.05,
-              value: settings.volume,
-              disabled,
-              onChange: (event) => write('volume', Number(event.target.value)),
-              style: { width: '100%' },
-            }),
-            h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12 } }, t('volumeHint')),
-          ]),
-          h('div', { key: 'waveform', style: { marginBottom: 12 } }, [
-            h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, t('waveform')),
-            h('select', {
-              key: 'select',
-              value: settings.waveform,
-              disabled,
-              onChange: (event) => write('waveform', event.target.value),
-              style: { padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
-            }, WAVEFORMS.map((name) => h('option', { key: name, value: name }, t(`waveform_${name}`)))),
-            h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12 } }, t('waveformHint')),
-          ]),
-          patternRow({
-            key: 'finished',
-            t,
-            label: t('finishedPattern'),
-            hint: t('finishedPatternHint'),
-            value: draftOf('finishedPattern', settings.finishedPattern),
-            disabled,
-            onEdit: (text) => edit('finishedPattern', text),
-            onCommit: () => commit('finishedPattern'),
-            onPreview: () => preview('finished', draftOf('finishedPattern', settings.finishedPattern)),
-          }),
-          patternRow({
-            key: 'interaction',
-            t,
-            label: t('interactionPattern'),
-            hint: t('interactionPatternHint'),
-            value: draftOf('interactionPattern', settings.interactionPattern),
-            disabled,
-            onEdit: (text) => edit('interactionPattern', text),
-            onCommit: () => commit('interactionPattern'),
-            onPreview: () => preview('interaction', draftOf('interactionPattern', settings.interactionPattern)),
-          }),
-        ]),
-        dialogGroup('repeat', t('groupRepeat'), [
-          h('div', { key: 'repeatCount', style: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 } }, [
-            h('span', { key: 'label', style: { fontWeight: 600, flex: 1 } }, t('repeatCount')),
-            h('input', {
-              key: 'input',
-              type: 'number',
-              min: 1,
-              max: 10,
-              value: settings.repeatCount,
-              disabled,
-              onChange: (event) => write('repeatCount', clampInteger(event.target.value, 1, 10, DEFAULTS.repeatCount)),
-              style: { width: 64, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
-            }),
-          ]),
-          h('div', { key: 'repeatCountHint', style: { opacity: 0.66, fontSize: 12, margin: '-6px 0 10px' } }, t('repeatCountHint')),
-          h('div', { key: 'interval', style: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 } }, [
-            h('span', { key: 'label', style: { fontWeight: 600, flex: 1 } }, `${t('intervalSeconds')}（${t('seconds')}）`),
-            h('input', {
-              key: 'input',
-              type: 'number',
-              min: 1,
-              max: 60,
-              value: Math.round(settings.intervalMs / 1000),
-              disabled,
-              onChange: (event) => write('intervalMs', clampInteger(event.target.value, 1, 60, DEFAULTS.intervalMs / 1000) * 1000),
-              style: { width: 64, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
-            }),
-          ]),
-          h('div', { key: 'intervalSecondsHint', style: { opacity: 0.66, fontSize: 12, margin: '-6px 0 10px' } }, t('intervalSecondsHint')),
-          h('div', { key: 'stop', style: { opacity: 0.66, fontSize: 12, lineHeight: 1.5 } }, t('stopHint')),
-        ]),
-        failed ? h('div', { key: 'failed', role: 'alert', style: STYLE.error }, t('saveFailed')) : null,
-      ]);
-    }
-
-    /**
-     * The row's configuration page on the Plugins page, the same body the dialog
-     * shows. The owner hands the page its form as `{ state, mutate }`; the
-     * adapter below narrows that to the store shape the body already consumes, so
-     * one form backs the dock dialog, this page and the bundle card at once.
-     */
-    function TurnNotifierRowConfig(props) {
-      const { t, view, form, audio } = props;
-      if (view === 'summary') return t('summary');
-      if (form?.state === undefined) return null;
-      if (form.state.status === 'loading') return h('div', { role: 'status' }, t('saving'));
-      if (form.state.status !== 'ready') return h('div', { style: STYLE.notice }, t('unavailable'));
-      // One stable bridge for the whole page: the owner hands a fresh `{state,
-      // mutate}` object every render, so an adapter created per render would give
-      // `useStoreValue` a new dependency each time and spin in a setState loop.
-      // The bridge's identity never changes; the page's explicit `snapshot` is
-      // what makes a new revision visible, and the owner re-renders on changes.
-      rowBridge.current = form;
-      return h('div', { key: 'page' }, [
-        form.state.writable === true ? null : h('div', { key: 'readonly', style: STYLE.notice }, t('readOnly')),
-        h('p', { key: 'intro', style: { margin: '0 0 12px', opacity: 0.75, lineHeight: 1.6 } }, t('pageIntro')),
-        h(TurnNotifierGroups, {
-          key: 'groups',
-          t,
-          store: ROW_STORE,
-          snapshot: project(form.state),
-          audio,
-        }),
-      ]);
-    }
-
-/** The dock bell: opens the settings dialog and reflects muted state. */
-return {
-      inject: ['slots', 'locale'],
+    return {
+      inject: ['slots'],
       apply(ctx) {
-        ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), 'turn-notifier: dictionaries');
-
         // `configForms` is optional: a composition without the settings UI must
-        // still get the bell and the chime (with schema defaults, read-only). It
-        // is also deliberately NOT part of this plugin's `inject` face — a plugin
-        // whose activation waits on a service that is being rebuilt during a row
-        // toggle can end up never activating, which is how the row page (`›`)
-        // disappeared after 停用→启用 while the same-shaped session-purge survived.
+        // still get the chime (with schema defaults, read-only). It is also
+        // deliberately NOT part of this plugin's `inject` face — a plugin whose
+        // activation waits on a service that is being rebuilt during a row toggle
+        // can end up never activating, which is how this half went missing after
+        // 停用→启用 while the same-shaped session-purge survived.
         const forms = ctx.get('configForms');
         const form = forms?.get?.(ENTRY_ID);
         const store = form === undefined ? FALLBACK_STORE : createSettingsStore(form);
@@ -753,25 +425,14 @@ return {
           };
         }, 'turn-notifier: audio unlock');
 
-        // The chime behavior stays its own invisible entry: it needs the session
-        // status hook only and must keep observing while the dialog is closed.
+        // The one contribution, an invisible entry: it needs the session status
+        // hook only, and must keep observing whether or not a settings surface is
+        // open. The settings page is not here — `@jedeiah/turn-notifier-settings`
+        // owns it and registers it against this row, so that switching this row
+        // off and on cannot take the page with it.
         ctx.slots.inject(SLOT_NAME, () =>
           ctx.slots.register({ name: SLOT_NAME, id: `${ENTRY_ID}-alert`, order: 91 }, createNotifier(audio, store)),
         );
-
-        // The bundle's own configuration page, sharing this row's lifecycle:
-        // off means nothing is mounted, on means everything comes back.
-        // The row's own configuration page, keyed `<package>#<row id>`: clicking
-        // the row in the bundle card opens the grouped body below. Registered
-        // only while the Host serves this entry's settings namespace.
-        ctx.effect(() => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
-          name: 'plugins.row.config',
-          key: `${BUNDLE_NAME}#${ENTRY_ID}`,
-          locale: LOCALE_NS,
-          inject: () => ({ audio }),
-        }, TurnNotifierRowConfig)), 'turn-notifier: row configuration page');
-        trace('client/row-page-registered');
-
       },
     };
   },

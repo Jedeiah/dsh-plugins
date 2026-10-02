@@ -1,9 +1,9 @@
 {
-  "name": "@jedeiah/turn-notifier",
-  "version": "1.6.6",
+  "name": "@jedeiah/turn-notifier-settings",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "回合提醒：智能体答完一轮、或停下来等你操作时响铃；不动鼠标就按设定间隔重复（默认 5 秒 ×3），一动鼠标键盘立刻停。两套音调、波形、音量、次数都能在 Plugins 页面里配置。",
+  "description": "回合提醒的设置页（配对包）：把 @jedeiah/turn-notifier 那一行的配置页放在一个不会被停用的 bundle 里，这样停用→启用提醒那一行之后，右侧 `›` 设置入口不会跟着消失。",
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",
@@ -17,14 +17,9 @@
     "client.js",
     "cordis.patch.yml",
     "icon.svg",
-    "locale/*.json"
+    "locale/*.json",
+    "README.md"
   ],
-  "peerDependencies": {
-    "@deepseek-ai/schemastery": "*"
-  },
-  "devDependencies": {
-    "@deepseek-ai/schemastery": "*"
-  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

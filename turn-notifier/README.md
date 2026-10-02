@@ -42,12 +42,12 @@
 
 ### 在 Plugins 页改（推荐）
 
-**改了本插件的客户端半边（`client.js`）之后，必须完全退出并重开 App**：宿主在启动时把 bundle 字节快照进内存，并按 `mtime/ctime/size` 生成带 `rev` 的资源 URL，响应头又是 `immutable` 一年缓存——只重载页面拿到的仍是启动时那一份。判定方法：插件卡片上的版本号（现在是 **1.6.3**）。
+**改了本插件的客户端半边（`client.js`）之后，必须完全退出并重开 App**：宿主在启动时把 bundle 字节快照进内存，并按 `mtime/ctime/size` 生成带 `rev` 的资源 URL，响应头又是 `immutable` 一年缓存——只重载页面拿到的仍是启动时那一份。判定方法：插件卡片上的版本号（本插件现在是 **1.6.6**，配套的设置包是 **1.0.0**）。
 
 
 ### 在界面里改（Plugins 页卡片）
 
-打开 **Plugins（插件）页 → 展开本插件卡片 → 点开 `turn-notifier` 那一行（右侧 `›`）**：同一个三组页面（键 `@jedeiah/turn-notifier#turn-notifier`）。
+设置页**由配对包 `@jedeiah/turn-notifier-settings` 提供**（见《为什么设置页在另一个包里》）。打开 **Plugins（插件）页 → 展开本插件卡片 → 点开 `turn-notifier` 那一行（右侧 `›`）**：三组页面（键 `@jedeiah/turn-notifier#turn-notifier`，由设置包注册到**本行**上）。
 
 - 数字框和音调框：**失焦或回车才提交**，边打字边写库不会发生；开关、下拉、滑杆即时提交。
 - 波形下拉框：选完立即生效。
@@ -56,7 +56,7 @@
 
 ### 临时安静：用静音，不要停用插件行
 
-停用再启用带客户端半边的插件行之后，**浏览器半边不会被重新挂载**（dsh 的已知问题 [deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)）：模块表认为这个包已经加载过，于是不再执行它的 `apply`，界面与配置页就一直缺席——**重载界面（⌘R）即可恢复**，不必重启 App。所以想安静就用上面的「静音」开关；行开关留着真正想移除这个插件时用。
+停用再启用带客户端半边的插件行之后，**浏览器半边不会被重新挂载**（dsh 的已知问题 [deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)）：模块表认为这个包已经加载过，于是不再执行它的 `apply`。对本包来说就是——**停用再启用之后，直到重载界面（⌘R）为止都不会再响**（不必重启 App）。**设置页不再受影响**：它由配对的设置包提供（1.6.6 起，见《为什么设置页在另一个包里》）。所以想安静就用上面的「静音」开关；行开关留着真正想移除这个插件时用。
 
 ### 在 patch 里改
 
@@ -73,7 +73,7 @@
     finishedPattern: '660:120, 990:260'
 ```
 
-`index.js` 里调用了 `settings.configure({ auto: false })`，因为本插件**自带配置页**；不声明的话设置服务会对外宣称存在一个自动生成的表单，而目前没有任何自带客户端会渲染它。
+`index.js` 里调用了 `settings.configure({ auto: false })`，因为本插件的设置**由手写页面编辑**，而不是设置服务自动生成的表单（页面现在由配对包 `@jedeiah/turn-notifier-settings` 渲染）；不声明的话设置服务会对外宣称存在一个自动生成的表单，而目前没有任何自带客户端会渲染它。
 
 ## 文件
 
@@ -82,8 +82,8 @@
 | `package.json` | 组合包清单：`dsh.bundle.patch` 与 `dsh.client` 声明 |
 | `cordis.patch.yml` | 插入 `turn-notifier` 那一行 |
 | `index.js` | 宿主半边：`Config` schema（九个可调项，含静音与两个触发场景开关）+ 页面策略 |
-| `client.js` | 客户端模块：状态监听、合成提示音、重复/取消逻辑，以及 Plugins 页上的行配置页 |
-| `locale/{en,zh}.json`、`icon.svg` | 插件卡片的文案与图标 |
+| `client.js` | 客户端模块：状态监听、合成提示音、重复/取消逻辑。没有界面、没有文案——设置页在配对包里 |
+| `locale/{en,zh}.json`、`icon.svg` | 插件卡片的文案与图标（卡片文案由宿主侧解析，与客户端字典无关；1.6.6 起客户端半边不再注册任何字典） |
 
 ## 为什么 `peerDependencies` 里要写 schemastery
 
@@ -99,21 +99,23 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 
 ## 工作原理
 
-**一个设置入口（1.6.3 起）。**
+**设置入口只有一个，而且不再由本包提供（1.6.6 起）。**
 
-| 入口 | 槽位 | 说明 |
+| 入口 | 槽位 | 谁的半边注册它 |
 |---|---|---|
-| Plugins 页卡片里可点开的行（右侧 `›`） | `plugins.row.config`（key = `<包名>#<行 id>`） | 与 session-purge 同构；按 `whileServed(['turn-notifier'])` 注册，宿主不提供该设置命名空间时整页不出现 |
+| Plugins 页卡片里可点开的行（右侧 `›`） | `plugins.row.config`（key = `<包名>#<行 id>`） | **配对包 `@jedeiah/turn-notifier-settings`**，注册到**本行**上（键 `@jedeiah/turn-notifier#turn-notifier`） |
 
-**不再有"卡片配置区"。** 1.6.0 曾在 `plugins.bundle.config` 另放一份，导致同一个卡片里出现"配置区 + 组件行页"两份入口（1.6.1 已删）。现在两处入口渲染的都是 `TurnNotifierGroups`（三组：什么时候响 / 怎么响 / 重复与停止），读写同一个 `ctx.configForms.get('turn-notifier')`，不存在两套界面或两套值。
+**为什么设置页在另一个包里。** 带客户端半边的行被停用后，浏览器半边会被拆掉，而重新启用**不会重新挂载**它（dsh 已知问题 [deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)）。页面挂在本行上就会跟着本行走——这正是 1.6.5 之前"停用→启用后 `›` 消失"的直接原因（同一操作下 `session-purge` 的行页却还在；差异只能定位到"页面由哪个包的半边注册"，确切机制仍未定论）。现在页面改由一个**不会被停用的设置包**注册：宿主命名空间仍然是本包的 `turn-notifier`（`configForms` 是全局服务，跨包读取是允许的），页面本身则不再随本行的开关生死。
 
-**关于"停用/启用后 `›` 消失"**（1.6.5 起改为只声明常驻依赖）：`session-purge` 在同样操作下能保住行页，本插件不能——**确切机制仍在取证中**（有一个独立排查任务在用浏览器自动化复现，目标是给出 `arrive()` 早退 / 备用 URL / 批构成三者的定论）。已确认的事实：行页只由客户端半边注册，宿主侧没有兜底页；runner 在停用时确实会 dispose 插件实例并 `invalidate` 模块，所以理论上支持重新挂载。临时办法是**重载界面（⌘R）**。
+**两个包都在才完整：** 只装本包＝会响但没有 `›`；只装设置包＝`›` 在、但 Plugins 页不会把 form 交给页面（宿主没有这个命名空间），页面渲染为空而不是报错。（行被停用时同理：命名空间消失 → 页面空着，重新启用后宿主重新 apply，页面自己就回来了。）
 
-若仍然出现 `›` 消失，**重载界面（⌘R）**即可恢复；想临时安静请用设置里的静音开关，不要动行开关。行配置页由宿主在每次渲染时新给一个 `{ state, mutate }`，插件侧用一个**身份稳定**的桥接对象 + 显式快照把新 revision 传进去——适配器若每次渲染都新建，`useStoreValue` 的依赖会不停变化并陷入 setState 循环。
+**不再有"卡片配置区"。** 1.6.0 曾在 `plugins.bundle.config` 另放一份，导致同一个卡片里出现"配置区 + 组件行页"两份入口（1.6.1 已删）。
+
+行配置页由宿主在每次渲染时新给一个 `{ state, mutate }`，插件侧用一个**身份稳定**的桥接对象 + 显式快照把新 revision 传进去——适配器若每次渲染都新建，`useStoreValue` 的依赖会不停变化并陷入 setState 循环（这段实现随之搬进了设置包）。
 
 **响铃行为是独立的隐形条目**（同一槽位、id `turn-notifier-alert`，渲染 `null`）：它只订阅 `useSessionStatus`，与设置页互不影响。
 
-**想安静请用静音开关，不要停用行。** 停用再启用带客户端半边的插件行之后，浏览器半边不会被重新挂载（dsh 的已知问题 deepseek-harness#8452：模块表认为包已加载、不再执行它的 `apply`），界面与配置页会一直缺席，直到**重载界面（⌘R）**——为此本插件提供 `muted`，行开关留给真正想移除插件时用。
+**想安静请用静音开关，不要停用行。** 停用再启用本行之后，响铃半边不会被重新挂载（dsh 的已知问题 deepseek-harness#8452：模块表认为包已加载、不再执行它的 `apply`），要等到**重载界面（⌘R）**才会再响；设置页现在不受影响。为此本插件提供 `muted`，行开关留给真正想移除插件时用。
 
 **`dsh.client` 里绝不能写 `immediately`。** 该字段把这一行划入 **bootstrap** 阶段，而客户端模块系统有一条明文限制：**"移除或替换 bootstrap 需要刷新页面"**。带它的行会出现"点停用移不掉、点启用加不回来、只有重载页面（重启桌面端）才生效"的现象。本插件不向其他插件提供任何东西，不需要启动期预取，因此不声明它——本行就是**可动态增删的普通条目**。
 
@@ -121,7 +123,7 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 
 **只在状态跳变时响：** 挂载后的第一次渲染、以及切到别的会话后的第一次渲染，都只记录基线——打开一个本来就空闲、或本来就在等你的会话，不会平白响一声。
 
-**文案与配色**全部走客户端 locale 服务与 `--dsw-alias-*` 主题令牌，所以跟随语言切换与深浅色，无需额外处理。
+**配色**走 `--dsw-alias-*` 主题令牌，跟随深浅色；页面**文案**走客户端 locale 服务（1.6.6 起只在设置包里注册字典，本包不再注册）。
 
 ## 验证情况
 
@@ -130,9 +132,9 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 | 项目 | 方式 |
 |---|---|
 | 逻辑 | 开发期曾用测试台覆盖过 **52 项断言**（状态跳变、会话切换不误报、**会话暂时从状态表消失不误报**、重复与取消、配置驱动行为、波形/音调配置生效、音调校验拒绝非法值、配置页结构与 key、写库时机、卸载清理）。按当时的验证约定，该测试台**已删除**，不再随包提供 |
-| 语法与清单 | `node --check`、JSON 解析、patch YAML 解析 |
-| 已安装后的实时槽位 | 客户端 `Slots.listSubTree`：root `conversation.composer.dock` 应有 `turn-notifier` 与 `turn-notifier-alert`；root `plugins.row.config` 应有 key `@jedeiah/turn-notifier#turn-notifier`（不再有 `plugins.bundle.config` 条目） |
-| 行配置页 | 开发期临时探针（不随包提供）：物化客户端模块 → `apply` → 渲染行页，断言三组标题、复选框/滑杆/下拉/试听/静音/恢复默认齐备、写入经 `form.mutate` 带 revision 落地、用到的 `@deepseek-ai/dsh-client-ui-primitives` 名字存在于安装导出表、字典键中英齐全无冗余 |
+| 语法与清单 | `client.js` 用与浏览器同口径的 `new vm.Script(source)` 解析、`index.js` 用 `node --check`、JSON 解析、patch YAML 解析 |
+| 已安装后的实时槽位 | 客户端 `Slots.listSubTree`：root `conversation.composer.dock` 应当**只有** `turn-notifier-alert`（1.6.6 起本包不再注册任何 `plugins.row.config` 条目）；root `plugins.row.config` 里的 key `@jedeiah/turn-notifier#turn-notifier` 由**设置包**注册（`plugins.bundle.config` 条目仍然没有） |
+| 设置页 | 1.6.6 起随页面搬到了配对包：物化、`apply`、渲染行页、字典键核对那一套断言见 `../turn-notifier-settings/README.md`。本包的探针只断言"响铃半边只注册 `conversation.composer.dock` 的 `turn-notifier-alert`，不再注册行页" |
 | 配置 schema | 宿主 `Config.listConfigs`（name = `@jedeiah/turn-notifier`）：状态应为 `schema`（= fiber 存活且 Config 是原生 schemastery schema），并列出全部字段 |
 
 **无法自动验证、需要你亲测的两件事：**
