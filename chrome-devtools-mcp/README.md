@@ -18,6 +18,12 @@ Harness profile。
 
 **没有 `index.js`**：本包只承载配置，没有宿主代码。
 
+**行名故意指向官方桥**：`cordis.patch.yml` 里的 `name` 是 `@deepseek-ai/dsh-mcp-client`（不是本包名），因为真正要挂载的是 dsh 自带的 MCP 客户端。三个后果值得知道：
+
+- Plugins 页那一行的标题/描述/图标来自**桥的清单**（它没有 `locale/`、没有 `icon`），所以显示的是英文原始名，本包的 `locale/` 与 `icon.svg` 不会作用到那一行；
+- 该行**永远不会加载本包的客户端半边**（浏览器模块表的扫描按行名取包），将来若给本包加界面，需要把行名改回包名并自行插入桥；
+- 如果你以前在 profile 的 `cordis.patch.yml` 里手写过 `dsh-mcp-client` 行，**先删掉它**再启用本包，否则同一个 `serverName` 会起两个服务器。
+
 ## 它是怎么连的
 
 ```yaml

@@ -23,9 +23,11 @@
  * The Remote descriptor is written here instead of `require`-ing a shared module
  * because the browser module table only ever serves a bundle's declared
  * `./client` entry, and this bundle is buildless: a second source file could not
- * be loaded. It mirrors `typert.js` one-for-one; the two are the only copies,
- * and every field the Gateway reads is one of the small fixed set documented in
- * that file.
+ * be loaded. It matches `typert.js` field for field (name, wire, source, result
+ * shape, cancellation); the *validation* lives on the host side, which re-checks
+ * every argument at the wire boundary, so this copy stays a declaration rather
+ * than a second opinion about what is valid. The smoke test asserts the
+ * field-for-field agreement so the two cannot drift.
  */
 
 window.__ModuleLoader__.load({
@@ -74,6 +76,7 @@ window.__ModuleLoader__.load({
           method: 'inspect',
           invocation: { kind: 'direct' },
           parameters: [{ name: 'sessionId', wire: 'sessionId', source: 'json', codec: sessionIdCodec() }],
+          cancellation: { parameter: 'signal' },
           result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurgeInspection`, create: passthroughCodec },
         },
         {
@@ -83,6 +86,7 @@ window.__ModuleLoader__.load({
           method: 'purge',
           invocation: { kind: 'direct' },
           parameters: [{ name: 'sessionId', wire: 'sessionId', source: 'json', codec: sessionIdCodec() }],
+          cancellation: { parameter: 'signal' },
           result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurgeReport`, create: passthroughCodec },
         },
       ],
@@ -130,7 +134,10 @@ window.__ModuleLoader__.load({
       childSuffix: '（子 agent）',
       rootLabel: '主会话',
       statsSessions: '会话数',
-      statsSize: '占用磁盘',
+      statsSize: '占用磁盘（日志 + 落盘）',
+      forksKept: '另有 {count} 个从该会话分叉出来的独立会话不会被删除：',
+      toastPartial: '；{count} 个会话未能删净，磁盘上仍留有日志',
+      settingsSaveFailed: '这次改动没有被宿主接受（可能被另一个窗口改过），请重试。',
       statsSchedules: '绑定的提醒',
       statsAttachments: '清理无引用附件',
       attachmentsOn: '是（会扫描其余会话的引用）',
@@ -153,6 +160,8 @@ window.__ModuleLoader__.load({
       hintPurgeSchedules: '否则提醒会继续对着一个已经不存在的日志触发。',
       optPurgeSpill: '删除工具落盘文件（spill）',
       hintPurgeSpill: '工具大输出的落盘文件，按会话 id 的哈希定位。',
+      optSpillRoots: '额外要扫的 spill 根（逗号分隔）',
+      hintSpillRoots: '留空即可：默认扫系统临时目录下的 dsh-spill-*。',
       optPurgeAttachments: '清理无引用附件',
       hintPurgeAttachments: '先扫描其余会话的引用，只删除没有任何保留会话再引用的附件对象（图片/文件字节）。',
       toastDeleted: '已删除 {count} 个会话，释放 {size}',
@@ -171,7 +180,10 @@ window.__ModuleLoader__.load({
       childSuffix: ' (subagent)',
       rootLabel: 'main',
       statsSessions: 'Sessions',
-      statsSize: 'On disk',
+      statsSize: 'On disk (logs + spill)',
+      forksKept: '{count} forked conversation(s) are independent and will not be deleted:',
+      toastPartial: '; {count} session(s) could not be fully removed and still have logs on disk',
+      settingsSaveFailed: 'The host rejected this change (another window may have edited it). Try again.',
       statsSchedules: 'Bound reminders',
       statsAttachments: 'Purge unreferenced attachments',
       attachmentsOn: 'yes (scans the surviving sessions first)',
@@ -194,6 +206,8 @@ window.__ModuleLoader__.load({
       hintPurgeSchedules: 'Otherwise a reminder keeps firing into a log that no longer exists.',
       optPurgeSpill: 'Delete spilled tool output',
       hintPurgeSpill: 'Large tool output spilled to disk, addressed by the hash of the session id.',
+      optSpillRoots: 'Extra spill roots (comma separated)',
+      hintSpillRoots: 'Leave empty for the default: every dsh-spill-* root under the OS temp directory.',
       optPurgeAttachments: 'Purge unreferenced attachments',
       hintPurgeAttachments: 'Scans the surviving sessions first and removes only attachment objects no session references any more.',
       toastDeleted: 'Deleted {count} session(s), freed {size}',
@@ -330,13 +344,14 @@ window.__ModuleLoader__.load({
           store.setRequest({ ...current, busy: true, error: null });
           try {
             const report = await call('purge', current.sessionId);
-            clearBrowserState(report?.targets ?? [current.sessionId]);
+            clearBrowserState(report?.removedIds ?? report?.targets ?? [current.sessionId]);
             store.setRequest(null);
             store.setToast({
               kind: 'deleted',
               tone: 'success',
               holdMs: TOAST_HOLD_MS,
-              count: report?.targets?.length ?? 1,
+              count: report?.removedIds?.length ?? report?.targets?.length ?? 1,
+              partial: report?.failedIds?.length ?? 0,
               size: formatBytes(report?.removed?.bytesFreed ?? 0),
               warnings: report?.warnings?.length ?? 0,
             });
@@ -436,6 +451,11 @@ window.__ModuleLoader__.load({
           ]),
           request.phase === 'loading' ? h('div', { key: 'loading', role: 'status' }, t('dialogLoading')) : null,
           request.phase === 'error' ? h('div', { key: 'error', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)' } }, `${t('dialogFailed')}${String(request.error)}`) : null,
+          inspection !== null && (inspection.forkIds ?? []).length > 0 ? h('div', { key: 'forks', style: { marginBottom: 8, lineHeight: 1.6 } }, [
+            t('forksKept', { count: (inspection.forkIds ?? []).length }),
+            h('br'),
+            inspection.forkIds.join(', '),
+          ]) : null,
           inspection === null ? null : h('div', { key: 'stats' }, [
             h('div', { key: 'targetsHeading', style: { fontWeight: 600, marginBottom: 4 } }, t('targetsHeading')),
             h('ul', { key: 'targets', style: { margin: '0 0 8px', paddingInlineStart: 18 } }, inspection.targets.map((target, index) => targetLine(target, index, t))),
@@ -453,7 +473,7 @@ window.__ModuleLoader__.load({
       if (toast === null) return null;
       const text = toast.kind === 'failed'
         ? t('toastFailed', { message: toast.message })
-        : `${t('toastDeleted', { count: toast.count, size: toast.size })}${toast.warnings > 0 ? t('toastWarned', { count: toast.warnings }) : ''}`;
+        : `${t('toastDeleted', { count: toast.count, size: toast.size })}${toast.partial > 0 ? t('toastPartial', { count: toast.partial }) : ''}${toast.warnings > 0 ? t('toastWarned', { count: toast.warnings }) : ''}`;
       return h(primitives.Toast, {
         text,
         tone: toast.tone,
@@ -474,6 +494,10 @@ window.__ModuleLoader__.load({
      */
     function PurgeSettingsCard(props) {
       const { t, view, form } = props;
+      // The draft lives above every early return: a hook after a conditional
+      // return would change the hook order between renders.
+      const [draft, setDraft] = React.useState(null);
+      const [saveFailed, setSaveFailed] = React.useState(false);
       if (view === 'summary') return t('settingsSummary');
       const state = form?.state;
       if (state === undefined) return null;
@@ -482,9 +506,14 @@ window.__ModuleLoader__.load({
       const value = state.value ?? {};
       const disabled = state.writable !== true;
       const write = (field, next) => {
-        void form.mutate([{ op: 'set', path: [field], value: next }], state.revision);
+        // `mutate` answers whether the Host accepted the write; a revision fence
+        // lost to another window must not look like a successful toggle.
+        Promise.resolve(form.mutate([{ op: 'set', path: [field], value: next }], state.revision))
+          .then((accepted) => setSaveFailed(accepted === false))
+          .catch(() => setSaveFailed(true));
       };
       const checked = (field, fallback) => (typeof value[field] === 'boolean' ? value[field] : fallback);
+      const spillRoots = Array.isArray(value.spillRoots) ? value.spillRoots.join(', ') : '';
       return h('div', null, [
         h('p', { key: 'intro', style: { marginTop: 0, opacity: 0.75, lineHeight: 1.6 } }, t('settingsIntro')),
         ...SCOPE_OPTIONS.map(([field, fallback]) => h('label', {
@@ -504,6 +533,28 @@ window.__ModuleLoader__.load({
             h('div', { key: 'hint', style: { opacity: 0.7, fontSize: 12, lineHeight: 1.5 } }, t(`hint${field[0].toUpperCase()}${field.slice(1)}`)),
           ]),
         ])),
+        h('label', { key: 'spillRoots', style: { display: 'block', marginTop: 2 } }, [
+          h('span', { key: 'label', style: { fontWeight: 600 } }, t('optSpillRoots')),
+          h('input', {
+            key: 'input',
+            type: 'text',
+            disabled,
+            value: draft ?? spillRoots,
+            placeholder: t('hintSpillRoots'),
+            onChange: (event) => setDraft(event.target.value),
+            onBlur: () => {
+              if (draft === null) return;
+              write('spillRoots', draft.split(',').map((entry) => entry.trim()).filter((entry) => entry !== ''));
+              setDraft(null);
+            },
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') event.currentTarget.blur();
+            },
+            style: { width: '100%', marginTop: 4, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
+          }),
+          h('div', { key: 'hint', style: { opacity: 0.7, fontSize: 12, lineHeight: 1.5 } }, t('hintSpillRoots')),
+        ]),
+        saveFailed ? h('div', { key: 'save-failed', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12 } }, t('settingsSaveFailed')) : null,
       ]);
     }
 

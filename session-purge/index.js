@@ -34,6 +34,7 @@ import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import {
   discoverSpillRoots,
+  throwIfAborted,
   planPurge,
   readCachedTitle,
   readStoredTitle,
@@ -154,6 +155,12 @@ class SessionPurgeService extends TypertRemoteService {
   constructor(ctx, config) {
     super(ctx, 'sessionPurge');
     this.config = config ?? {};
+    /**
+     * The target set the dialog last showed, per session. `purge` compares it
+     * with a fresh plan so a child created between preview and confirmation can
+     * never be deleted without having been listed.
+     */
+    this.previewed = new Map();
   }
 
   /**
@@ -189,7 +196,7 @@ class SessionPurgeService extends TypertRemoteService {
    * @param sessionId - the session the operator selected.
    * @returns the preview.
    */
-  async inspect(sessionId) {
+  async inspect(sessionId, signal) {
     assertSessionId(sessionId);
     const settings = this.settings();
     const root = this.sessionsRoot();
@@ -198,16 +205,21 @@ class SessionPurgeService extends TypertRemoteService {
       sessionId,
       includeDescendants: settings.includeDescendants,
       spillRoots: settings.spillRoots,
+      signal,
     });
     if (plan === undefined) {
       throw new RemoteError('session-purge/session-unknown', `no stored session "${sessionId}" exists under the configured session root`, { sessionId, root });
     }
     const live = plan.targetIds.filter((id) => this.isLive(id));
     const schedules = await this.scheduleTasks(plan.targetIds);
+    this.previewed.set(sessionId, { ids: [...plan.targetIds], at: Date.now() });
     return {
       sessionId,
       root,
       live: this.isLive(sessionId),
+      forkIds: plan.forkIds,
+      logBytes: plan.logBytes,
+      spillBytes: plan.spillBytes,
       blocked: live.length === 0 ? null : { reason: 'live-session', sessionIds: live },
       sizeBytes: plan.sizeBytes,
       scheduleCount: schedules.length,
@@ -233,7 +245,7 @@ class SessionPurgeService extends TypertRemoteService {
    * @param sessionId - the session the operator selected.
    * @returns the report the Client half shows.
    */
-  async purge(sessionId) {
+  async purge(sessionId, signal) {
     assertSessionId(sessionId);
     const settings = this.settings();
     const root = this.sessionsRoot();
@@ -242,6 +254,7 @@ class SessionPurgeService extends TypertRemoteService {
       sessionId,
       includeDescendants: settings.includeDescendants,
       spillRoots: settings.spillRoots,
+      signal,
     });
     if (plan === undefined) {
       throw new RemoteError('session-purge/session-unknown', `no stored session "${sessionId}" exists under the configured session root`, { sessionId, root });
@@ -255,39 +268,78 @@ class SessionPurgeService extends TypertRemoteService {
       );
     }
 
+    // The preview is the contract with the operator: if the set grew since the
+    // dialog rendered (a child was created), stop and make them look again.
+    const previewed = this.previewed.get(sessionId);
+    this.previewed.delete(sessionId);
+    if (previewed !== undefined) {
+      const before = new Set(previewed.ids);
+      const now = new Set(plan.targetIds);
+      const added = plan.targetIds.filter((id) => !before.has(id));
+      const gone = previewed.ids.filter((id) => !now.has(id));
+      if (added.length > 0 || gone.length > 0) {
+        throw new RemoteError(
+          'session-purge/target-set-changed',
+          `the set of sessions to delete changed since the dialog was rendered (+${String(added.length)} / -${String(gone.length)}); reopen the dialog to confirm the new list`,
+          { sessionId, added, removed: gone },
+        );
+      }
+    }
+
     const warnings = [];
     const removed = { sessionDirectories: 0, projectDirectories: 0, projectionRecords: 0, spillDirectories: 0, schedules: 0, workspaceSlots: 0, attachmentObjects: 0, attachmentLinks: 0, bytesFreed: 0 };
     const digests = settings.purgeAttachments
       ? await unreferencedDigests({
         doomed: plan.targets.map((target) => target.directory),
         survivors: [...plan.index.values()].filter((record) => !plan.targetIds.includes(record.id)).map((record) => record.directory),
+        signal,
       })
       : undefined;
+
+    // Workspace accounting first: the registry's `sessionIds` view is filtered by
+    // a header index that a removed log directory empties, so detaching after the
+    // delete would silently skip the slot and strand a dangling id.
+    throwIfAborted(signal);
+    removed.workspaceSlots = await this.detachFromWorkspaces(plan.targetIds, warnings);
 
     const directories = await removeSessionDirectories({
       plan,
       removeEmptyProjectDirectory: settings.removeEmptyProjectDirectory,
       warnings,
+      signal,
     });
     Object.assign(removed, directories);
-    removed.projectionRecords = await removeProjectionRecords({ storagesRoot: this.storagesRoot(), ids: plan.targetIds, warnings });
+    removed.projectionRecords = await removeProjectionRecords({ storagesRoot: this.storagesRoot(), ids: plan.targetIds, warnings, signal });
     if (settings.purgeSpill) {
       removed.spillDirectories = await removeSpillDirectories({
         ids: plan.targetIds,
         roots: await discoverSpillRoots(settings.spillRoots),
         warnings,
+        signal,
       });
     }
     if (settings.purgeSchedules) removed.schedules = await this.removeSchedules(plan.targetIds, warnings);
-    removed.workspaceSlots = await this.detachFromWorkspaces(plan.targetIds, warnings);
     if (digests !== undefined) {
-      const attachments = await removeAttachments({ root: this.attachmentsRoot(), digests, warnings });
+      const attachments = await removeAttachments({ root: this.attachmentsRoot(), digests, warnings, signal });
       removed.attachmentObjects = attachments.objects;
       removed.attachmentLinks = attachments.links;
     }
 
-    announceRemoved(this.ctx, plan.targetIds);
-    return { sessionId, targets: plan.targetIds, removed, warnings };
+    // Only sessions whose directory is really gone are announced; a partially
+    // failed sweep must not drop rows that still exist on disk.
+    for (const id of directories.failedIds) {
+      warnings.push(`session "${id}" was not fully removed; its log directory is still present`);
+    }
+    announceRemoved(this.ctx, directories.removedIds);
+    return {
+      sessionId,
+      targets: plan.targetIds,
+      removedIds: directories.removedIds,
+      failedIds: directories.failedIds,
+      forkIds: plan.forkIds,
+      removed,
+      warnings,
+    };
   }
 
   /** Resolve the configured session log root, defaulting to the shipped layout. */

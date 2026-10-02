@@ -22,6 +22,7 @@
  */
 import { createHash } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -63,61 +64,91 @@ function storedLog(header, events) {
   return Buffer.concat([frame(`${JSON.stringify(header)}\n`), frame(`${events.map((event) => JSON.stringify(event)).join('\n')}\n`)]);
 }
 
+/** The same two lines in the raw-line shape (`compression: 'none'`). */
+function storedRaw(header, events) {
+  return Buffer.from(`${JSON.stringify(header)}\n${events.map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8');
+}
+
 /**
  * Build a synthetic dsh home.
  * @param root - the temporary directory to fill.
  * @returns the paths a purge configuration needs.
  */
-async function buildStore(root) {
+async function buildStore(root, options = {}) {
+  const raw = options.raw === true;
+  const write = raw ? storedRaw : storedLog;
+  const file = raw ? 'session.v2.jsonl' : 'session.v4.jsonl.zstd';
+  const version = raw ? 2 : 4;
   const sessionsRoot = join(root, 'sessions');
   const storagesRoot = join(root, 'storages');
   const attachmentsRoot = join(root, 'attachments');
   const spillRoot = join(root, 'tmp', 'dsh-spill-abc123');
   const project = join(sessionsRoot, '--Users-me-projects-doomed--');
   const survivorProject = join(sessionsRoot, '--Users-me-projects-kept--');
+  const nestedProject = join(sessionsRoot, '--Users-me-projects-nested--');
   const parentId = 'session-parent-0000';
   const childId = '11111111-2222-3333-4444-555555555555';
+  const grandId = '22222222-3333-4444-5555-666666666666';
+  const forkId = 'session-fork-0000';
   const keptId = 'session-kept-0000';
   const doomedDigest = 'a'.repeat(64);
   const keptDigest = 'b'.repeat(64);
+  const sharedDigest = 'c'.repeat(64);
 
-  for (const id of [parentId, childId]) await mkdir(join(project, id), { recursive: true });
+  for (const id of [parentId, childId, forkId]) await mkdir(join(project, id), { recursive: true });
   await mkdir(join(survivorProject, keptId), { recursive: true });
+  await mkdir(join(nestedProject, grandId), { recursive: true });
   await mkdir(join(storagesRoot, 'session_projcache', 'sessions'), { recursive: true });
   await mkdir(join(attachmentsRoot, 'v1', 'objects', doomedDigest.slice(0, 2)), { recursive: true });
   await mkdir(join(attachmentsRoot, 'v1', 'objects', keptDigest.slice(0, 2)), { recursive: true });
+  await mkdir(join(attachmentsRoot, 'v1', 'objects', sharedDigest.slice(0, 2)), { recursive: true });
   await mkdir(join(attachmentsRoot, 'v1', 'files', doomedDigest.slice(0, 2), doomedDigest), { recursive: true });
   await mkdir(join(spillRoot, `session-${createHash('sha256').update(parentId).digest('hex').slice(0, 12)}`), { recursive: true });
 
   const cwd = '/Users/example/projects/demo';
-  await writeFile(join(project, parentId, 'session.v4.jsonl.zstd'), storedLog(
-    { type: 'session', version: 4, id: parentId, createdAt: 1, cwd, isSeeded: false, delegationDepth: 0 },
+  await writeFile(join(project, parentId, file), write(
+    { type: 'session', version, id: parentId, createdAt: 1, cwd, isSeeded: false, delegationDepth: 0 },
     [
       { type: 'session/title', seq: 1, time: 2, data: { title: 'Synthetic parent' } },
       { type: 'user/message', seq: 2, time: 3, data: { content: [{ type: 'image', source: `sha256:${doomedDigest}` }] } },
+      { type: 'user/message', seq: 3, time: 4, data: { content: [{ type: 'image', source: `sha256:${sharedDigest}` }] } },
     ],
   ));
-  await writeFile(join(project, childId, 'session.v4.jsonl.zstd'), storedLog(
-    { type: 'session', version: 4, id: childId, createdAt: 2, cwd, parentSession: parentId, isSeeded: false, origin: 'subagent', delegationDepth: 1 },
+  await writeFile(join(project, childId, file), write(
+    { type: 'session', version, id: childId, createdAt: 2, cwd, parentSession: parentId, isSeeded: false, origin: 'subagent', delegationDepth: 1 },
     [{ type: 'session/title', seq: 1, time: 3, data: { title: 'Synthetic child' } }],
   ));
-  await writeFile(join(survivorProject, keptId, 'session.v4.jsonl.zstd'), storedLog(
-    { type: 'session', version: 4, id: keptId, createdAt: 3, cwd, isSeeded: false, delegationDepth: 0 },
+  await writeFile(join(survivorProject, keptId, file), write(
+    { type: 'session', version, id: keptId, createdAt: 3, cwd, isSeeded: false, delegationDepth: 0 },
     [
       { type: 'session/title', seq: 1, time: 4, data: { title: 'Survivor' } },
       { type: 'user/message', seq: 2, time: 5, data: { content: [{ type: 'image', source: `sha256:${keptDigest}` }] } },
+      { type: 'user/message', seq: 3, time: 6, data: { content: [{ type: 'image', source: `sha256:${sharedDigest}` }] } },
     ],
   ));
-  const titles = { 'session-parent-0000': 'Synthetic parent', [childId]: 'Synthetic child', 'session-kept-0000': 'Survivor' };
+  await writeFile(join(nestedProject, grandId, file), write(
+    { type: 'session', version: 4, id: grandId, createdAt: 3, cwd, parentSession: childId, isSeeded: false, origin: 'subagent', delegationDepth: 2 },
+    [{ type: 'session/title', seq: 1, time: 4, data: { title: 'Synthetic grandchild' } }],
+  ));
+  await writeFile(join(project, forkId, 'session.v4.jsonl.zstd'), storedLog(
+    { type: 'session', version: 4, id: forkId, createdAt: 4, cwd, parentSession: parentId, isSeeded: true, delegationDepth: 0 },
+    [{ type: 'session/title', seq: 1, time: 5, data: { title: 'Independent fork' } }],
+  ));
+  const titles = { 'session-parent-0000': 'Synthetic parent', [childId]: 'Synthetic child', [grandId]: 'Synthetic grandchild', [forkId]: 'Independent fork', 'session-kept-0000': 'Survivor' };
   for (const [id, title] of Object.entries(titles)) {
     await writeFile(join(storagesRoot, 'session_projcache', 'sessions', `${id}.json`), JSON.stringify({ version: 7, record: { rows: { title: { ver: 1, seq: 1, val: title } } } }));
   }
   await writeFile(join(attachmentsRoot, 'v1', 'objects', doomedDigest.slice(0, 2), doomedDigest), 'doomed bytes');
+  // Projection residue the storage domain can leave behind: an invalid-record
+  // backup and an atomic write that never landed.
+  await writeFile(join(storagesRoot, 'session_projcache', 'sessions', `${parentId}.json.bak.202610030101`), '{"version":7,"record":{"rows":{}}}');
+  await writeFile(join(storagesRoot, 'session_projcache', 'sessions', `${parentId}.json.deadbeef1234.tmp`), '{}');
   await writeFile(join(attachmentsRoot, 'v1', 'objects', keptDigest.slice(0, 2), keptDigest), 'kept bytes');
+  await writeFile(join(attachmentsRoot, 'v1', 'objects', sharedDigest.slice(0, 2), sharedDigest), 'shared bytes');
   await writeFile(join(attachmentsRoot, 'v1', 'files', doomedDigest.slice(0, 2), doomedDigest, 'report.png'), 'link');
   await writeFile(join(spillRoot, `session-${createHash('sha256').update(parentId).digest('hex').slice(0, 12)}`, 'tool-output.txt'), 'spilled');
 
-  return { root, sessionsRoot, storagesRoot, attachmentsRoot, spillRoot, project, survivorProject, parentId, childId, keptId, doomedDigest, keptDigest };
+  return { root, sessionsRoot, storagesRoot, attachmentsRoot, spillRoot, project, survivorProject, nestedProject, parentId, childId, grandId, forkId, keptId, doomedDigest, keptDigest, sharedDigest };
 }
 
 /** @returns whether a path exists. */
@@ -139,28 +170,40 @@ async function testEngine(store) {
   const engine = await import(join(here, 'engine.js'));
 
   const index = await engine.indexStoredSessions(store.sessionsRoot);
-  check('indexes three stored sessions', index.size === 3, `saw ${String(index.size)}`);
+  check('indexes every stored session (parent, child, grandchild, fork, survivor)', index.size === 5, `saw ${String(index.size)}`);
+
+  // Generation selection: newest compressed generation wins, and a raw-line store
+  // (`compression: 'none'`) is ranked numerically, not lexicographically.
+  check('picks the newest compressed generation', engine.selectLogFile(['session.v2.jsonl.zstd', 'session.v10.jsonl.zstd']) === 'session.v10.jsonl.zstd');
+  check('falls back to the newest raw-line generation', engine.selectLogFile(['session.v2.jsonl', 'session.v10.jsonl', 'session.v9.jsonl']) === 'session.v10.jsonl');
+  check('returns nothing for a directory without a log', engine.selectLogFile(['session.lock']) === undefined);
 
   const plan = await engine.planPurge({ root: store.sessionsRoot, sessionId: store.parentId, includeDescendants: true, spillRoots: [store.spillRoot] });
-  check('plan includes the session and its subagent child', plan.targetIds.length === 2 && plan.targetIds.includes(store.childId), plan.targetIds.join(','));
+  check('plan includes the session, its subagent child and its grandchild', plan.targetIds.length === 3 && plan.targetIds.includes(store.childId) && plan.targetIds.includes(store.grandId), plan.targetIds.join(','));
+  check('a fork is NOT lineage and stays out of the target set', !plan.targetIds.includes(store.forkId) && plan.forkIds.includes(store.forkId), `targets=${plan.targetIds.join(',')} forks=${plan.forkIds.join(',')}`);
   check('plan finds the spilled output directory', plan.spillDirectories.length === 1, plan.spillDirectories.join(','));
-  check('plan totals the on-disk size of both logs', plan.sizeBytes > 0, String(plan.sizeBytes));
+  check('plan totals logs plus spill', plan.sizeBytes >= plan.logBytes + plan.spillBytes && plan.spillBytes > 0, JSON.stringify({ log: plan.logBytes, spill: plan.spillBytes, total: plan.sizeBytes }));
+  const shallow = await engine.planPurge({ root: store.sessionsRoot, sessionId: store.parentId, includeDescendants: false });
+  check('includeDescendants: false plans only the selected session', shallow.targetIds.length === 1 && shallow.targetIds[0] === store.parentId);
 
   const warnings = [];
   const digests = await engine.unreferencedDigests({
     doomed: plan.targets.map((target) => target.directory),
     survivors: [join(store.survivorProject, store.keptId)],
   });
-  check('only the doomed digest is unreferenced', digests.size === 1 && digests.has(store.doomedDigest), [...digests].join(','));
+  check('only the doomed digest is unreferenced (a shared one is kept)', digests.size === 1 && digests.has(store.doomedDigest) && !digests.has(store.sharedDigest), [...digests].join(','));
   const directories = await engine.removeSessionDirectories({ plan, removeEmptyProjectDirectory: true, warnings });
-  check('removes both session directories', directories.sessionDirectories === 2, JSON.stringify(directories));
-  check('drops the emptied project directory', directories.projectDirectories === 1, JSON.stringify(directories));
+  check('removes every target directory', directories.sessionDirectories === 3 && directories.removedIds.length === 3 && directories.failedIds.length === 0, JSON.stringify(directories));
+  check('drops only the emptied project directory', directories.projectDirectories === 1, JSON.stringify(directories));
   check('parent log is gone', !(await exists(join(store.project, store.parentId))));
   check('subagent log is gone', !(await exists(join(store.project, store.childId))));
+  check('the grandchild in another project directory is gone', !(await exists(join(store.nestedProject, store.grandId))));
+  check('the fork still exists and keeps its project directory', await exists(join(store.project, store.forkId)) && await exists(store.project));
   check('survivor log is untouched', await exists(join(store.survivorProject, store.keptId)));
 
   const records = await engine.removeProjectionRecords({ storagesRoot: store.storagesRoot, ids: plan.targetIds, warnings });
-  check('removes both projection records and keeps the survivor', records === 2, String(records));
+  check('removes every projection document of the targets, including .bak and .tmp residue', records === 5, `${String(records)} of [${(await readdir(join(store.storagesRoot, 'session_projcache', 'sessions'))).join(', ')}]`);
+  check('the fork\'s and survivor\'s projection records stay', await exists(join(store.storagesRoot, 'session_projcache', 'sessions', `${store.forkId}.json`)) && await exists(join(store.storagesRoot, 'session_projcache', 'sessions', 'session-kept-0000.json')));
   check('survivor projection record stays', await exists(join(store.storagesRoot, 'session_projcache', 'sessions', 'session-kept-0000.json')));
 
   const spill = await engine.removeSpillDirectories({ ids: plan.targetIds, roots: [store.spillRoot], warnings });
@@ -170,7 +213,49 @@ async function testEngine(store) {
   const attachments = await engine.removeAttachments({ root: store.attachmentsRoot, digests, warnings });
   check('removes the doomed object and its reference link', attachments.objects === 1 && attachments.links === 1, JSON.stringify(attachments));
   check('keeps the survivor object', await exists(join(store.attachmentsRoot, 'v1', 'objects', store.keptDigest.slice(0, 2), store.keptDigest)));
+  check('keeps the object two sessions shared', await exists(join(store.attachmentsRoot, 'v1', 'objects', store.sharedDigest.slice(0, 2), store.sharedDigest)));
   check('no warnings were raised', warnings.length === 0, warnings.join(' | '));
+
+  // The same flow over a raw-line store (`compression: 'none'`): the generation
+  // selector ranks `.jsonl` generations numerically and the digest scanner reads
+  // plain lines instead of Zstandard frames.
+  const raw = await buildStore(join(store.root, 'raw-store'), { raw: true });
+  const rawIndex = await engine.indexStoredSessions(raw.sessionsRoot);
+  check('indexes a raw-line store', rawIndex.size === 5, `saw ${String(rawIndex.size)}`);
+  check('reads the raw store\'s header and title', rawIndex.get(raw.parentId)?.header?.id === raw.parentId && (await engine.readStoredTitle(rawIndex.get(raw.parentId).directory)) === 'Synthetic parent');
+  const rawPlan = await engine.planPurge({ root: raw.sessionsRoot, sessionId: raw.parentId, includeDescendants: true });
+  const rawWarnings = [];
+  const rawDigests = await engine.unreferencedDigests({
+    doomed: rawPlan.targets.map((target) => target.directory),
+    survivors: [join(raw.survivorProject, raw.keptId)],
+  });
+  check('finds the unreferenced digest in raw lines', rawDigests.size === 1 && rawDigests.has(raw.doomedDigest), [...rawDigests].join(','));
+  const rawRemoved = await engine.removeSessionDirectories({ plan: rawPlan, removeEmptyProjectDirectory: true, warnings: rawWarnings });
+  check('deletes a raw-line session, its child and its grandchild', rawRemoved.sessionDirectories === 3 && !(await exists(join(raw.project, raw.parentId))), JSON.stringify(rawRemoved));
+  check('the raw-line survivor stays readable', await exists(join(raw.survivorProject, raw.keptId, 'session.v2.jsonl')));
+}
+
+/**
+ * Spill-root discovery must accept only the backend's own root shape and must
+ * never treat a look-alike directory as its own.
+ */
+async function testSpillDiscovery() {
+  console.log('\nPart A2 — spill-root discovery');
+  const { discoverSpillRoots, SPILL_ROOT_PATTERN } = await import(join(here, 'engine.js'));
+  const base = tmpdir();
+  const valid = await mkdtemp(join(base, 'dsh-spill-'));
+  const validName = valid.slice(base.length + 1);
+  const foreign = join(base, 'dsh-spill-test-abc');
+  await mkdir(foreign, { recursive: true });
+  try {
+    check('the backend root shape is accepted', SPILL_ROOT_PATTERN.test(validName), validName);
+    check('a look-alike root is rejected', !SPILL_ROOT_PATTERN.test('dsh-spill-test-abc') && !SPILL_ROOT_PATTERN.test('dsh-spill-toolong1'));
+    const roots = await discoverSpillRoots();
+    check('discovery finds the real root and skips the look-alike', roots.includes(valid) && !roots.includes(foreign), roots.join(', '));
+  } finally {
+    await rm(valid, { recursive: true, force: true });
+    await rm(foreign, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -243,15 +328,17 @@ async function testGateway(app, workroot) {
   const { gateway } = boot(config.value);
 
   const inspect = await gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: store.parentId }, signal: new AbortController().signal });
-  check('inspect returns both targets with titles', inspect.targets.length === 2 && inspect.targets[0].title === 'Synthetic parent', JSON.stringify(inspect.targets.map((target) => [target.sessionId, target.title])));
+  check('inspect returns every lineage target with titles', inspect.targets.length === 3 && inspect.targets[0].title === 'Synthetic parent' && inspect.targets.some((target) => target.sessionId === store.grandId && target.title === 'Synthetic grandchild'), JSON.stringify(inspect.targets.map((target) => [target.sessionId, target.title])));
+  check('inspect reports the fork that will be kept', (inspect.forkIds ?? []).includes(store.forkId), JSON.stringify(inspect.forkIds));
   check('inspect reports no blocking liveness', inspect.blocked === null);
   check('inspect counts the spilled directory', inspect.spillDirectoryCount === 1, String(inspect.spillDirectoryCount));
   check('inspect totals the disk size', inspect.sizeBytes > 0, String(inspect.sizeBytes));
 
   const report = await gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: store.parentId }, signal: new AbortController().signal });
-  check('purge deletes the session and its child', report.targets.length === 2, report.targets.join(','));
-  check('purge reports every removed artifact', report.removed.sessionDirectories === 2 && report.removed.projectionRecords === 2 && report.removed.spillDirectories === 1, JSON.stringify(report.removed));
+  check('purge deletes the session, its child and its grandchild', report.targets.length === 3 && report.removedIds.length === 3, report.targets.join(','));
+  check('purge reports every removed artifact', report.removed.sessionDirectories === 3 && report.removed.projectionRecords === 5 && report.removed.spillDirectories === 1, JSON.stringify(report.removed));
   check('purge leaves the survivor readable', await exists(join(store.survivorProject, store.keptId, 'session.v4.jsonl.zstd')));
+  check('purge leaves the fork untouched', await exists(join(store.project, store.forkId)));
   check('purge keeps unreferenced attachments (default off)', await exists(join(store.attachmentsRoot, 'v1', 'objects', store.doomedDigest.slice(0, 2), store.doomedDigest)));
 
   const second = await buildStore(join(workroot, 'gateway-store-live'));
@@ -271,6 +358,89 @@ async function testGateway(app, workroot) {
   live.sessionId = null;
   const retry = await liveHost.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: second.parentId }, signal: new AbortController().signal });
   check('once cold, the same purge succeeds and clears the unreferenced attachment', retry.removed.attachmentObjects === 1, JSON.stringify(retry.removed));
+
+  // ── Live guard, error codes, and the Host-side reference bookkeeping ──────
+  {
+    const third = await buildStore(join(workroot, 'gateway-store-bookkeeping'));
+    const host3 = boot({ ...config.value, sessionsRoot: third.sessionsRoot, storagesRoot: third.storagesRoot, attachmentsRoot: third.attachmentsRoot, spillRoots: [third.spillRoot] });
+    const calls = [];
+    const live = { sessionId: third.childId };
+    host3.ctx.provide('agents', { get: (id) => (live.sessionId === id ? { id } : undefined) });
+    host3.ctx.effect(() => host3.ctx.on('api-session/removed', (id) => calls.push(`removed:${id}`)), 'selftest: announce listener');
+    host3.ctx.provide('workspaceRegistry', {
+      list: () => [{
+        id: 'ws-1',
+        sessionIds: [third.parentId],
+        detachSession: (id) => {
+          // Ordering: the accounting slot must be dropped while the log is still
+          // there, or the registry's filtered view skips it and the slot strands.
+          calls.push(`detach:${id}:log-${existsSync(join(third.project, id)) ? 'present' : 'gone'}`);
+          return Promise.resolve();
+        },
+      }],
+      unarchiveSession: (id) => calls.push(`unarchive:${id}`),
+      unpinSession: (id) => calls.push(`unpin:${id}`),
+    });
+    host3.ctx.provide('schedule', {
+      catalog: async () => [{ id: 'task-1', sessionId: third.parentId }, { id: 'task-2', sessionId: 'unrelated' }],
+      delete: async ({ id, sessionId }) => { calls.push(`schedule:${sessionId}/${id}`); return { deleted: true }; },
+    });
+
+    const blockedInspection = await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: third.parentId }, signal: new AbortController().signal });
+    check('a live *child* is reported as blocking the preview', blockedInspection.blocked?.sessionIds?.includes(third.childId) === true, JSON.stringify(blockedInspection.blocked));
+    let childRefusal;
+    try {
+      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: third.parentId }, signal: new AbortController().signal });
+    } catch (error) {
+      childRefusal = error;
+    }
+    check('a live child refuses the purge with the stable code', childRefusal?.code === 'session-purge/session-live', String(childRefusal?.code));
+
+    live.sessionId = null;
+    const bookkeeping = await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: third.parentId }, signal: new AbortController().signal });
+    check('the purge drops the Workspace slot before the log disappears', calls.includes(`detach:${third.parentId}:log-present`), calls.join(' | '));
+    check('archive and pin entries are cleared through the registry', calls.includes(`unarchive:${third.parentId}`) && calls.includes(`unpin:${third.parentId}`), calls.join(' | '));
+    check('only reminders bound to the targets are deleted', calls.includes(`schedule:${third.parentId}/task-1`) && !calls.some((entry) => entry.includes('task-2')), calls.join(' | '));
+    check('the report counts the schedule and workspace work', bookkeeping.removed.schedules === 1 && bookkeeping.removed.workspaceSlots === 1, JSON.stringify(bookkeeping.removed));
+    check('every removed session is announced once', bookkeeping.removedIds.every((id) => calls.includes(`removed:${id}`)) && calls.filter((entry) => entry.startsWith('removed:')).length === bookkeeping.removedIds.length, calls.join(' | '));
+
+    let unknownRefusal;
+    try {
+      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: 'session-does-not-exist' }, signal: new AbortController().signal });
+    } catch (error) {
+      unknownRefusal = error;
+    }
+    check('an unknown session is refused with its own code', unknownRefusal?.code === 'session-purge/session-unknown', String(unknownRefusal?.code));
+    let invalidRefusal;
+    try {
+      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: '../evil' }, signal: new AbortController().signal });
+    } catch (error) {
+      invalidRefusal = error;
+    }
+    // Either layer may answer first: the manifest codec rejects at the wire
+    // boundary (`gateway/input-invalid`) and the service re-checks with its own
+    // stable code. Both mean "refused before any path use".
+    check('a traversal-shaped id is refused before any path use', invalidRefusal !== undefined && (invalidRefusal.code === 'session-purge/invalid-session-id' || invalidRefusal.code === 'gateway/input-invalid' || String(invalidRefusal.message).includes('path-safe')), `${String(invalidRefusal?.code)} ${String(invalidRefusal?.message)}`);
+
+    // A target set that grew between preview and confirmation must be refused,
+    // not silently deleted.
+    const fourth = await buildStore(join(workroot, 'gateway-store-drift'));
+    const host4 = boot({ ...config.value, sessionsRoot: fourth.sessionsRoot, storagesRoot: fourth.storagesRoot, attachmentsRoot: fourth.attachmentsRoot, spillRoots: [fourth.spillRoot] });
+    await host4.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: fourth.parentId }, signal: new AbortController().signal });
+    await mkdir(join(fourth.project, '99999999-8888-7777-6666-555555555555'), { recursive: true });
+    await writeFile(join(fourth.project, '99999999-8888-7777-6666-555555555555', 'session.v4.jsonl.zstd'), storedLog(
+      { type: 'session', version: 4, id: '99999999-8888-7777-6666-555555555555', createdAt: 9, cwd: '/Users/example/projects/demo', parentSession: fourth.parentId, isSeeded: false, origin: 'subagent', delegationDepth: 1 },
+      [{ type: 'session/title', seq: 1, time: 9, data: { title: 'Late child' } }],
+    ));
+    let driftRefusal;
+    try {
+      await host4.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: fourth.parentId }, signal: new AbortController().signal });
+    } catch (error) {
+      driftRefusal = error;
+    }
+    check('a target set that grew since the preview is refused', driftRefusal?.code === 'session-purge/target-set-changed', String(driftRefusal?.code));
+    check('the late child survives the refusal', existsSync(join(fourth.project, '99999999-8888-7777-6666-555555555555')));
+  }
   return true;
 }
 
@@ -390,12 +560,21 @@ async function testClientHalf(app) {
     return nodes;
   })();
   const checkbox = rendered.find((node) => node.props?.type === 'checkbox');
-  check('the settings page renders one checkbox per scope switch', rendered.filter((node) => node.props?.type === 'checkbox').length === 5, String(rendered.filter((node) => node.props?.type === 'checkbox').length));
+  const boxes = rendered.filter((node) => node.props?.type === 'checkbox').length;
+  const textFields = rendered.filter((node) => node.props?.type === 'text').length;
+  check('the settings page renders one checkbox per scope switch plus the spill-root field', boxes === 5 && textFields === 1, `checkboxes=${String(boxes)} text=${String(textFields)}`);
   checkbox.props.onChange({ target: { checked: true } });
   check('toggling a switch queues one field write with the revision fence', writes.length === 1 && writes[0].ops[0].op === 'set' && writes[0].revision === 3, JSON.stringify(writes));
   check('list entries carry an id, the keyed entry a key, all a locale namespace', entries.every((entry) => (typeof entry.options.id === 'string' || typeof entry.options.key === 'string') && entry.options.locale === 'plugin.sessionPurge'), JSON.stringify(entries.map((entry) => entry.options.id ?? entry.options.key)));
   check('every sidebar and overlay entry injects its behavior', entries.filter((entry) => entry.options.name !== 'plugins.row.config').every((entry) => typeof entry.options.inject === 'function'));
   check('registers dictionaries, the remote mount and the settings page', effects.length === 3 && dictionaries?.namespace === 'plugin.sessionPurge', effects.join(' | '));
+
+  const hostManifest = await import(join(here, 'typert.js'));
+  const shape = (descriptor) => `${descriptor.namespace}/${descriptor.method}:${descriptor.parameters.map((parameter) => `${parameter.wire}=${parameter.source}`).join(',')}`;
+  const hostShape = hostManifest.TYPERT.invocations.map(shape).sort();
+  const clientShape = (mounted?.descriptors ?? []).map(shape).sort();
+  check('the inline Client manifest matches the Host manifest field for field', JSON.stringify(hostShape) === JSON.stringify(clientShape), `${hostShape.join(' | ')} vs ${clientShape.join(' | ')}`);
+  check('both manifests are owned by this package', hostManifest.TYPERT.package === '@jedeiah/session-purge' && mounted?.package === '@jedeiah/session-purge');
 
   check('mounts the bundle\'s own Remote namespace', mounted?.package === '@jedeiah/session-purge' && mounted.descriptors.length === 2, JSON.stringify(mounted?.descriptors?.map((descriptor) => `${descriptor.namespace}/${descriptor.method}`)));
   // Mirrors the Client API's own admission checks: every declared field must carry
@@ -445,6 +624,7 @@ const root = await mkdtemp(join(tmpdir(), 'session-purge-selftest-'));
 try {
   const store = await buildStore(join(root, 'store'));
   await testEngine(store);
+  await testSpillDiscovery();
   await testClientHalf(appDirectory());
   await testGateway(appDirectory(), root);
 } finally {

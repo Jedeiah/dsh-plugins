@@ -110,7 +110,7 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 
 | 项目 | 方式 |
 |---|---|
-| 逻辑 | 开发期曾用测试台覆盖过 **52 项断言**（状态跳变、会话切换不误报、**会话暂时从状态表消失不误报**、重复与取消、配置驱动行为、波形/音调配置生效、音调校验拒绝非法值、配置页结构与 key、写库时机、卸载清理）。按 `verification.md` 的约定，该测试台**已删除**，不再随包提供 |
+| 逻辑 | 开发期曾用测试台覆盖过 **52 项断言**（状态跳变、会话切换不误报、**会话暂时从状态表消失不误报**、重复与取消、配置驱动行为、波形/音调配置生效、音调校验拒绝非法值、配置页结构与 key、写库时机、卸载清理）。按当时的验证约定，该测试台**已删除**，不再随包提供 |
 | 语法与清单 | `node --check`、JSON 解析、patch YAML 解析 |
 | 已安装后的实时槽位 | 客户端 `Slots.listSubTree`：root `conversation.composer.dock` 应有 `turn-notifier`；root `plugins.bundle.config` 应有 key `@jedeiah/turn-notifier` |
 | 配置 schema | 宿主 `Config.listConfigs`（name = `@jedeiah/turn-notifier`）：状态应为 `schema`（= fiber 存活且 Config 是原生 schemastery schema），并列出全部字段 |
@@ -126,6 +126,6 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 
 ## 已知限制
 
-- **开发期测试台已按约定删除。** 它模拟过 React 与 DOM，违反 `verification.md` 里"禁止模拟 React/DOM"的约定；最后一轮代码审核中它抓到了一个真 bug（会话暂时离开状态表会误报"回合结束"），确认修复后即移除，包内不再包含测试代码。
+- **开发期测试台已按约定删除。** 它模拟过 React 与 DOM，违反了当时"禁止模拟 React/DOM"的约定；最后一轮代码审核中它抓到了一个真 bug（会话暂时离开状态表会误报"回合结束"），确认修复后即移除，包内不再包含测试代码。
 - 提交方式是**失焦/回车**，不是官方那套"暂存 + 保存/放弃"模型（那套组件在 `dsh-client-ui-primitives` 里，而规范禁止插件引它）。
 - 状态跳变的判定依赖 `useSessionStatus` 给的 `running` / `pendingInteraction`；如果槽位不提供这个 hook，插件**降级为不响**而不是崩溃。

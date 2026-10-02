@@ -22,7 +22,7 @@
  * @module @jedeiah/session-purge/engine
  */
 import { createHash } from 'node:crypto';
-import { readFile, readdir, rm, rmdir, stat } from 'node:fs/promises';
+import { open, readFile, readdir, rm, rmdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import zlib from 'node:zlib';
@@ -38,6 +38,60 @@ export const SPILL_ROOT_PATTERN = /^dsh-spill-[A-Za-z0-9]{6}$/;
 
 /** A backend-generated per-session spill directory: `session-` plus 12 lowercase hex. */
 export const SPILL_SESSION_PATTERN = /^session-[0-9a-f]{12}$/;
+
+/**
+ * Bytes read when probing a stored log's header frame. The header frame holds one
+ * short line, so this only has to cover a pathological header; reading the whole
+ * file would cost a full buffer per session on every store scan.
+ */
+const HEADER_PROBE_BYTES = 64 * 1024;
+
+/**
+ * Byte cap for a reference scan. `0` disables the cap. Beyond it the scan is
+ * reported as incomplete and the attachment sweep refuses — a partial scan must
+ * never look like a complete one.
+ */
+const MAX_SCAN_BYTES = 64 * 1024 * 1024;
+
+/** Tail window used when hunting for the last recorded title in a large log. */
+const TITLE_SCAN_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The raw-line shape stores the same first line without a frame header, so it can
+ * be read with a smaller cap than a compressed header frame needs.
+ */
+const RAW_HEADER_PROBE_BYTES = 8 * 1024;
+
+/**
+ * Size of a file, or 0 when it cannot be stat'ed.
+ * @param path - the file.
+ * @returns the byte size.
+ */
+async function fileSize(path) {
+  try { return (await stat(path)).size; } catch { return 0; }
+}
+
+/**
+ * Read at most `bytes` from the start of a file.
+ * @param path - the file to read.
+ * @param bytes - the byte cap.
+ * @returns the prefix.
+ */
+async function readPrefix(path, bytes) {
+  const handle = await open(path, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(bytes);
+    let filled = 0;
+    while (filled < bytes) {
+      const { bytesRead } = await handle.read(buffer, filled, bytes - filled, filled);
+      if (bytesRead === 0) break;
+      filled += bytesRead;
+    }
+    return buffer.subarray(0, filled);
+  } finally {
+    await handle.close();
+  }
+}
 
 /**
  * Decode one zstd frame.
@@ -65,11 +119,25 @@ export function eachFrame(buffer, visit) {
     offsets.push(at);
     at += 4;
   }
-  for (let index = 0; index < offsets.length; index += 1) {
-    const end = index + 1 < offsets.length ? offsets[index + 1] : buffer.length;
-    const text = decodeFrame(buffer.subarray(offsets[index], end));
-    if (text !== undefined) visit(text);
+  let skipped = 0;
+  for (let start = 0; start < offsets.length;) {
+    // A frame boundary is a magic position, but magic bytes also occur *inside*
+    // entropy-coded blocks, so a candidate split must be proven by decoding it:
+    // take the next candidate first (the common case) and merge forward until a
+    // segment decodes. Only when no merge works is the magic a false start.
+    let matched = -1;
+    for (let end = start + 1; end <= offsets.length; end += 1) {
+      const limit = end < offsets.length ? offsets[end] : buffer.length;
+      const text = decodeFrame(buffer.subarray(offsets[start], limit));
+      if (text === undefined) continue;
+      visit(text);
+      matched = end;
+      break;
+    }
+    if (matched === -1) skipped += 1;
+    start = matched === -1 ? start + 1 : matched;
   }
+  return { frames: offsets.length, skipped };
 }
 
 /**
@@ -82,7 +150,7 @@ export function selectLogFile(entries) {
   let best;
   let bestVersion = -1;
   for (const entry of entries) {
-    const match = /^session(?:\.v(\d+))?\.jsonl\.zstd$/.exec(entry);
+    const match = /^session(?:\.v([1-9]\d*))?\.jsonl\.zstd$/.exec(entry);
     if (match === null) continue;
     const version = match[1] === undefined ? 0 : Number(match[1]);
     if (version > bestVersion) {
@@ -91,7 +159,21 @@ export function selectLogFile(entries) {
     }
   }
   if (best !== undefined) return best;
-  return entries.filter((entry) => /^session(?:\.v\d+)?\.jsonl$/.test(entry)).sort().at(-1);
+  // Raw-line stores (`compression: 'none'`) have no `.zstd` suffix, so the
+  // version has to be compared numerically here too — a lexicographic sort would
+  // rank `session.v10.jsonl` below `session.v2.jsonl`.
+  let rawBest;
+  let rawVersion = -1;
+  for (const entry of entries) {
+    const match = /^session(?:\.v([1-9]\d*))?\.jsonl$/.exec(entry);
+    if (match === null) continue;
+    const version = match[1] === undefined ? 0 : Number(match[1]);
+    if (version > rawVersion) {
+      rawVersion = version;
+      rawBest = entry;
+    }
+  }
+  return rawBest;
 }
 
 /**
@@ -111,7 +193,7 @@ export async function readSessionHeader(directory) {
   const path = join(directory, file);
   let probe;
   try {
-    probe = await readFile(path);
+    probe = await readPrefix(path, file.endsWith('.jsonl') ? RAW_HEADER_PROBE_BYTES : HEADER_PROBE_BYTES);
   } catch {
     return undefined;
   }
@@ -126,7 +208,12 @@ export async function readSessionHeader(directory) {
   // The first frame holds only the header line, so the probe's second magic
   // marks its end; without one the probe itself is the frame.
   const next = probe.indexOf(ZSTD_MAGIC, 4);
-  const text = decodeFrame(next > 0 ? probe.subarray(0, next) : probe);
+  const firstFrame = next > 0 ? probe.subarray(0, next) : probe;
+  let text = decodeFrame(firstFrame);
+  if (text === undefined && next === -1) {
+    // The probe cut the header frame in half: decode it whole from the file.
+    text = decodeFrame(await readFile(path));
+  }
   if (text === undefined) return undefined;
   try {
     return JSON.parse(text.split('\n', 1)[0]);
@@ -150,9 +237,26 @@ export async function readStoredTitle(directory) {
   }
   const file = selectLogFile(entries);
   if (file === undefined) return undefined;
+  const path = join(directory, file);
   let buffer;
   try {
-    buffer = await readFile(join(directory, file));
+    // A title is written near the end of a session's life, so a large log is
+    // scanned from its tail window instead of being read whole on the dialog's
+    // critical path. Frames that start before the window simply fail to decode
+    // and are ignored.
+    const size = await fileSize(path);
+    if (size > TITLE_SCAN_BYTES) {
+      const handle = await open(path, 'r');
+      try {
+        const window = Buffer.allocUnsafe(TITLE_SCAN_BYTES);
+        const { bytesRead } = await handle.read(window, 0, TITLE_SCAN_BYTES, size - TITLE_SCAN_BYTES);
+        buffer = window.subarray(0, bytesRead);
+      } finally {
+        await handle.close();
+      }
+    } else {
+      buffer = await readFile(path);
+    }
   } catch {
     return undefined;
   }
@@ -211,7 +315,10 @@ export async function indexStoredSessions(root) {
       } catch {
         /* a directory that vanished mid-scan keeps its zero size */
       }
-      records.set(header.id, { id: header.id, directory, projectDirectory, header, sizeBytes });
+      const existing = records.get(header.id);
+      const record = { id: header.id, directory, projectDirectory, header, sizeBytes, duplicates: [] };
+      if (existing === undefined) records.set(header.id, record);
+      else existing.duplicates.push(record);
     }
   }
   return records;
@@ -235,10 +342,48 @@ export function lineageOf(index, rootId) {
     const record = index.get(id);
     if (record !== undefined) ordered.push(record);
     for (const candidate of index.values()) {
-      if (candidate.header.parentSession === id && !seen.has(candidate.id)) queue.push(candidate.id);
+      if (candidate.header.parentSession !== id || seen.has(candidate.id)) continue;
+      // Only subagent-origin sessions are lineage: a fork also carries
+      // `parentSession`, but it is an independent conversation (the shipped
+      // packages define lineage the same way — see the archived-session gate,
+      // which returns false for any header without `origin: 'subagent'`).
+      if (candidate.header.origin !== 'subagent') continue;
+      queue.push(candidate.id);
     }
   }
   return ordered;
+}
+
+/**
+ * Sessions that point at one of these ids through `parentSession` but are not
+ * subagent lineage — i.e. forks, independent conversations the purge must not
+ * touch. The dialog reports them so the operator knows what stays behind.
+ * @param index - the stored-session index.
+ * @param ids - the sessions being deleted.
+ * @returns the fork records, in index order.
+ */
+export function forksOf(index, ids) {
+  const wanted = new Set(ids);
+  return [...index.values()].filter((record) => typeof record.header.parentSession === 'string'
+    && wanted.has(record.header.parentSession)
+    && record.header.origin !== 'subagent');
+}
+
+/**
+ * Sum the bytes inside a directory tree, bounded by the same scan cap.
+ * @param directory - the tree root.
+ * @returns the byte total, or 0 when it cannot be measured.
+ */
+async function directorySize(directory) {
+  let total = 0;
+  let entries;
+  try { entries = await readdir(directory, { withFileTypes: true }); } catch { return 0; }
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) total += await directorySize(path);
+    else total += await fileSize(path);
+  }
+  return total;
 }
 
 /**
@@ -275,25 +420,42 @@ export async function discoverSpillRoots(configured = []) {
  * @param sink - the digest sink.
  */
 export async function collectDigests(directory, sink) {
+  return collectDigestsReport(directory, sink);
+}
+
+/**
+ * Scan one stored log for attachment digests, reporting whether the scan was
+ * complete. Callers that delete bytes must fail closed on `complete === false`:
+ * an unreadable or partially undecodable log can hide a reference, and deleting
+ * an object another session still points at is irreversible.
+ * @param directory - the session-owned directory.
+ * @param sink - the digest sink.
+ * @returns whether every byte of the log was scanned.
+ */
+export async function collectDigestsReport(directory, sink) {
   let entries;
   try {
     entries = await readdir(directory);
   } catch {
-    return;
+    return false;
   }
   const file = selectLogFile(entries);
-  if (file === undefined) return;
+  if (file === undefined) return false;
+  if (MAX_SCAN_BYTES !== 0 && (await fileSize(join(directory, file))) > MAX_SCAN_BYTES) return false;
   let buffer;
   try {
     buffer = await readFile(join(directory, file));
   } catch {
-    return;
+    return false;
   }
   const scan = (text) => {
     for (const match of text.matchAll(DIGEST_PATTERN)) sink.add(match[1]);
   };
-  if (file.endsWith('.jsonl')) scan(buffer.toString('utf8'));
-  else eachFrame(buffer, scan);
+  if (file.endsWith('.jsonl')) {
+    scan(buffer.toString('utf8'));
+    return true;
+  }
+  return eachFrame(buffer, scan).skipped === 0;
 }
 
 /**
@@ -305,12 +467,20 @@ export async function collectDigests(directory, sink) {
  * @param params.survivors - directories of the sessions that stay.
  * @returns the removable digests.
  */
-export async function unreferencedDigests({ doomed, survivors }) {
+export async function unreferencedDigests({ doomed, survivors, signal }) {
   const referenced = new Set();
-  for (const directory of doomed) await collectDigests(directory, referenced);
+  for (const directory of doomed) {
+    throwIfAborted(signal);
+    await collectDigestsReport(directory, referenced);
+  }
   if (referenced.size === 0) return new Set();
   const kept = new Set();
-  for (const directory of survivors) await collectDigests(directory, kept);
+  for (const directory of survivors) {
+    throwIfAborted(signal);
+    // One surviving log that could not be read in full is enough to stop the
+    // whole subtraction: the missing reference would delete a live object.
+    if (!(await collectDigestsReport(directory, kept))) return new Set();
+  }
   return new Set([...referenced].filter((digest) => !kept.has(digest)));
 }
 
@@ -321,10 +491,11 @@ export async function unreferencedDigests({ doomed, survivors }) {
  * @param params.warnings - the warning sink.
  * @returns how many objects and links were removed.
  */
-export async function removeAttachments({ root, digests, warnings }) {
+export async function removeAttachments({ root, digests, warnings, signal }) {
   let objects = 0;
   let links = 0;
   for (const digest of digests) {
+    throwIfAborted(signal);
     const prefix = digest.slice(0, 2);
     for (const tree of ['objects', 'file-objects']) {
       const path = join(root, 'v1', tree, prefix, digest);
@@ -339,8 +510,10 @@ export async function removeAttachments({ root, digests, warnings }) {
     }
     const references = join(root, 'v1', 'files', prefix, digest);
     try {
-      await rm(references, { recursive: true, force: true });
-      links += 1;
+      if (await exists(references)) {
+        await rm(references, { recursive: true, force: true });
+        links += 1;
+      }
     } catch (error) {
       warnings.push(`could not remove attachment references ${digest}: ${String(error)}`);
     }
@@ -358,7 +531,8 @@ export async function removeAttachments({ root, digests, warnings }) {
  * @param params.spillRoots - extra spill roots to inspect.
  * @returns the plan, or `undefined` when the session is not stored.
  */
-export async function planPurge({ root, sessionId, includeDescendants, spillRoots = [] }) {
+export async function planPurge({ root, sessionId, includeDescendants, spillRoots = [], signal }) {
+  throwIfAborted(signal);
   const index = await indexStoredSessions(root);
   const selected = index.get(sessionId);
   if (selected === undefined) return undefined;
@@ -376,12 +550,17 @@ export async function planPurge({ root, sessionId, includeDescendants, spillRoot
       }
     }
   }
+  let spillBytes = 0;
+  for (const directory of spillDirectories) spillBytes += await directorySize(directory);
   return {
     sessionId,
     root,
     targets,
     targetIds: targets.map((target) => target.id),
-    sizeBytes: targets.reduce((total, target) => total + target.sizeBytes, 0),
+    logBytes: targets.reduce((total, target) => total + target.sizeBytes, 0),
+    spillBytes,
+    sizeBytes: targets.reduce((total, target) => total + target.sizeBytes, 0) + spillBytes,
+    forkIds: forksOf(index, targets.map((target) => target.id)).map((record) => record.id),
     spillDirectories,
     index,
   };
@@ -395,20 +574,29 @@ export async function planPurge({ root, sessionId, includeDescendants, spillRoot
  * @param params.warnings - the warning sink.
  * @returns the removal counters.
  */
-export async function removeSessionDirectories({ plan, removeEmptyProjectDirectory, warnings }) {
+export async function removeSessionDirectories({ plan, removeEmptyProjectDirectory, warnings, signal }) {
   let sessionDirectories = 0;
   let bytesFreed = 0;
   let projectDirectories = 0;
   const projects = new Set();
+  const removedIds = [];
+  const failedIds = [];
   for (const target of plan.targets) {
+    throwIfAborted(signal);
     bytesFreed += target.sizeBytes;
-    projects.add(target.projectDirectory);
-    try {
-      await rm(target.directory, { recursive: true, force: true });
-      sessionDirectories += 1;
-    } catch (error) {
-      warnings.push(`could not remove ${target.directory}: ${String(error)}`);
+    let failed = false;
+    for (const record of [target, ...target.duplicates]) {
+      projects.add(record.projectDirectory);
+      try {
+        await rm(record.directory, { recursive: true, force: true });
+        if (await exists(record.directory)) failed = true;
+        else sessionDirectories += 1;
+      } catch (error) {
+        failed = true;
+        warnings.push(`could not remove ${record.directory}: ${String(error)}`);
+      }
     }
+    (failed ? failedIds : removedIds).push(target.id);
   }
   if (removeEmptyProjectDirectory) {
     for (const project of projects) {
@@ -420,7 +608,24 @@ export async function removeSessionDirectories({ plan, removeEmptyProjectDirecto
       }
     }
   }
-  return { sessionDirectories, projectDirectories, bytesFreed };
+  return { sessionDirectories, projectDirectories, bytesFreed, removedIds, failedIds };
+}
+
+/**
+ * Abort the current step when the caller cancelled.
+ * @param signal - the caller's signal, when one was supplied.
+ */
+export function throwIfAborted(signal) {
+  if (signal?.aborted === true) throw signal.reason ?? new Error('session-purge: operation aborted');
+}
+
+/**
+ * Whether a path exists.
+ * @param path - the candidate path.
+ * @returns whether it exists.
+ */
+async function exists(path) {
+  try { await stat(path); return true; } catch { return false; }
 }
 
 /**
@@ -431,7 +636,7 @@ export async function removeSessionDirectories({ plan, removeEmptyProjectDirecto
  * @param params.warnings - the warning sink.
  * @returns how many documents were removed.
  */
-export async function removeProjectionRecords({ storagesRoot, ids, warnings }) {
+export async function removeProjectionRecords({ storagesRoot, ids, warnings, signal }) {
   const directory = join(storagesRoot, 'session_projcache', 'sessions');
   let entries;
   try {
@@ -442,7 +647,11 @@ export async function removeProjectionRecords({ storagesRoot, ids, warnings }) {
   const wanted = new Set(ids.map((id) => `${id}.json`));
   let removed = 0;
   for (const entry of entries) {
-    if (!wanted.has(entry.split('.bak.')[0])) continue;
+    throwIfAborted(signal);
+    // `<id>.json`, `<id>.json.bak.<stamp>` (invalid-record backup) and
+    // `<id>.json.<hex>.tmp` (an atomic write that never landed) are all residue.
+    const base = wanted.has(entry) ? entry : [...wanted].find((candidate) => entry.startsWith(`${candidate}.`));
+    if (base === undefined) continue;
     try {
       await rm(join(directory, entry), { force: true });
       removed += 1;
@@ -461,7 +670,7 @@ export async function removeProjectionRecords({ storagesRoot, ids, warnings }) {
  * @param params.warnings - the warning sink.
  * @returns how many directories were removed.
  */
-export async function removeSpillDirectories({ ids, roots, warnings }) {
+export async function removeSpillDirectories({ ids, roots, warnings, signal }) {
   const names = new Set(ids.map(spillDirectoryName));
   let removed = 0;
   for (const root of roots) {
@@ -472,6 +681,7 @@ export async function removeSpillDirectories({ ids, roots, warnings }) {
       continue;
     }
     for (const entry of entries) {
+      throwIfAborted(signal);
       if (!entry.isDirectory() || !names.has(entry.name) || !SPILL_SESSION_PATTERN.test(entry.name)) continue;
       try {
         await rm(join(root, entry.name), { recursive: true, force: true });
@@ -498,7 +708,11 @@ export async function removeSpillDirectories({ ids, roots, warnings }) {
 export async function readCachedTitle({ storagesRoot, sessionId }) {
   try {
     const document = JSON.parse(await readFile(join(storagesRoot, 'session_projcache', 'sessions', `${sessionId}.json`), 'utf8'));
-    const value = document?.record?.rows?.title?.val;
+    const row = document?.record?.rows?.title;
+    // The row carries the projection's state version; a foreign or older version
+    // is not this build's title and falls back to reading the log.
+    if (row?.ver !== 1) return undefined;
+    const value = row.val;
     return typeof value === 'string' && value.length > 0 ? value : undefined;
   } catch {
     return undefined;

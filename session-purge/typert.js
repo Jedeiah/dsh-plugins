@@ -77,6 +77,7 @@ export const TYPERT = {
           },
         },
       ],
+      cancellation: { parameter: 'signal' },
       result: {
         mode: 'strict',
         typeSymbol: `${PACKAGE}#SessionPurgeInspection`,
@@ -101,6 +102,7 @@ export const TYPERT = {
           },
         },
       ],
+      cancellation: { parameter: 'signal' },
       result: {
         mode: 'strict',
         typeSymbol: `${PACKAGE}#SessionPurgeReport`,

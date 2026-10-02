@@ -10,7 +10,7 @@
 
 | # | 位置 | 内容 |
 |---|---|---|
-| 1 | `<DSH_HOME>/sessions/<项目目录>/<会话目录>/` | 会话日志的全部格式代际 + `session.lock`；**含它的子 agent 会话**（子会话是同根的兄弟目录，靠 header 的 `parentSession` 链找出来，默认一起删） |
+| 1 | `<DSH_HOME>/sessions/<项目目录>/<会话目录>/` | 会话日志的全部格式代际 + `session.lock`；**含它的子 agent 会话**（子会话是同根的兄弟目录，header 带 `origin: "subagent"` + `parentSession`，默认递归一起删）。**从该会话「分叉」出来的独立会话不会被删**——fork 也带 `parentSession` 但没有 `origin`，官方同样不把它算作血缘；对话框会把它们列出来，让你知道留下了什么 |
 | 2 | `<DSH_HOME>/storages/session_projcache/sessions/<id>.json` | 投影检查点（连同存储域可能留下的 `.bak.<时间戳>`） |
 | 3 | `workspace.json` | 工作区归属槽位、归档集合、置顶集合——走 Workspace 注册表自己的方法，不手改文档 |
 | 4 | `schedule.json` | 绑在该会话上的提醒——走 Schedule 服务删除，避免提醒继续对着一个已经不存在的日志触发 |
@@ -18,11 +18,19 @@
 | 6 | `<DSH_HOME>/attachments/` | 附件对象与引用链接，**默认不删**（见下） |
 | 7 | 浏览器 Local Storage | 由客户端半边清理 `dsh.conversation.<id>`、`dsh.sidebar-right.v1.<id>`、`dsh.user-questions.drafts.v1.<id>`，并在 `dsh.sessions.current` 指向被删会话时移除它 |
 
-删除后会向所有已连接窗口广播官方事件 `api-session/removed`，侧栏立即掉行，不必刷新。
+删除后会向所有已连接窗口广播官方事件 `api-session/removed`（只广播**确实删净**的那些），侧栏立即掉行，不必刷新。
+
+三个安全阀：
+
+- **预览与执行必须一致**：对话框列出的目标集会随 `inspect` 记下；确认时若目标集变了（例如这期间又生成了一个子会话），宿主以 `session-purge/target-set-changed` 拒绝，要求你重新打开对话框看一遍——不会静默多删。
+- **部分失败不算成功**：某个会话目录删不掉时，它不会出现在广播里（行仍在），警告随报告返回，浏览器状态也不会被清掉。
+- **可取消**：两个 Remote 方法都声明了 `signal`，浏览器断开/调用被取消时宿主会在步骤边界停下。
 
 ## 活会话是硬性拒绝，不是警告
 
 如果目标会话（或它的某个子会话）**仍驻留在当前进程**里，删除会被拒绝，并返回稳定错误码 `session-purge/session-live`：
+
+判定走宿主注册表（`agents` / `sessions`），**不去探测 `session.lock`**。注意这个边界：POSIX 上那个文件是给别的**进程**用的排他锁，本插件不尝试获取它，所以「另一个 dsh 进程正拿着同一个会话」这种情况无法察觉（单机单实例是常态）；Windows 上它根本不是文件（命名内核信号量），所以也不可能探测。
 
 - 驻留的 Agent 仍握着写句柄，删掉它背后的日志只会让写落到已 unlink 的 inode；
 - 会话被释放时投影缓存还会做最后一次检查点写入，**把刚删掉的 `session_projcache` 记录重建出来**。
@@ -57,7 +65,8 @@ Plugins 页里可改的字段（`.volatile()`，改完立刻生效，不重挂�
 方式二（命令行，需要先退出 App）：
 
 ```bash
-dsh plugin --profile desktop add ~/agentProjects/dsh-plugins/session-purge
+# 把路径换成你自己的 clone；desktop 是桌面端保留的 profile 名，装之前先完全退出 App
+dsh plugin --profile desktop add "<本仓库绝对路径>/session-purge"
 ```
 
 > ⚠️ App 运行时**不要**用命令行装：桌面端 profile 由 Electron 应用独占，进程持有 `~/.dsh/profiles/desktop/package.json.lock`，`dsh plugin add` 会在 pnpm 阶段挂住（本次开发已实测，见下）。要么在 Plugins 页里装（它自己会与应用协调），要么先退出 App。
@@ -82,13 +91,13 @@ node selftest.mjs            # 全量：引擎 + 真实网关回归
 node selftest.mjs 2>&1 | tail -5
 ```
 
-Part A 在临时目录里造一份合成存储（真·多帧 Zstandard 日志、投影检查点、spill 目录、附件对象），验证计划与删除的结果；Part B 用**安装里真实的** `validateTypertManifest`、`TypertRegistry`、`TypertGatewayService` 把宿主半边跑通，包括：
+Part A 在临时目录里造两份合成存储（真·多帧 Zstandard 日志与 `compression: 'none'` 的裸行日志，各带投影检查点、spill 目录、附件对象），验证日志代际选择、血缘、计划、附件引用减法与删除的结果；Part C 把浏览器半边放进桩模块表里真跑一遍 `load → factory → apply`（模块 id、只 require 平台 seed、四条 slot 贡献、配置页的渲染与写入、双语文案键、以及**内联客户端 manifest 与 `typert.js` 字段逐一对齐**），并用安装里真实的 Typert 注册表做准入；Part B 用**安装里真实的** `validateTypertManifest`、`TypertRegistry`、`TypertGatewayService` 把宿主半边跑通，包括：
 
 - 手写 manifest 通过安装自带的校验器；
 - `sessionPurge.inspect` / `purge` 经网关调用成功，子会话随父会话一起删除，保留会话与它引用的附件完好；
 - 活会话被拒绝（`session-purge/session-live`）且文件原封不动，转冷后再删成功。
 
-本次记录：**32 项检查全部通过**。
+本次记录：**87 项检查全部通过**（Part A 引擎 31 + Part A2 spill 发现 3 + Part C 客户端半边 25 + Part B 真实网关与 Typert 注册表 28）。计数会随测试增加而变化，以 `node selftest.mjs` 的实际输出为准。
 
 ## 实现注记（踩过的坑）
 
@@ -122,6 +131,10 @@ Part A 在临时目录里造一份合成存储（真·多帧 Zstandard 日志、
 - 存活判定走宿主服务（Agent / Session 注册表），不依赖 `session.lock` —— Windows 上那个锁是**命名内核信号量、没有锁文件**，本插件不受影响；
 - 唯一平台差异在 `selftest.mjs`：Windows 下建符号链接用 junction（普通 symlink 需要开发者模式）；
 - `selftest.mjs` 的 `--app` 默认指向 macOS 安装路径，其它平台用 `--app <你的 @deepseek-ai 目录>`，找不到安装时 Part B/C 会自动跳过。
+
+### 不在覆盖范围内
+
+以下都是**派生数据**，本插件不碰：`<DSH_HOME>/cache/attachments` 的图片变体缓存；以及若把会话全文检索从默认的 `openAt: never`/`:memory:` 改成持久索引，那份 SQLite 里的行。二者都可以由各自的宿主在下次重建时自行纠正。
 
 ## 已知限制
 
