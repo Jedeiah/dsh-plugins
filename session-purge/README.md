@@ -97,7 +97,7 @@ Part A 在临时目录里造两份合成存储（真·多帧 Zstandard 日志与
 - `sessionPurge.inspect` / `purge` 经网关调用成功，子会话随父会话一起删除，保留会话与它引用的附件完好；
 - 活会话被拒绝（`session-purge/session-live`）且文件原封不动，转冷后再删成功。
 
-本次记录：**87 项检查全部通过**（Part A 引擎 31 + Part A2 spill 发现 3 + Part C 客户端半边 25 + Part B 真实网关与 Typert 注册表 28）。计数会随测试增加而变化，以 `node selftest.mjs` 的实际输出为准。
+本次记录：**91 项检查全部通过**（Part A 引擎 31 + Part A2 spill 发现 3 + Part C 客户端半边 29 + Part B 真实网关与 Typert 注册表 28）。计数会随测试增加而变化，以 `node selftest.mjs` 的实际输出为准。
 
 ## 实现注记（踩过的坑）
 
@@ -118,6 +118,8 @@ Part A 在临时目录里造两份合成存储（真·多帧 Zstandard 日志与
 - **`.volatile()` 字段到手不是值，是活引用。** 宿主 `apply(ctx, config)` 拿到的 volatile 字段是 `{ get() }` 句柄（`cosmokit` 的 volatile 协议），直接当布尔用会永远为真。`index.js` 的 `readConfigValue()` 统一解包，并且在每次操作开始时读一次快照，避免一次删除看到两个配置版本。
 
 - **浏览器半边拿不到 `./remote`。** 模块表只认平台 seed、已物化模块和已注册的包工厂，`require('./remote.js')` / `require('<pkg>/remote')` 都会抛。所以 Client manifest 内联在 `client.js` 里（与 `typert.js` 一一对应）。
+
+- **点号子服务必须在 `inject` 里声明。** `ctx.remote.<命名空间>` 只有在声明过的上下文里才可读，从插件自己的 ctx 直接读会抛 `cannot get property "remote.sessionPurge" without inject`。正确顺序是：先 `ctx.remote.$mount(manifest)`，再 `ctx.inject(['remote.sessionPurge', 'slots', 'locale'], child => …)`，在子上下文里注册全部界面；`configForms` 用 `child.get('configForms')` 取（它是可选的，缺了也不能挡住按钮）。Part C 的桩按这条规则实现——未声明的访问会抛同样的错，这类回归不可能再溜过去。
 
 - **客户端不能订阅自定义事件。** 转发事件的合法键集是编进应用的静态白名单（`API_REMOTE_FORWARDED_EVENTS`），第三方 `$on('自己的/事件')` 会静默注册、永不触发。本插件直接复用白名单里的 `api-session/removed`。
 

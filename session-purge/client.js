@@ -302,11 +302,18 @@ window.__ModuleLoader__.load({
      * @param store - the shared store.
      * @returns the injected behavior.
      */
-    function createPurgeApi(ctx, store, mounted) {
-      /** Run one Remote method, mapping the transport's result branches onto throws. */
+    function createPurgeApi(namespaceOf, store) {
+      /**
+       * Run one Remote method, mapping the transport's result branches onto
+       * throws. The namespace service is read through a thunk because cordis
+       * only exposes `remote.<namespace>` on a context that declares it in
+       * `inject`, and that context exists only after `$mount` has published the
+       * namespace — reading it from the plugin's own context throws
+       * "cannot get property ... without inject".
+       */
       const call = async (method, sessionId) => {
-        await mounted;
-        const result = await ctx.remote.sessionPurge[method](sessionId);
+        const namespace = await namespaceOf();
+        const result = await namespace[method](sessionId);
         if (result?.ok !== true) throw result?.error ?? new Error('session-purge: the Remote call failed');
         return result.value;
       };
@@ -568,57 +575,90 @@ window.__ModuleLoader__.load({
      * @param ctx - the client runtime.
      */
     async function apply(ctx) {
+      // Mount this bundle's Remote namespace first, then wait for the namespace
+      // service to exist. `inject` is the only way to read a dotted child
+      // service: the plugin's own context may name `remote`, never
+      // `remote.sessionPurge`, before the mount publishes it.
       const mounted = ctx.remote.$mount(TYPERT_REMOTE);
-      ctx.effect(() => () => {
-        void mounted.then((dispose) => dispose(), () => undefined);
-      }, 'session-purge: remote namespace');
 
-      const purge = createPurgeApi(ctx, store, mounted);
+      const ui = ctx.inject(['remote.sessionPurge', 'slots', 'locale'], (child) => {
+        const namespaceOf = async () => {
+          await mounted;
+          return child.remote.sessionPurge;
+        };
+        const purge = createPurgeApi(namespaceOf, store);
+        const prune = [];
 
-      ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), 'session-purge: dictionaries');
+        prune.push(child.effect(() => child.locale.register(LOCALE_NS, { zh, en }), 'session-purge: dictionaries'));
 
-      ctx.slots.inject(ROW_SLOT, () => ctx.slots.register({
-        name: ROW_SLOT,
-        id: 'session-purge',
-        order: 300,
-        locale: LOCALE_NS,
-        inject: () => ({ purge }),
-      }, PurgeRowButton));
-
-      ctx.slots.inject(MENU_SLOT, () => ctx.slots.register({
-        name: MENU_SLOT,
-        id: 'session-purge',
-        order: 500,
-        locale: LOCALE_NS,
-        inject: () => ({ purge }),
-      }, PurgeMenuItem));
-
-      // The row's configuration page: without it the Plugins page has nothing to
-      // render for this bundle — the auto-generated settings model is data only.
-      ctx.effect(() => ctx.configForms.whileServed([ROW_ID], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
-        name: 'plugins.row.config',
-        key: `${BUNDLE_NAME}#${ROW_ID}`,
-        locale: LOCALE_NS,
-      }, PurgeSettingsCard))), 'session-purge: settings page');
-
-      ctx.slots.inject(OVERLAY_SLOT, function* () {
-        yield ctx.slots.register({
-          name: OVERLAY_SLOT,
-          id: 'session-purge-confirm',
+        prune.push(child.slots.inject(ROW_SLOT, () => child.slots.register({
+          name: ROW_SLOT,
+          id: 'session-purge',
+          order: 300,
           locale: LOCALE_NS,
           inject: () => ({ purge }),
-        }, PurgeConfirmDialog);
-        yield ctx.slots.register({
-          name: OVERLAY_SLOT,
-          id: 'session-purge-toast',
+        }, PurgeRowButton)));
+
+        prune.push(child.slots.inject(MENU_SLOT, () => child.slots.register({
+          name: MENU_SLOT,
+          id: 'session-purge',
+          order: 500,
           locale: LOCALE_NS,
           inject: () => ({ purge }),
-        }, PurgeToast);
+        }, PurgeMenuItem)));
+
+        // The row's configuration page: without it the Plugins page has nothing
+        // to render for this bundle — the generated settings model is data only.
+        // `configForms` is optional, so it is read defensively rather than
+        // injected: a composition without the settings UI must still get the
+        // delete button.
+        const forms = child.get('configForms');
+        if (forms !== undefined && typeof forms.whileServed === 'function') {
+          prune.push(child.effect(() => forms.whileServed([ROW_ID], () => child.slots.inject('plugins.row.config', () => child.slots.register({
+            name: 'plugins.row.config',
+            key: `${BUNDLE_NAME}#${ROW_ID}`,
+            locale: LOCALE_NS,
+          }, PurgeSettingsCard))), 'session-purge: settings page'));
+        }
+
+        prune.push(child.slots.inject(OVERLAY_SLOT, function* () {
+          yield child.slots.register({
+            name: OVERLAY_SLOT,
+            id: 'session-purge-confirm',
+            locale: LOCALE_NS,
+            inject: () => ({ purge }),
+          }, PurgeConfirmDialog);
+          yield child.slots.register({
+            name: OVERLAY_SLOT,
+            id: 'session-purge-toast',
+            locale: LOCALE_NS,
+            inject: () => ({ purge }),
+          }, PurgeToast);
+        }));
+
+        return () => {
+          for (const dispose of prune.reverse()) {
+            try {
+              void dispose?.();
+            } catch {
+              /* one failed teardown must not strand the rest */
+            }
+          }
+        };
       });
 
-      return undefined;
+      try {
+        await ui;
+      } catch (error) {
+        void mounted.then((dispose) => dispose(), () => undefined);
+        throw error;
+      }
+      return async () => {
+        await ui.dispose();
+        void mounted.then((dispose) => dispose(), () => undefined);
+      };
     }
 
-    return { apply, inject: ['remote', 'slots', 'locale', 'configForms'] };
+    return { apply, inject: ['remote'] };
   },
 });

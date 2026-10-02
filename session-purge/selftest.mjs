@@ -506,29 +506,86 @@ async function testClientHalf(app) {
   const entries = [];
   const effects = [];
   const writes = [];
-  let mounted;
+  const mounted = [];
+  let namespaceReads = 0;
   let dictionaries;
-  const ctx = {
-    remote: { $mount: async (contribution) => { mounted = contribution; return async () => undefined; } },
-    locale: { register: (namespace, dicts) => { dictionaries = { namespace, ...dicts }; return () => undefined; } },
-    slots: {
-      register: (options, component) => { entries.push({ options, component }); return () => undefined; },
-      inject: (_slot, callback) => {
-        const produced = callback();
-        if (produced !== undefined && produced !== null && typeof produced[Symbol.iterator] === 'function') for (const _entry of produced) { /* register() already recorded it */ }
-      },
-    },
-    effect: (body, label) => { effects.push(label); const dispose = body(); return typeof dispose === 'function' ? dispose : () => undefined; },
-    configForms: { whileServed: (_namespaces, register) => register(new Set(['session-purge'])) },
-  };
 
+  // The fake namespace service `$mount` publishes, plus a context stub that
+  // enforces cordis's own rule: `remote.<namespace>` is readable only on a
+  // context that declared it in `inject`. A client half that reads it from its
+  // own context therefore fails here exactly as it fails in the browser
+  // ("cannot get property \"remote.sessionPurge\" without inject").
+  const namespace = {
+    inspect: async () => ({ sessionId: 'x', targets: [], sizeBytes: 0, scheduleCount: 0, spillDirectoryCount: 0, includeDescendants: true, purgeAttachments: false, live: false, blocked: null, forkIds: [], logBytes: 0, spillBytes: 0 }),
+    purge: async () => ({ sessionId: 'x', targets: [], removedIds: [], failedIds: [], forkIds: [], removed: { bytesFreed: 0 }, warnings: [] }),
+  };
+  const form = {
+    getSnapshot: () => ({ status: 'ready', writable: true, revision: 1, value: {} }),
+    subscribe: () => () => undefined,
+    mutate: (ops, revision) => { writes.push({ ops, revision }); return Promise.resolve(true); },
+    set: () => undefined,
+    unset: () => undefined,
+  };
+  const makeRemote = (injected) => {
+    const remote = {
+      $mount: async (contribution) => {
+        mounted.push(contribution);
+        await Promise.resolve();
+        return async () => undefined;
+      },
+    };
+    if (injected) {
+      Object.defineProperty(remote, 'sessionPurge', {
+        get: () => { namespaceReads += 1; return namespace; },
+      });
+    } else {
+      Object.defineProperty(remote, 'sessionPurge', {
+        get: () => { throw new Error('cannot get property "remote.sessionPurge" without inject'); },
+      });
+    }
+    return remote;
+  };
+  const makeCtx = (injected = new Set()) => {
+    const ctx = {
+      remote: makeRemote(injected.has('remote.sessionPurge')),
+      slots: {
+        register: (options, component) => { entries.push({ options, component }); return () => undefined; },
+        inject: (_slot, callback) => {
+          const produced = callback();
+          if (produced !== undefined && produced !== null && typeof produced[Symbol.iterator] === 'function') for (const _entry of produced) { /* register() recorded it */ }
+        },
+      },
+      locale: { register: (namespace, dicts) => { dictionaries = { namespace, ...dicts }; return () => undefined; } },
+      configForms: { whileServed: (_namespaces, register) => register(new Set(['session-purge'])) },
+      effect: (body, label) => { effects.push(label); const dispose = body(); return typeof dispose === 'function' ? dispose : () => undefined; },
+      get: (name) => (name === 'configForms' ? ctx.configForms : undefined),
+      inject: (names, callback) => {
+        injectedNames.push(...names);
+        const child = makeCtx(new Set(names));
+        const cleanup = callback(child);
+        return {
+          then: (resolve, reject) => Promise.resolve(cleanup).then(resolve, reject),
+          catch: (reject) => Promise.resolve(cleanup).catch(reject),
+          dispose: async () => { if (typeof cleanup === 'function') await cleanup(); },
+        };
+      },
+    };
+    return ctx;
+  };
+  const injectedNames = [];
+  const ctx = makeCtx();
+
+  let disposer;
   try {
-    await plugin.apply(ctx);
+    disposer = await plugin.apply(ctx);
     check('apply() completes against a stub runtime', true);
   } catch (error) {
     check('apply() completes against a stub runtime', false, String(error));
     return;
   }
+  check('apply returns a disposer', typeof disposer === 'function');
+  check('the Remote namespace is read through an injected child context', injectedNames.includes('remote.sessionPurge'), injectedNames.join(', '));
+  check('the bundle mounts exactly one Remote contribution', mounted.length === 1 && mounted[0].package === '@jedeiah/session-purge');
 
   const slots = entries.map((entry) => entry.options.name);
   check('contributes a sidebar row action', slots.includes('sidebar.workspaces.session.row.action'));
@@ -567,21 +624,22 @@ async function testClientHalf(app) {
   check('toggling a switch queues one field write with the revision fence', writes.length === 1 && writes[0].ops[0].op === 'set' && writes[0].revision === 3, JSON.stringify(writes));
   check('list entries carry an id, the keyed entry a key, all a locale namespace', entries.every((entry) => (typeof entry.options.id === 'string' || typeof entry.options.key === 'string') && entry.options.locale === 'plugin.sessionPurge'), JSON.stringify(entries.map((entry) => entry.options.id ?? entry.options.key)));
   check('every sidebar and overlay entry injects its behavior', entries.filter((entry) => entry.options.name !== 'plugins.row.config').every((entry) => typeof entry.options.inject === 'function'));
-  check('registers dictionaries, the remote mount and the settings page', effects.length === 3 && dictionaries?.namespace === 'plugin.sessionPurge', effects.join(' | '));
+  check('registers the dictionaries and the settings page as effects', effects.length === 2 && dictionaries?.namespace === 'plugin.sessionPurge', effects.join(' | '));
 
   const hostManifest = await import(join(here, 'typert.js'));
   const shape = (descriptor) => `${descriptor.namespace}/${descriptor.method}:${descriptor.parameters.map((parameter) => `${parameter.wire}=${parameter.source}`).join(',')}`;
   const hostShape = hostManifest.TYPERT.invocations.map(shape).sort();
-  const clientShape = (mounted?.descriptors ?? []).map(shape).sort();
+  const clientShape = (mounted[0]?.descriptors ?? []).map(shape).sort();
   check('the inline Client manifest matches the Host manifest field for field', JSON.stringify(hostShape) === JSON.stringify(clientShape), `${hostShape.join(' | ')} vs ${clientShape.join(' | ')}`);
-  check('both manifests are owned by this package', hostManifest.TYPERT.package === '@jedeiah/session-purge' && mounted?.package === '@jedeiah/session-purge');
 
-  check('mounts the bundle\'s own Remote namespace', mounted?.package === '@jedeiah/session-purge' && mounted.descriptors.length === 2, JSON.stringify(mounted?.descriptors?.map((descriptor) => `${descriptor.namespace}/${descriptor.method}`)));
+  check('both manifests are owned by this package', hostManifest.TYPERT.package === '@jedeiah/session-purge' && mounted[0].package === '@jedeiah/session-purge');
+
+  check('the mounted contribution carries both methods', mounted[0].descriptors.length === 2, JSON.stringify(mounted[0].descriptors.map((descriptor) => `${descriptor.namespace}/${descriptor.method}`)));
   // Mirrors the Client API's own admission checks: every declared field must carry
   // `mode: 'strict'`, a type symbol and a `create()` factory, or the namespace
   // mounts nothing and every call fails at runtime.
   const isStrictCodec = (codec) => codec?.mode === 'strict' && typeof codec.typeSymbol === 'string' && codec.typeSymbol.length > 0 && typeof codec.create === 'function';
-  const fields = (mounted?.descriptors ?? []).flatMap((descriptor) => [...descriptor.parameters.map((parameter) => parameter.codec), descriptor.result]);
+  const fields = (mounted[0]?.descriptors ?? []).flatMap((descriptor) => [...descriptor.parameters.map((parameter) => parameter.codec), descriptor.result]);
   check('every Client descriptor field carries a strict codec', fields.length > 0 && fields.every(isStrictCodec), fields.map((codec) => `${String(codec?.mode)}/${String(codec?.typeSymbol)}`).join(', '));
 
   const dictionaryBlock = (name) => {
@@ -591,6 +649,13 @@ async function testClientHalf(app) {
   };
   const zh = dictionaryBlock('zh');
   const en = dictionaryBlock('en');
+  // Reading the namespace from the plugin's own context must still throw (that is
+  // the browser failure this wiring exists to avoid), while the child context is
+  // allowed to read it.
+  let outerThrew = false;
+  try { void ctx.remote.sessionPurge; } catch { outerThrew = true; }
+  check('the outer context still guards the dotted service (regression shape)', outerThrew);
+
   const usedKeys = new Set([...source.matchAll(/\bt\('[A-Za-z][A-Za-z0-9_]*'/g)].map((match) => match[0].slice(3, -1)));
   // The scope switches are worded from a table, so their keys appear only as
   // `t(\`opt${field}\`)` templates: every opt*/hint* entry is live when the source
@@ -612,7 +677,7 @@ async function testClientHalf(app) {
     const { TypertRegistry } = await import(join(app, 'dsh-typert-registry', 'lib', 'index.js'));
     const ctx = new Context();
     new TypertRegistry(ctx);
-    const dispose = ctx.typert.remotes.register(mounted);
+    const dispose = ctx.typert.remotes.register(mounted[0]);
     await dispose();
     check('the installation\'s Typert registry admits the Client manifest', true);
   } catch (error) {
