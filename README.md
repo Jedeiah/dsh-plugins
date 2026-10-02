@@ -9,7 +9,8 @@
 
 | 插件 | 作用 | 版本 |
 |---|---|---|
-| **[turn-notifier](turn-notifier/README.md)** | **回合提醒**：智能体答完一轮、或停下来等你操作（审批 / 提问）时响铃；不动鼠标键盘就按设定间隔重复（默认 5 秒 ×3），一动就停。**1.6.3 起设置只有一个入口**：Plugins 页卡片里点开 `turn-notifier` 那一行（右侧 `›`），三组排版（含试听、静音） | 1.6.4 |
+| **[turn-notifier](turn-notifier/README.md)** | **回合提醒**：智能体答完一轮、或停下来等你操作（审批 / 提问）时响铃；不动鼠标键盘就按设定间隔重复（默认 5 秒 ×3），一动就停。设置页由配对包 [turn-notifier-settings](turn-notifier-settings/README.md) 提供（Plugins 页卡片里点开 `turn-notifier` 那一行右侧的 `›`；键 `@jedeiah/turn-notifier#turn-notifier`、挂 `whileServed` 反应式门），所以「停用→启用响铃那一行」不再弄丢设置入口；响铃本身仍随行开关进出，回到界面需重载页面 | 1.6.6 |
+| **[turn-notifier-settings](turn-notifier-settings/README.md)** | **回合提醒设置**：`turn-notifier` 的设置页半边，三组排版（什么时候响 / 怎么响 / 重复与停止）含试听与静音。拆成独立 bundle 是为了让设置入口与「可被停用的那一行」解耦：本包的行不需要开关，且注册挂在命名空间反应式门上，命名空间回来时自动重挂 | 1.0.0 |
 | **[web-fetch-fakeip](web-fetch-fakeip/README.md)** | **抓取兼容 fake-ip 代理**：复用官方 HTTP 抓取提供方的整条流水线，只额外放行本地 TUN 代理（Clash / Shadowrocket）的 fake-ip 段，让 `web_fetch` 开着代理时也能正常工作 | 5.0.0 |
 | **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **Chrome DevTools MCP**：给模型浏览器调试工具（页面管理、快照、截图、DOM/JS 求值、控制台、网络、性能分析），工具名形如 `mcp__chrome-devtools__<tool>` | 1.0.0 |
 | **[session-purge](session-purge/README.md)** | **会话彻底删除**：侧栏会话行的悬停按钮 / 「…」菜单里加「删除会话」，把会话连同子 agent 会话从磁盘上连根清掉——日志与锁、投影缓存、工作区归属、绑定的提醒、工具落盘文件，可选清掉无人引用的附件对象；活会话拒绝删除（先重启 App） | 1.0.0 |
