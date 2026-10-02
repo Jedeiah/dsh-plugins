@@ -29,14 +29,24 @@
  */
 
 window.__ModuleLoader__.load({
-  id: '@local/session-purge',
+  id: '@jedeiah/session-purge',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
 
     /** This bundle's package name: the browser module id and the Remote package id. */
-    const BUNDLE_NAME = '@local/session-purge';
+    const BUNDLE_NAME = '@jedeiah/session-purge';
+    /** The row id this bundle's patch declares; also this plugin's settings namespace. */
+    const ROW_ID = 'session-purge';
+    /** Scope switches the row's configuration page renders, with their Host defaults. */
+    const SCOPE_OPTIONS = [
+      ['includeDescendants', true],
+      ['removeEmptyProjectDirectory', true],
+      ['purgeSchedules', true],
+      ['purgeSpill', true],
+      ['purgeAttachments', false],
+    ];
     /** Dictionary namespace owned by this plugin. */
     const LOCALE_NS = 'plugin.sessionPurge';
     /** Hover-button list on a session row. */
@@ -45,6 +55,13 @@ window.__ModuleLoader__.load({
     const MENU_SLOT = 'sidebar.workspaces.session.menu.item';
     /** Full-shell overlay slot: dialogs and toasts. */
     const OVERLAY_SLOT = 'shell.overlay';
+
+    /**
+     * A strict result codec factory. `create` must be a *function* returning the
+     * schema object — the API admission checks call it — so this cannot be the
+     * schema itself.
+     */
+    const passthroughCodec = () => ({ parse: (value) => value });
 
     /** Hand-written Client manifest, mirroring `typert.js`. */
     const TYPERT_REMOTE = {
@@ -80,16 +97,25 @@ window.__ModuleLoader__.load({
     /** How long an error toast stays up. */
     const ERROR_TOAST_HOLD_MS = 12000;
 
-    /** A strict codec whose parser accepts any value; result codecs are not executed. */
-    const passthroughCodec = { parse: (value) => value };
-
-    /** A strict codec for a session id: a non-empty, path-safe string. */
+    /**
+     * A strict codec for a session id: a non-empty, path-safe string.
+     *
+     * The shape matters: the Client API validates every declared field before a
+     * method becomes callable (`mode`, `typeSymbol`, `create()`), even though this
+     * face never executes the parser — the Host decodes the wire value with the
+     * matching codec from `typert.js`. A bare `{ parse }` therefore mounts
+     * nothing and fails every call, which is what the smoke test pins down.
+     */
     function sessionIdCodec() {
       return {
-        parse(value) {
-          if (typeof value !== 'string' || value.length === 0) throw new Error('session-purge: sessionId must be a non-empty string');
-          return value;
-        },
+        mode: 'strict',
+        typeSymbol: `${BUNDLE_NAME}#SessionId`,
+        create: () => ({
+          parse(value) {
+            if (typeof value !== 'string' || value.length === 0) throw new Error('session-purge: sessionId must be a non-empty string');
+            return value;
+          },
+        }),
       };
     }
 
@@ -115,6 +141,20 @@ window.__ModuleLoader__.load({
       confirmPending: '正在删除…',
       cancel: '取消',
       close: '关闭',
+      settingsSummary: '删除会话的清扫范围：子会话、空项目目录、绑定的提醒、工具落盘文件、无引用附件。',
+      settingsIntro: '这些开关决定「删除会话」会清掉哪些痕迹。改动立即生效，不需要重启。附件默认保留：字节是跨会话共享去重的。',
+      settingsLoading: '正在读取配置…',
+      settingsUnavailable: '当前不可写（远端页面或未连接本机）。',
+      optIncludeDescendants: '一并删除子 agent 会话',
+      hintIncludeDescendants: '子会话是同一个存储里的兄弟会话，靠 parentSession 链识别。',
+      optRemoveEmptyProjectDirectory: '回收被清空的项目目录',
+      hintRemoveEmptyProjectDirectory: '项目目录里的最后一个会话删掉后，把空目录也收掉。',
+      optPurgeSchedules: '删除该会话绑定的提醒',
+      hintPurgeSchedules: '否则提醒会继续对着一个已经不存在的日志触发。',
+      optPurgeSpill: '删除工具落盘文件（spill）',
+      hintPurgeSpill: '工具大输出的落盘文件，按会话 id 的哈希定位。',
+      optPurgeAttachments: '清理无引用附件',
+      hintPurgeAttachments: '先扫描其余会话的引用，只删除没有任何保留会话再引用的附件对象（图片/文件字节）。',
       toastDeleted: '已删除 {count} 个会话，释放 {size}',
       toastWarned: '；有 {count} 条警告，详见日志',
       toastFailed: '删除失败：{message}',
@@ -142,6 +182,20 @@ window.__ModuleLoader__.load({
       confirmPending: 'Deleting…',
       cancel: 'Cancel',
       close: 'Close',
+      settingsSummary: 'What a delete sweeps: subagent sessions, emptied project directories, bound reminders, spilled tool output and unreferenced attachments.',
+      settingsIntro: 'These switches decide what "Delete session" removes. Changes apply immediately; no restart needed. Attachments stay by default because their bytes are de-duplicated across sessions.',
+      settingsLoading: 'Loading configuration…',
+      settingsUnavailable: 'Not writable from here (remote page or no local connection).',
+      optIncludeDescendants: 'Delete subagent sessions too',
+      hintIncludeDescendants: 'Children are sibling sessions in the same store, found through the parentSession chain.',
+      optRemoveEmptyProjectDirectory: 'Reclaim emptied project directories',
+      hintRemoveEmptyProjectDirectory: 'Drop a project directory once its last session is gone.',
+      optPurgeSchedules: 'Delete this session\'s reminders',
+      hintPurgeSchedules: 'Otherwise a reminder keeps firing into a log that no longer exists.',
+      optPurgeSpill: 'Delete spilled tool output',
+      hintPurgeSpill: 'Large tool output spilled to disk, addressed by the hash of the session id.',
+      optPurgeAttachments: 'Purge unreferenced attachments',
+      hintPurgeAttachments: 'Scans the surviving sessions first and removes only attachment objects no session references any more.',
       toastDeleted: 'Deleted {count} session(s), freed {size}',
       toastWarned: '; {count} warning(s) logged',
       toastFailed: 'Delete failed: {message}',
@@ -408,6 +462,51 @@ window.__ModuleLoader__.load({
       }, `session-purge-toast-${String(toast.seq)}`);
     }
 
+
+    /**
+     * The row's configuration page on the Plugins page.
+     *
+     * The Plugins page renders a row's form only when the bundle registers a page
+     * for that row (`plugins.row.config`, keyed `<package>#<row id>`): the
+     * settings service supplies the values and the write queue, never the UI.
+     * The page is registered while the Host serves this row's namespace, so a
+     * composition that never mounts the plugin shows no page at all.
+     */
+    function PurgeSettingsCard(props) {
+      const { t, view, form } = props;
+      if (view === 'summary') return t('settingsSummary');
+      const state = form?.state;
+      if (state === undefined) return null;
+      if (state.status === 'loading') return h('div', { role: 'status' }, t('settingsLoading'));
+      if (state.status !== 'ready') return h('div', { role: 'status', style: { opacity: 0.7 } }, t('settingsUnavailable'));
+      const value = state.value ?? {};
+      const disabled = state.writable !== true;
+      const write = (field, next) => {
+        void form.mutate([{ op: 'set', path: [field], value: next }], state.revision);
+      };
+      const checked = (field, fallback) => (typeof value[field] === 'boolean' ? value[field] : fallback);
+      return h('div', null, [
+        h('p', { key: 'intro', style: { marginTop: 0, opacity: 0.75, lineHeight: 1.6 } }, t('settingsIntro')),
+        ...SCOPE_OPTIONS.map(([field, fallback]) => h('label', {
+          key: field,
+          style: { display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 10, cursor: disabled ? 'default' : 'pointer' },
+        }, [
+          h('input', {
+            key: 'input',
+            type: 'checkbox',
+            checked: checked(field, fallback),
+            disabled,
+            onChange: (event) => write(field, event.target.checked),
+            style: { marginTop: 3, flex: 'none' },
+          }),
+          h('span', { key: 'text' }, [
+            h('span', { key: 'label', style: { fontWeight: 600 } }, t(`opt${field[0].toUpperCase()}${field.slice(1)}`)),
+            h('div', { key: 'hint', style: { opacity: 0.7, fontSize: 12, lineHeight: 1.5 } }, t(`hint${field[0].toUpperCase()}${field.slice(1)}`)),
+          ]),
+        ])),
+      ]);
+    }
+
     // The store is module-scoped rather than created per `apply` call: the three
     // entries must share it, and one bundle row is mounted at most once per page.
     const store = createStore();
@@ -443,6 +542,14 @@ window.__ModuleLoader__.load({
         inject: () => ({ purge }),
       }, PurgeMenuItem));
 
+      // The row's configuration page: without it the Plugins page has nothing to
+      // render for this bundle — the auto-generated settings model is data only.
+      ctx.effect(() => ctx.configForms.whileServed([ROW_ID], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+        name: 'plugins.row.config',
+        key: `${BUNDLE_NAME}#${ROW_ID}`,
+        locale: LOCALE_NS,
+      }, PurgeSettingsCard))), 'session-purge: settings page');
+
       ctx.slots.inject(OVERLAY_SLOT, function* () {
         yield ctx.slots.register({
           name: OVERLAY_SLOT,
@@ -461,6 +568,6 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
-    return { apply, inject: ['remote', 'slots', 'locale'] };
+    return { apply, inject: ['remote', 'slots', 'locale', 'configForms'] };
   },
 });

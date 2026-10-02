@@ -76,7 +76,7 @@ dsh plugin --profile <你的profile> add "github:Jedeiah/dsh-plugins#path:turn-n
 - **宿主半边不要写死可调参数。** 导出 `Config` schema（`import z from '@deepseek-ai/schemastery'`），字段加 `.volatile()`，这样它们才会出现在 Plugins 页面的配置表单里。
 - **从 dsh 安装目录里 import 的包，必须写进该插件的 `peerDependencies`。** 本仓库的插件是 `link:` 进 profile 的，裸导入靠这条声明被路由到安装里的副本（否则报 `ERR_MODULE_NOT_FOUND` → 该行 `failed to import`）。
 - **客户端半边别写 `immediately: true`**，除非真的需要启动期预取——它会把这一行划进 bootstrap 阶段，而 bootstrap 条目无法被动态移除/替换。
-- `@local/*` 只是本地作用域名。**改名要同步改 `cordis.patch.yml` 里的行名并重新安装。**
+- `@jedeiah/*` 是这些包的作用域名（与仓库作者同名，避免与他人撞名）。**改名要同步改 `cordis.patch.yml` 里的行名、客户端半边的模块 id 并重新安装。**
 
 ## 已知的 dsh 侧问题
 

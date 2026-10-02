@@ -6,4 +6,4 @@
 
 - insert:
     - id: session-purge
-      name: '@local/session-purge'
+      name: '@jedeiah/session-purge'

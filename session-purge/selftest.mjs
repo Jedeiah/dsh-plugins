@@ -18,13 +18,14 @@
  * Nothing outside the temporary directory is read or written, except reading the
  * installation's packages.
  *
- * @module @local/session-purge/selftest
+ * @module @jedeiah/session-purge/selftest
  */
 import { createHash } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 import zlib from 'node:zlib';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -195,8 +196,11 @@ async function testGateway(app, workroot) {
   await cp(join(here, 'index.js'), join(bundle, 'index.js'));
   await cp(join(here, 'engine.js'), join(bundle, 'engine.js'));
   await cp(join(here, 'typert.js'), join(bundle, 'typert.js'));
+  // Windows cannot create directory symlinks without Developer Mode or elevation,
+  // so the shim uses a junction there; every other platform takes a plain symlink.
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
   for (const name of ['schemastery', 'dsh-typert-protocol', 'dsh-home-paths']) {
-    await symlink(join(app, name), join(modules, 'node_modules', '@deepseek-ai', name), 'dir');
+    await symlink(join(app, name), join(modules, 'node_modules', '@deepseek-ai', name), linkType);
   }
 
   const { Context } = await import(join(app, 'cordis', 'lib', 'index.js'));
@@ -207,7 +211,7 @@ async function testGateway(app, workroot) {
   const manifest = await import(join(bundle, 'typert.js'));
 
   try {
-    validateTypertManifest('@local/session-purge', manifest.TYPERT);
+    validateTypertManifest('@jedeiah/session-purge', manifest.TYPERT);
     check('hand-written TYPERT manifest passes the installation validator', true);
   } catch (error) {
     check('hand-written TYPERT manifest passes the installation validator', false, String(error));
@@ -270,10 +274,178 @@ async function testGateway(app, workroot) {
   return true;
 }
 
+/**
+ * Part C: materialise the browser half in a stub module table and activate it
+ * against a stub client runtime.
+ *
+ * The Client half is a classic script that hands its factory to
+ * `window.__ModuleLoader__.load`; nothing about it is type-checked or executed
+ * until a page loads, so a mistake there costs a boot failure that the Host half
+ * cannot see. This part runs the same sequence the page does — register, build
+ * the module, call `apply` — and asserts the contributions, the Remote manifest
+ * and the dictionaries, which is exactly the class of defect (a const referenced
+ * from its own temporal dead zone) that shipped the first time.
+ */
+async function testClientHalf(app) {
+  console.log('\nPart C — client half materialisation and registration');
+  const source = await readFile(join(here, 'client.js'), 'utf8');
+
+  const registered = [];
+  const sandbox = { console, window: { __ModuleLoader__: { load: (spec) => registered.push(spec) } } };
+  vm.createContext(sandbox);
+  try {
+    vm.runInContext(source, sandbox, { filename: 'client.js' });
+    check('module body evaluates and registers itself', registered.length === 1, `${String(registered.length)} registration(s)`);
+  } catch (error) {
+    check('module body evaluates and registers itself', false, String(error));
+    return;
+  }
+  const module = registered[0];
+  check('module id is the package name', module.id === '@jedeiah/session-purge', String(module.id));
+  check('it exposes a factory', typeof module.factory === 'function');
+
+  // The two specifiers a page resolves for this bundle: React and the primitives
+  // package, both platform seeds. Anything else would fail at runtime.
+  const required = [];
+  const react = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: (initial) => [initial, () => undefined],
+    useEffect: () => undefined,
+    Fragment: Symbol('Fragment'),
+    useSyncExternalStore: (_subscribe, read) => read(),
+  };
+  const primitives = new Proxy({}, { get: (_target, key) => (props) => ({ type: String(key), props }) });
+  const require = (spec) => {
+    required.push(spec);
+    if (spec === 'react') return react;
+    if (spec === '@deepseek-ai/dsh-client-ui-primitives') return primitives;
+    throw new Error(`client half required an unexpected specifier: ${spec}`);
+  };
+
+  let plugin;
+  try {
+    plugin = module.factory(require);
+    check('factory body runs (no temporal-dead-zone reference)', true);
+  } catch (error) {
+    check('factory body runs (no temporal-dead-zone reference)', false, String(error));
+    return;
+  }
+  check('exports { inject, apply }', typeof plugin.apply === 'function' && Array.isArray(plugin.inject), JSON.stringify(plugin.inject));
+  check('requires only platform seeds', required.every((spec) => spec === 'react' || spec === '@deepseek-ai/dsh-client-ui-primitives'), required.join(', '));
+
+  const entries = [];
+  const effects = [];
+  const writes = [];
+  let mounted;
+  let dictionaries;
+  const ctx = {
+    remote: { $mount: async (contribution) => { mounted = contribution; return async () => undefined; } },
+    locale: { register: (namespace, dicts) => { dictionaries = { namespace, ...dicts }; return () => undefined; } },
+    slots: {
+      register: (options, component) => { entries.push({ options, component }); return () => undefined; },
+      inject: (_slot, callback) => {
+        const produced = callback();
+        if (produced !== undefined && produced !== null && typeof produced[Symbol.iterator] === 'function') for (const _entry of produced) { /* register() already recorded it */ }
+      },
+    },
+    effect: (body, label) => { effects.push(label); const dispose = body(); return typeof dispose === 'function' ? dispose : () => undefined; },
+    configForms: { whileServed: (_namespaces, register) => register(new Set(['session-purge'])) },
+  };
+
+  try {
+    await plugin.apply(ctx);
+    check('apply() completes against a stub runtime', true);
+  } catch (error) {
+    check('apply() completes against a stub runtime', false, String(error));
+    return;
+  }
+
+  const slots = entries.map((entry) => entry.options.name);
+  check('contributes a sidebar row action', slots.includes('sidebar.workspaces.session.row.action'));
+  check('contributes a sidebar menu row', slots.includes('sidebar.workspaces.session.menu.item'));
+  check('contributes two overlay entries (dialog + toast)', slots.filter((slot) => slot === 'shell.overlay').length === 2, slots.join(', '));
+  const settingsEntry = entries.find((entry) => entry.options.name === 'plugins.row.config');
+  check('contributes the row configuration page keyed <package>#<row id>', settingsEntry?.options.key === '@jedeiah/session-purge#session-purge', JSON.stringify(settingsEntry?.options));
+  const card = settingsEntry?.component({ t: (key) => key, view: 'summary', form: undefined });
+  check('the settings page renders a one-liner for the summary view', typeof card === 'string');
+  const page = settingsEntry?.component({
+    t: (key) => key,
+    view: 'page',
+    form: {
+      state: { status: 'ready', writable: true, revision: 3, value: { purgeAttachments: true, purgeSpill: false } },
+      mutate: (ops, revision) => { writes.push({ ops, revision }); return Promise.resolve(true); },
+    },
+  });
+  const flat = JSON.stringify(page, (key, value) => (typeof value === 'function' ? '[fn]' : value));
+  check('the settings page renders every switch with the stored values', flat.includes('optPurgeAttachments') && flat.includes('"checked":true') && flat.includes('"checked":false'), flat.slice(0, 160));
+  const rendered = (() => {
+    const nodes = [];
+    const walk = (node) => {
+      if (Array.isArray(node)) { for (const child of node) walk(child); return; }
+      if (node === null || node === undefined || typeof node !== 'object') return;
+      nodes.push(node);
+      walk(node.children);
+    };
+    walk(page);
+    return nodes;
+  })();
+  const checkbox = rendered.find((node) => node.props?.type === 'checkbox');
+  check('the settings page renders one checkbox per scope switch', rendered.filter((node) => node.props?.type === 'checkbox').length === 5, String(rendered.filter((node) => node.props?.type === 'checkbox').length));
+  checkbox.props.onChange({ target: { checked: true } });
+  check('toggling a switch queues one field write with the revision fence', writes.length === 1 && writes[0].ops[0].op === 'set' && writes[0].revision === 3, JSON.stringify(writes));
+  check('list entries carry an id, the keyed entry a key, all a locale namespace', entries.every((entry) => (typeof entry.options.id === 'string' || typeof entry.options.key === 'string') && entry.options.locale === 'plugin.sessionPurge'), JSON.stringify(entries.map((entry) => entry.options.id ?? entry.options.key)));
+  check('every sidebar and overlay entry injects its behavior', entries.filter((entry) => entry.options.name !== 'plugins.row.config').every((entry) => typeof entry.options.inject === 'function'));
+  check('registers dictionaries, the remote mount and the settings page', effects.length === 3 && dictionaries?.namespace === 'plugin.sessionPurge', effects.join(' | '));
+
+  check('mounts the bundle\'s own Remote namespace', mounted?.package === '@jedeiah/session-purge' && mounted.descriptors.length === 2, JSON.stringify(mounted?.descriptors?.map((descriptor) => `${descriptor.namespace}/${descriptor.method}`)));
+  // Mirrors the Client API's own admission checks: every declared field must carry
+  // `mode: 'strict'`, a type symbol and a `create()` factory, or the namespace
+  // mounts nothing and every call fails at runtime.
+  const isStrictCodec = (codec) => codec?.mode === 'strict' && typeof codec.typeSymbol === 'string' && codec.typeSymbol.length > 0 && typeof codec.create === 'function';
+  const fields = (mounted?.descriptors ?? []).flatMap((descriptor) => [...descriptor.parameters.map((parameter) => parameter.codec), descriptor.result]);
+  check('every Client descriptor field carries a strict codec', fields.length > 0 && fields.every(isStrictCodec), fields.map((codec) => `${String(codec?.mode)}/${String(codec?.typeSymbol)}`).join(', '));
+
+  const dictionaryBlock = (name) => {
+    const start = source.indexOf(`const ${name} = {`);
+    const end = source.indexOf('};', start);
+    return new Set([...source.slice(start, end).matchAll(/^ {6}([a-zA-Z][A-Za-z0-9_]*):/gm)].map((match) => match[1]));
+  };
+  const zh = dictionaryBlock('zh');
+  const en = dictionaryBlock('en');
+  const usedKeys = new Set([...source.matchAll(/\bt\('[A-Za-z][A-Za-z0-9_]*'/g)].map((match) => match[0].slice(3, -1)));
+  // The scope switches are worded from a table, so their keys appear only as
+  // `t(\`opt${field}\`)` templates: every opt*/hint* entry is live when the source
+  // renders those two templates.
+  if (source.includes('t(`opt${') && source.includes('t(`hint${')) {
+    for (const key of [...zh, ...en]) if (/^(opt|hint)[A-Z]/.test(key)) usedKeys.add(key);
+  }
+  check('every t() key exists in both dictionaries', [...usedKeys].every((key) => zh.has(key) && en.has(key)), [...usedKeys].filter((key) => !zh.has(key) || !en.has(key)).join(', '));
+  check('no dictionary key is dead', [...zh].every((key) => usedKeys.has(key)), [...zh].filter((key) => !usedKeys.has(key)).join(', '));
+
+  // The strongest available admission check: hand the Client manifest to the
+  // installation's own Typert registry, the same one the browser mounts it into.
+  if (!(await exists(join(app, 'dsh-typert-registry', 'lib', 'index.js')))) {
+    console.log('  skip real-registry admission (no dsh installation; pass --app)');
+    return;
+  }
+  try {
+    const { Context } = await import(join(app, 'cordis', 'lib', 'index.js'));
+    const { TypertRegistry } = await import(join(app, 'dsh-typert-registry', 'lib', 'index.js'));
+    const ctx = new Context();
+    new TypertRegistry(ctx);
+    const dispose = ctx.typert.remotes.register(mounted);
+    await dispose();
+    check('the installation\'s Typert registry admits the Client manifest', true);
+  } catch (error) {
+    check('the installation\'s Typert registry admits the Client manifest', false, String(error));
+  }
+}
+
 const root = await mkdtemp(join(tmpdir(), 'session-purge-selftest-'));
 try {
   const store = await buildStore(join(root, 'store'));
   await testEngine(store);
+  await testClientHalf(appDirectory());
   await testGateway(appDirectory(), root);
 } finally {
   await rm(root, { recursive: true, force: true });

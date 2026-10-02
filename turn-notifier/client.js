@@ -21,7 +21,7 @@
  */
 
 /** This bundle's package name: the browser module id. */
-const BUNDLE_NAME = '@local/turn-notifier';
+const BUNDLE_NAME = '@jedeiah/turn-notifier';
 /** Profile row id; also the Host settings namespace. */
 const ENTRY_ID = 'turn-notifier';
 /** Dictionary namespace owned by this plugin. */

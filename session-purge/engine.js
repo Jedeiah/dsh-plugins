@@ -19,7 +19,7 @@
  *   - Attachments: `<attachmentsRoot>/v1/{objects,file-objects}/<2 hex>/<sha256>`
  *     and reference links at `<attachmentsRoot>/v1/files/<2 hex>/<sha256>/<name>`.
  *
- * @module @local/session-purge/engine
+ * @module @jedeiah/session-purge/engine
  */
 import { createHash } from 'node:crypto';
 import { readFile, readdir, rm, rmdir, stat } from 'node:fs/promises';

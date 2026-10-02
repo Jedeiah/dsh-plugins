@@ -28,7 +28,7 @@
  * the checkpoint on disposal. The purge refuses while any target is live here and
  * names them, so the Client can say what to do about it (restart, then delete).
  *
- * @module @local/session-purge
+ * @module @jedeiah/session-purge
  */
 import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';

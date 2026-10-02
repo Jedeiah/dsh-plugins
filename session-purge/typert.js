@@ -23,7 +23,7 @@
  * *would* be the generated form; hand-rolling the two trivially-shaped schemas
  * keeps the bundle dependency-free and byte-identical on every machine.
  *
- * @module @local/session-purge/typert
+ * @module @jedeiah/session-purge/typert
  */
 
 /**
@@ -51,7 +51,7 @@ function sessionIdCodec() {
 }
 
 /** Endpoint ids, spelled `<package>#<namespace>/<method>` like the generated ones. */
-const PACKAGE = '@local/session-purge';
+const PACKAGE = '@jedeiah/session-purge';
 
 /** The Host manifest consumed by the Typert loader on the row that mounts this bundle. */
 export const TYPERT = {

@@ -1,5 +1,5 @@
 {
-  "name": "@local/session-purge",
+  "name": "@jedeiah/session-purge",
   "version": "1.0.0",
   "private": true,
   "type": "module",

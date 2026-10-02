@@ -52,7 +52,7 @@
 
 ```yaml
 - id: turn-notifier
-  name: '@local/turn-notifier'
+  name: '@jedeiah/turn-notifier'
   config:
     repeatCount: 4
     intervalMs: 3000
@@ -112,13 +112,17 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 |---|---|
 | 逻辑 | 开发期曾用测试台覆盖过 **52 项断言**（状态跳变、会话切换不误报、**会话暂时从状态表消失不误报**、重复与取消、配置驱动行为、波形/音调配置生效、音调校验拒绝非法值、配置页结构与 key、写库时机、卸载清理）。按 `verification.md` 的约定，该测试台**已删除**，不再随包提供 |
 | 语法与清单 | `node --check`、JSON 解析、patch YAML 解析 |
-| 已安装后的实时槽位 | 客户端 `Slots.listSubTree`：root `conversation.composer.dock` 应有 `turn-notifier`；root `plugins.bundle.config` 应有 key `@local/turn-notifier` |
-| 配置 schema | 宿主 `Config.listConfigs`（name = `@local/turn-notifier`）：状态应为 `schema`（= fiber 存活且 Config 是原生 schemastery schema），并列出全部字段 |
+| 已安装后的实时槽位 | 客户端 `Slots.listSubTree`：root `conversation.composer.dock` 应有 `turn-notifier`；root `plugins.bundle.config` 应有 key `@jedeiah/turn-notifier` |
+| 配置 schema | 宿主 `Config.listConfigs`（name = `@jedeiah/turn-notifier`）：状态应为 `schema`（= fiber 存活且 Config 是原生 schemastery schema），并列出全部字段 |
 
 **无法自动验证、需要你亲测的两件事：**
 
 1. **表单长什么样。** 样式是按"令牌 + 结构"写的，**没有做过视觉比对**（自动化能驱动的是 Chrome，而 Harness 界面在 Electron 里）。
 2. **是否真的出声。** 需要真实音频设备与浏览器自动播放策略，只能在你的环境里确认。
+
+## 平台
+
+纯浏览器半边（Web Audio + Pointer Events），没有宿主代码、没有平台判断：桌面端（macOS / Windows / Linux）与 Web profile 都能用。唯一前提是页面能发声——浏览器要求先有一次用户手势，这也是它自己解锁音频上下文的原因。
 
 ## 已知限制
 

@@ -14,4 +14,4 @@
 
 - insert:
     - id: web-fetch-fakeip
-      name: '@local/web-fetch-fakeip'
+      name: '@jedeiah/web-fetch-fakeip'

@@ -62,7 +62,7 @@ dsh plugin --profile desktop add ~/agentProjects/dsh-plugins/session-purge
 
 > ⚠️ App 运行时**不要**用命令行装：桌面端 profile 由 Electron 应用独占，进程持有 `~/.dsh/profiles/desktop/package.json.lock`，`dsh plugin add` 会在 pnpm 阶段挂住（本次开发已实测，见下）。要么在 Plugins 页里装（它自己会与应用协调），要么先退出 App。
 
-卸载：Plugins 页里 Remove，或退出 App 后 `dsh plugin --profile desktop remove @local/session-purge`。
+卸载：Plugins 页里 Remove，或退出 App 后 `dsh plugin --profile desktop remove @jedeiah/session-purge`。
 
 ## 文件
 
@@ -113,6 +113,15 @@ Part A 在临时目录里造一份合成存储（真·多帧 Zstandard 日志、
 - **客户端不能订阅自定义事件。** 转发事件的合法键集是编进应用的静态白名单（`API_REMOTE_FORWARDED_EVENTS`），第三方 `$on('自己的/事件')` 会静默注册、永不触发。本插件直接复用白名单里的 `api-session/removed`。
 
 - **deletion 的引用面比想象广。** 只删日志目录能让会话从 UI 消失（列表靠 header，失效 id 会被过滤、下次变更时剪除），但投影缓存、工作区槽位、提醒、spill、浏览器状态都会留下痕迹；本插件的价值就在于把这些一次性做全。
+
+## 平台
+
+纯 Node（`node:fs` / `node:os` / `node:path` / `node:zlib` / `node:crypto`）+ 浏览器 API，代码里没有 `process.platform`、没有平台路径假设：
+
+- 会话目录、项目目录都靠**读 header** 识别，不解析目录名，因此 POSIX 与 Windows 的存储布局都能处理；
+- 存活判定走宿主服务（Agent / Session 注册表），不依赖 `session.lock` —— Windows 上那个锁是**命名内核信号量、没有锁文件**，本插件不受影响；
+- 唯一平台差异在 `selftest.mjs`：Windows 下建符号链接用 junction（普通 symlink 需要开发者模式）；
+- `selftest.mjs` 的 `--app` 默认指向 macOS 安装路径，其它平台用 `--app <你的 @deepseek-ai 目录>`，找不到安装时 Part B/C 会自动跳过。
 
 ## 已知限制
 

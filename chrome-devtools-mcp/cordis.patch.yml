@@ -1,4 +1,4 @@
-# Chrome DevTools MCP — provided by the local bundle @local/chrome-devtools-mcp.
+# Chrome DevTools MCP — provided by the local bundle @jedeiah/chrome-devtools-mcp.
 #
 # This row was moved out of the profile's `cordis.patch.yml` so the server can be
 # managed from the Plugins page instead of by hand. It inserts the shipped

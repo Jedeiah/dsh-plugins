@@ -1,4 +1,4 @@
-# @local/chrome-devtools-mcp
+# @jedeiah/chrome-devtools-mcp
 
 一个**纯配置型 dsh 组合包**：通过官方自带的 `@deepseek-ai/dsh-mcp-client` 桥接，把
 [`chrome-devtools-mcp`](https://www.npmjs.com/package/chrome-devtools-mcp) 服务器接进当前
@@ -35,7 +35,7 @@ args: ['-y', 'chrome-devtools-mcp@latest', '--autoConnect', '--no-usage-statisti
 在 Plugins 页面安装，或用 `plugin_manager` 工具：
 
 - 安装：`action: install_bundle`，`target: <本目录的绝对路径>`
-- 卸载：`action: remove_bundle`，`target: @local/chrome-devtools-mcp`
+- 卸载：`action: remove_bundle`，`target: @jedeiah/chrome-devtools-mcp`
 
 **保持本目录在原位。** `install_bundle` 是把 profile 链接到这个路径、而不是复制，所以
 移动或删除目录会让组合包失效。
@@ -44,3 +44,7 @@ args: ['-y', 'chrome-devtools-mcp@latest', '--autoConnect', '--no-usage-statisti
 
 编辑这里的 `cordis.patch.yml`，然后把组合包关掉再打开（或重启 Harness）以重新组合。
 该文件在 profile 之外，不受 HMR 监视。
+
+## 平台
+
+本包只提供 patch 行，真正启动 MCP 服务器的是官方 `@deepseek-ai/dsh-mcp-client`，进程启动交给 dsh 的 subprocess seam（平台差异由它处理）。共同前提是宿主 PATH 上有 `node` / `npm`：首次运行由 `npx` 拉取 `chrome-devtools-mcp`，之后缓存在 npm 的 npx 缓存里。

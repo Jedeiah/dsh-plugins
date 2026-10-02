@@ -1,4 +1,4 @@
-# @local/web-fetch-fakeip
+# @jedeiah/web-fetch-fakeip
 
 **开着本地 TUN 代理时，让 dsh 的 `web_fetch` 继续可用。**
 
@@ -93,7 +93,7 @@ web-fetch-fakeip: allowRanges entries must be IPv4 CIDRs; got "abc"
 ## 安装 / 卸载
 
 - 安装：Plugins 页 → Add plugin，或用 `plugin_manager`：`action: install_bundle`，`target: <本目录绝对路径>`
-- 卸载：`action: remove_bundle`，`target: @local/web-fetch-fakeip`
+- 卸载：`action: remove_bundle`，`target: @jedeiah/web-fetch-fakeip`
 
 **保持本目录在原位**：`install_bundle` 是软链，移动目录会失效。
 
@@ -159,10 +159,15 @@ try {
 `apply` 级校验（非法 CIDR 指名 token、非法上限）全部生效。
 
 ```bash
-# 复跑语法检查
-ELECTRON_RUN_AS_NODE=1 "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
+# 复跑语法检查（把 $DSH_APP 指向你的 dsh 应用包——macOS 桌面端就是
+# "DeepSeek Harness.app" 所在的目录）
+ELECTRON_RUN_AS_NODE=1 "$DSH_APP/Contents/MacOS/DeepSeek Harness" \
   --check "<本目录>/index.js"
 ```
+
+## 平台
+
+宿主半边只用 `node:dns` / `node:net`，没有平台判断；`web_fetch` 走的是官方抓取提供方的整条流水线，因此三平台行为一致。README 里的复跑命令用 `$DSH_APP` 占位，macOS / Windows / Linux 各自替换成自己的应用路径即可。
 
 ## 已知限制
 
