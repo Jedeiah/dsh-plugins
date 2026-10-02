@@ -1,3 +1,6 @@
+import { appendFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 
 /**
@@ -47,7 +50,26 @@ export const Config = z.object({
  * settings service must not advertise an auto-generated form for it.
  * @param ctx - Host plugin context.
  */
+/**
+ * Append one Host-side lifecycle marker to `~/.dsh/turn-notifier-trace.log`.
+ *
+ * Temporary diagnostics paired with the browser trace in `client.js`: together
+ * they show whether a row toggle re-ran the Host half, the browser half, both,
+ * or neither. Remove once that behavior is settled.
+ *
+ * @param event - short marker name.
+ */
+function trace(event) {
+  try {
+    appendFileSync(join(homedir(), '.dsh', 'turn-notifier-trace.log'), `${new Date().toISOString()} ${event} ${process.pid}\n`);
+  } catch {
+    /* diagnostics must never break the plugin */
+  }
+}
+
 export function apply(ctx) {
+  trace('host/apply');
+  ctx.effect(() => () => trace('host/dispose'), 'turn-notifier: trace dispose');
   ctx.inject(['settings'], (child) => {
     child.effect(() => child.settings.configure({ auto: false }, ctx.fiber));
   });

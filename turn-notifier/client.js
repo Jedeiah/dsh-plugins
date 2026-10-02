@@ -466,6 +466,35 @@ window.__ModuleLoader__.load({
       reset: (field) => Promise.resolve(rowBridge.current?.mutate([{ op: 'unset', path: [field] }], rowBridge.current.state.revision)).then((accepted) => accepted !== false),
     });
 
+
+    /**
+     * Append one lifecycle marker to a browser-local trace.
+     *
+     * The row's configuration entry can only be registered by a client half that
+     * actually executed, so when a row stops showing its `›` the question is
+     * always "did `apply` run again?" — which is invisible from outside the app.
+     * This trace answers it from disk: browser localStorage lives in the app's
+     * LevelDB, so the operator never has to open DevTools. The host half writes a
+     * matching trace to `~/.dsh/turn-notifier-trace.log`, and the two together
+     * place the failure on the Host or the browser side.
+     *
+     * It is temporary diagnostics: remove once the row-toggle behavior is settled.
+     *
+     * @param event - short marker name.
+     * @param extra - optional extra fields.
+     */
+    function trace(event, extra) {
+      try {
+        const key = 'dsh.turn-notifier.trace';
+        const previous = window.localStorage.getItem(key);
+        const entries = previous === null ? [] : JSON.parse(previous);
+        entries.push({ at: new Date().toISOString(), event, ...extra });
+        window.localStorage.setItem(key, JSON.stringify(entries.slice(-40)));
+      } catch {
+        /* diagnostics must never break the plugin */
+      }
+    }
+
     /** One uppercase group heading with its rows. */
     function dialogGroup(key, title, rows) {
       return h('section', { key, style: { marginBottom: 16 } }, [
@@ -712,6 +741,8 @@ return {
         if (form !== undefined) ctx.effect(() => () => store.dispose(), 'turn-notifier: settings subscription');
 
         const audio = createAudio();
+        trace('client/apply', { entryId: ENTRY_ID });
+        ctx.effect(() => () => trace('client/dispose'), 'turn-notifier: trace dispose');
 
         // Unlock the audio context on the first user gesture, as autoplay policy requires.
         ctx.effect(() => {
@@ -733,12 +764,13 @@ return {
         // The row's own configuration page, keyed `<package>#<row id>`: clicking
         // the row in the bundle card opens the grouped body below. Registered
         // only while the Host serves this entry's settings namespace.
-        if (forms?.whileServed !== undefined) ctx.effect(() => forms.whileServed([ENTRY_ID], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+        ctx.effect(() => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
           name: 'plugins.row.config',
           key: `${BUNDLE_NAME}#${ENTRY_ID}`,
           locale: LOCALE_NS,
           inject: () => ({ audio }),
-        }, TurnNotifierRowConfig))), 'turn-notifier: row configuration page');
+        }, TurnNotifierRowConfig)), 'turn-notifier: row configuration page');
+        trace('client/row-page-registered');
 
       },
     };
