@@ -32,6 +32,9 @@ const SLOT_NAME = 'conversation.composer.dock';
 
 /** Fallbacks, mirroring the Host schema defaults. */
 const DEFAULTS = Object.freeze({
+  muted: false,
+  notifyOnTurnEnd: true,
+  notifyOnWaiting: true,
   repeatCount: 3,
   intervalMs: 5000,
   volume: 0.35,
@@ -95,6 +98,26 @@ const en = {
   readOnly: 'This deployment stores settings read-only.',
   unavailable: 'The notifier row is switched off, so there is nothing to configure right now.',
   saveFailed: 'The deployment did not accept that value; it was left for you to correct.',
+  openSettings: 'Turn notifier settings',
+  dialogTitle: 'Turn notifier',
+  close: 'Close',
+  groupWhen: 'When it rings',
+  groupHow: 'How it rings',
+  groupRepeat: 'Repeats and stopping',
+  muteLabel: 'Mute',
+  muteHint: 'Use this switch to go quiet. Do not switch the plugin row off instead: after off→on the browser half is not remounted (known dsh issue deepseek-harness#8452), so this page stays away until the page is reloaded.',
+  turnEndLabel: 'A turn finishes',
+  waitingLabel: 'It stops to wait for you (approval or question)',
+  preview: 'Preview',
+  stopHint: 'Any pointer or key activity stops the repeats immediately.',
+  done: 'Done',
+  restoreAll: 'Restore all defaults',
+  statusPrefix: 'Now: ',
+  statusIdle: 'idle',
+  statusRunning: 'running',
+  statusWaiting: 'waiting for you',
+  statusMuted: 'muted',
+  unavailable: 'The notifier row is switched off, so there is nothing to configure right now.',
 };
 
 /** Simplified Chinese copy. */
@@ -122,6 +145,26 @@ const zh = {
   readOnly: '本部署的设置为只读。',
   unavailable: '回合提醒那一行处于停用状态，现在没有可配置的内容。',
   saveFailed: '本部署没有接受这个值，已保留供你修改。',
+  openSettings: '回合提醒设置',
+  dialogTitle: '回合提醒',
+  close: '关闭',
+  groupWhen: '什么时候响',
+  groupHow: '怎么响',
+  groupRepeat: '重复与停止',
+  muteLabel: '静音',
+  muteHint: '临时安静用这个开关。不要用停用插件行来代替——停用再启用后浏览器半边不会重新挂载（dsh 的已知问题 deepseek-harness#8452），设置页会一直缺席到重载界面为止。',
+  turnEndLabel: '智能体答完一轮',
+  waitingLabel: '停下来等你操作（审批 / 提问）',
+  preview: '试听',
+  stopHint: '鼠标或键盘一动，正在重复的提醒立即停止。',
+  done: '完成',
+  restoreAll: '全部恢复默认',
+  statusPrefix: '当前：',
+  statusIdle: '空闲',
+  statusRunning: '正在跑',
+  statusWaiting: '等待你操作',
+  statusMuted: '已静音',
+  unavailable: '回合提醒那一行处于停用状态，现在没有可配置的内容。',
 };
 
 /** Shared control surface, so every input, select and reset link matches. */
@@ -176,6 +219,10 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
+    // Official primitives are a platform seed shared by every client bundle, so
+    // the dialog gets the shell's portal, focus handling and control styling
+    // instead of a hand-rolled overlay.
+    const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
 
     /** Clamp a value into an integer range, falling back when unusable. */
     function clampInteger(value, min, max, fallback) {
@@ -218,6 +265,9 @@ window.__ModuleLoader__.load({
       return {
         status: raw?.status ?? 'loading',
         writable: raw?.writable === true,
+        muted: value.muted === true,
+        notifyOnTurnEnd: value.notifyOnTurnEnd !== false,
+        notifyOnWaiting: value.notifyOnWaiting !== false,
         repeatCount: clampInteger(value.repeatCount, 1, 10, DEFAULTS.repeatCount),
         intervalMs: clampInteger(value.intervalMs, 1000, 60000, DEFAULTS.intervalMs),
         volume: Math.min(1, Math.max(0, Number.isFinite(value.volume) ? value.volume : DEFAULTS.volume)),
@@ -229,6 +279,9 @@ window.__ModuleLoader__.load({
           interaction: parsePattern(interactionPattern, PATTERNS.interaction),
         },
         overridden: {
+          muted: user?.muted !== undefined,
+          notifyOnTurnEnd: user?.notifyOnTurnEnd !== undefined,
+          notifyOnWaiting: user?.notifyOnWaiting !== undefined,
           repeatCount: user?.repeatCount !== undefined,
           intervalMs: user?.intervalMs !== undefined,
           volume: user?.volume !== undefined,
@@ -257,6 +310,10 @@ window.__ModuleLoader__.load({
           listeners.add(listener);
           return () => listeners.delete(listener);
         },
+        /** Write one field through the settings service; resolves `false` when rejected. */
+        write: (field, value) => Promise.resolve(form.set(field, value)).then((accepted) => accepted !== false),
+        /** Drop one user override, returning the field to its schema default. */
+        reset: (field) => Promise.resolve(form.unset(field)).then((accepted) => accepted !== false),
         dispose: () => {
           unsubscribe();
           listeners.clear();
@@ -399,8 +456,9 @@ window.__ModuleLoader__.load({
           const watched = before.known === true && known === true;
           const finishedTurn = watched && before.running === true && running !== true;
           const needsUser = watched && pending !== undefined && before.pending === undefined;
-          if (needsUser) startAlert(alertRef, audio, settings, 'interaction');
-          else if (finishedTurn) startAlert(alertRef, audio, settings, 'finished');
+          if (settings.muted === true) stopAlert(alertRef);
+          else if (needsUser && settings.notifyOnWaiting !== false) startAlert(alertRef, audio, settings, 'interaction');
+          else if (finishedTurn && settings.notifyOnTurnEnd !== false) startAlert(alertRef, audio, settings, 'finished');
           // The reason to chime is gone — a new turn started, or the pending
           // interaction was answered — so stop the remaining repeats at once.
           else if (running === true || before.pending !== undefined) stopAlert(alertRef);
@@ -416,6 +474,9 @@ window.__ModuleLoader__.load({
     const FALLBACK_SNAPSHOT = Object.freeze({
       status: 'unavailable',
       writable: false,
+      muted: DEFAULTS.muted,
+      notifyOnTurnEnd: DEFAULTS.notifyOnTurnEnd,
+      notifyOnWaiting: DEFAULTS.notifyOnWaiting,
       repeatCount: DEFAULTS.repeatCount,
       intervalMs: DEFAULTS.intervalMs,
       volume: DEFAULTS.volume,
@@ -423,6 +484,9 @@ window.__ModuleLoader__.load({
       finishedPattern: DEFAULTS.finishedPattern,
       interactionPattern: DEFAULTS.interactionPattern,
       overridden: Object.freeze({
+        muted: false,
+        notifyOnTurnEnd: false,
+        notifyOnWaiting: false,
         repeatCount: false,
         intervalMs: false,
         volume: false,
@@ -440,6 +504,270 @@ window.__ModuleLoader__.load({
       getSnapshot: () => FALLBACK_SNAPSHOT,
       subscribe: () => () => {},
     });
+
+
+    /** One uppercase group heading with its rows. */
+    function dialogGroup(key, title, rows) {
+      return h('section', { key, style: { marginBottom: 16 } }, [
+        h('h4', { key: 'title', style: { margin: '0 0 8px', fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', opacity: 0.55 } }, title),
+        ...rows,
+      ]);
+    }
+
+    /** A checkbox row: the switch and its label on one line, hint underneath. */
+    function toggleRow(key, label, checked, disabled, onToggle, hint) {
+      return h('div', { key, style: { marginBottom: 10 } }, [
+        h('label', { key: 'row', style: { display: 'flex', gap: 8, alignItems: 'center', cursor: disabled ? 'default' : 'pointer' } }, [
+          h('input', {
+            key: 'box',
+            type: 'checkbox',
+            checked,
+            disabled,
+            onChange: (event) => onToggle(event.target.checked),
+          }),
+          h('span', { key: 'text', style: { fontWeight: 600 } }, label),
+        ]),
+        hint === undefined ? null : h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12, lineHeight: 1.5, marginLeft: 24 } }, hint),
+      ]);
+    }
+
+    /** A tone-pattern row: text field, live validation and a preview button. */
+    function patternRow(props) {
+      const { key, t, label, hint, value, disabled, onEdit, onCommit, onPreview } = props;
+      const tones = parsePattern(value, null);
+      return h('div', { key, style: { marginBottom: 12 } }, [
+        h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, label),
+        h('div', { key: 'line', style: { display: 'flex', gap: 8, alignItems: 'center' } }, [
+          h('input', {
+            key: 'input',
+            type: 'text',
+            value,
+            disabled,
+            onChange: (event) => onEdit(event.target.value),
+            onBlur: onCommit,
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') event.currentTarget.blur();
+            },
+            style: {
+              flex: 1,
+              minWidth: 0,
+              padding: '5px 7px',
+              background: 'transparent',
+              color: 'inherit',
+              border: `1px solid ${tones === null ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-border-l1)'}`,
+              borderRadius: 4,
+            },
+          }),
+          h(primitives.Button, {
+            key: 'preview',
+            variant: 'outline',
+            disabled: disabled || tones === null,
+            onClick: () => onPreview(value),
+            children: t('preview'),
+          }),
+        ]),
+        h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12, lineHeight: 1.5, marginTop: 4 } }, tones === null ? t('invalidPattern') : hint),
+      ]);
+    }
+
+    /**
+     * The Settings dialog opened from the dock bell.
+     *
+     * It edits exactly the same form the Plugins-page card edits
+     * (`ctx.configForms.get(ENTRY_ID)`), so the two surfaces can never disagree;
+     * the redesign is layout and affordances, not a second source of truth.
+     */
+    function TurnNotifierDialog(props) {
+      const { t, store, audio, running, pending, open, onClose } = props;
+      const settings = useStoreValue(store);
+      const [drafts, setDrafts] = React.useState({});
+      const [failed, setFailed] = React.useState(false);
+
+      const write = (field, value) => {
+        store.write(field, value).then((ok) => setFailed(ok === false));
+      };
+      const draftOf = (field, current) => (drafts[field] !== undefined ? drafts[field] : current);
+      const edit = (field, text) => setDrafts((current) => ({ ...current, [field]: text }));
+      const commit = (field) => {
+        const text = drafts[field];
+        if (text === undefined) return;
+        setDrafts((current) => {
+          const next = { ...current };
+          delete next[field];
+          return next;
+        });
+        write(field, text.trim() === '' ? DEFAULTS[field] : text.trim());
+      };
+      const preview = (reason, text) => {
+        const tones = parsePattern(text, PATTERNS[reason]);
+        audio.ring(reason, { ...settings, tones: { ...settings.tones, [reason]: tones } });
+      };
+
+      if (open !== true) return null;
+      const disabled = settings.writable !== true;
+      const status = settings.muted
+        ? t('statusMuted')
+        : pending === true ? t('statusWaiting') : running === true ? t('statusRunning') : t('statusIdle');
+
+      return h(primitives.Modal, {
+        open: true,
+        onClose,
+        closeLabel: t('close'),
+        title: t('dialogTitle'),
+        description: `${t('statusPrefix')}${status}`,
+        footer: h(React.Fragment, null, [
+          h(primitives.Button, {
+            key: 'restore',
+            variant: 'outline',
+            disabled,
+            onClick: () => {
+              for (const field of ['repeatCount', 'intervalMs', 'volume', 'waveform', 'finishedPattern', 'interactionPattern']) store.reset(field);
+            },
+            children: t('restoreAll'),
+          }),
+          h(primitives.Button, { key: 'done', variant: 'primary', onClick: onClose, children: t('done') }),
+        ]),
+        children: [
+          dialogGroup('when', t('groupWhen'), [
+            toggleRow('turnEnd', t('turnEndLabel'), settings.notifyOnTurnEnd, disabled, (next) => write('notifyOnTurnEnd', next)),
+            toggleRow('waiting', t('waitingLabel'), settings.notifyOnWaiting, disabled, (next) => write('notifyOnWaiting', next)),
+            toggleRow('mute', t('muteLabel'), settings.muted, disabled, (next) => write('muted', next), t('muteHint')),
+          ]),
+          dialogGroup('how', t('groupHow'), [
+            h('div', { key: 'volume', style: { marginBottom: 10 } }, [
+              h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, `${t('volume')} · ${settings.volume.toFixed(2)}`),
+              h('input', {
+                key: 'slider',
+                type: 'range',
+                min: 0,
+                max: 1,
+                step: 0.05,
+                value: settings.volume,
+                disabled,
+                onChange: (event) => write('volume', Number(event.target.value)),
+                style: { width: '100%' },
+              }),
+              h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12 } }, t('volumeHint')),
+            ]),
+            h('div', { key: 'waveform', style: { marginBottom: 12 } }, [
+              h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, t('waveform')),
+              h('select', {
+                key: 'select',
+                value: settings.waveform,
+                disabled,
+                onChange: (event) => write('waveform', event.target.value),
+                style: { padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
+              }, WAVEFORMS.map((name) => h('option', { key: name, value: name }, t(`waveform_${name}`)))),
+              h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12 } }, t('waveformHint')),
+            ]),
+            patternRow({
+              key: 'finished',
+              t,
+              label: t('finishedPattern'),
+              hint: t('finishedPatternHint'),
+              value: draftOf('finishedPattern', settings.finishedPattern),
+              disabled,
+              onEdit: (text) => edit('finishedPattern', text),
+              onCommit: () => commit('finishedPattern'),
+              onPreview: () => preview('finished', draftOf('finishedPattern', settings.finishedPattern)),
+            }),
+            patternRow({
+              key: 'interaction',
+              t,
+              label: t('interactionPattern'),
+              hint: t('interactionPatternHint'),
+              value: draftOf('interactionPattern', settings.interactionPattern),
+              disabled,
+              onEdit: (text) => edit('interactionPattern', text),
+              onCommit: () => commit('interactionPattern'),
+              onPreview: () => preview('interaction', draftOf('interactionPattern', settings.interactionPattern)),
+            }),
+          ]),
+          dialogGroup('repeat', t('groupRepeat'), [
+            h('div', { key: 'repeatCount', style: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 } }, [
+              h('span', { key: 'label', style: { fontWeight: 600, flex: 1 } }, t('repeatCount')),
+              h('input', {
+                key: 'input',
+                type: 'number',
+                min: 1,
+                max: 10,
+                value: settings.repeatCount,
+                disabled,
+                onChange: (event) => write('repeatCount', clampInteger(event.target.value, 1, 10, DEFAULTS.repeatCount)),
+                style: { width: 64, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
+              }),
+            ]),
+            h('div', { key: 'interval', style: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 } }, [
+              h('span', { key: 'label', style: { fontWeight: 600, flex: 1 } }, `${t('intervalSeconds')}（${t('seconds')}）`),
+              h('input', {
+                key: 'input',
+                type: 'number',
+                min: 1,
+                max: 60,
+                value: Math.round(settings.intervalMs / 1000),
+                disabled,
+                onChange: (event) => write('intervalMs', clampInteger(event.target.value, 1, 60, DEFAULTS.intervalMs / 1000) * 1000),
+                style: { width: 64, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
+              }),
+            ]),
+            h('div', { key: 'stop', style: { opacity: 0.66, fontSize: 12, lineHeight: 1.5 } }, t('stopHint')),
+          ]),
+          failed ? h('div', { key: 'failed', role: 'alert', style: STYLE.error }, t('saveFailed')) : null,
+        ],
+      });
+    }
+
+    /** The dock bell: opens the settings dialog and reflects muted state. */
+    function createDockEntry(store, audio) {
+      return function TurnNotifierDock(props) {
+        const { t, sessionId, useSessionStatus } = props;
+        const settings = useStoreValue(store);
+        const [open, setOpen] = React.useState(false);
+        const useStatus = typeof useSessionStatus === 'function' ? useSessionStatus : readEmptyStatus;
+        const selectRunning = React.useCallback((snapshot) => (sessionId === undefined ? undefined : snapshot.get(sessionId)?.running), [sessionId]);
+        const selectPending = React.useCallback((snapshot) => (sessionId === undefined ? undefined : snapshot.get(sessionId)?.pendingInteraction), [sessionId]);
+        const running = useStatus(selectRunning);
+        const pending = useStatus(selectPending);
+
+        return h(React.Fragment, null, [
+          h(primitives.Tooltip, {
+            key: 'bell',
+            label: t('openSettings'),
+            side: 'top',
+            align: 'center',
+            delayMs: 400,
+          }, h('button', {
+            key: 'button',
+            type: 'button',
+            'aria-label': t('openSettings'),
+            onClick: () => setOpen(true),
+            style: {
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 26,
+              height: 26,
+              padding: 0,
+              border: 'none',
+              background: 'transparent',
+              cursor: 'pointer',
+              color: 'var(--dsw-alias-label-tertiary)',
+              opacity: settings.muted ? 0.35 : 0.75,
+            },
+          }, h(primitives.IconAlarmClockOutlineRegular, { size: 16 }))),
+          h(TurnNotifierDialog, {
+            key: 'dialog',
+            t,
+            store,
+            audio,
+            running,
+            pending,
+            open,
+            onClose: () => setOpen(false),
+          }),
+        ]);
+      };
+    }
 
     /** Badge style, computed once instead of per render. */
     const BADGE_STYLE = Object.freeze(Object.assign({ marginLeft: '6px' }, STYLE.badge));
@@ -676,7 +1004,13 @@ window.__ModuleLoader__.load({
         }, 'turn-notifier: audio unlock');
 
         ctx.slots.inject(SLOT_NAME, () =>
-          ctx.slots.register({ name: SLOT_NAME, id: ENTRY_ID, order: 90 }, createNotifier(audio, store)),
+          ctx.slots.register({ name: SLOT_NAME, id: ENTRY_ID, order: 90 }, createDockEntry(store, audio)),
+        );
+
+        // The chime behavior stays its own invisible entry: it needs the session
+        // status hook only and must keep observing while the dialog is closed.
+        ctx.slots.inject(SLOT_NAME, () =>
+          ctx.slots.register({ name: SLOT_NAME, id: `${ENTRY_ID}-alert`, order: 91 }, createNotifier(audio, store)),
         );
 
         // The bundle's own configuration page, sharing this row's lifecycle:

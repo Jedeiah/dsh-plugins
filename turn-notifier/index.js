@@ -14,6 +14,20 @@ import z from '@deepseek-ai/schemastery';
  * the bare specifier to the installation's copy.
  */
 export const Config = z.object({
+  /**
+   * Silence every chime without touching the profile row.
+   *
+   * This exists because of a harness bug (deepseek-harness#8452): disabling a row
+   * that ships a client half tears the half down, and re-enabling it does not
+   * mount it again — the browser module table reports the bundle as already
+   * loaded, so nothing re-runs its `apply`. Muting here is the supported way to
+   * go quiet; the row switch stays reserved for removing the plugin entirely.
+   */
+  muted: z.boolean().default(false).volatile(),
+  /** Ring when a turn finishes. */
+  notifyOnTurnEnd: z.boolean().default(true).volatile(),
+  /** Ring when the agent stops to wait for the operator (approval or question). */
+  notifyOnWaiting: z.boolean().default(true).volatile(),
   /** How many times one alert rings, including the first. */
   repeatCount: z.number().step(1).min(1).max(10).default(3).volatile(),
   /** Milliseconds between the first ring and each repeat. */

@@ -80,7 +80,7 @@ dsh plugin --profile <你的profile> add "github:Jedeiah/dsh-plugins#path:turn-n
 
 ## 已知的 dsh 侧问题
 
-- **停用一行带客户端半边的插件后再启用，客户端半边不会重新挂载**，需要重启 App 才能恢复（表现为该行的界面/配置页消失，内置插件面板报 `loaded without registering ... via __ModuleLoader__.load`）。已上报：[deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)。在修好之前：**别用行开关去临时静音**，改用插件自己的配置（例如把音量调 0）。
+- **停用一行带客户端半边的插件后再启用，客户端半边不会重新挂载**（表现为该行的界面/配置页消失，内置插件面板报 `loaded without registering ... via __ModuleLoader__.load`）。原因是浏览器模块表认为该包已加载、不再执行它的 `apply`；**重载界面（⌘R）即可恢复**，重启 App 当然也行（不必为此重启整个应用）。已上报：[deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)。在修好之前：**别用行开关去临时静音**——`turn-notifier` 现在自带「静音」开关，其它插件把自己的行为改成可配置而不是需要停用。
 - **静态 `import` dsh 自带包：作者在 0.2.0-rc.2 上遇到过一次「条目建不起来、诊断只报 `failed to import`」（当时 specifier 就是同一个）；后续复核里，把该包写进 `peerDependencies` 之后静态导入可以正常组合（`schemastery`、`dsh-web-fetch-http` 都是静态导入）。因此本仓库仍统一用模块作用域的 `await import(...)` 兜底，见 `web-fetch-fakeip` 的 README《实现注记》。
 
 ## 贡献
