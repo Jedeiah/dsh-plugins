@@ -180,40 +180,10 @@ const CONTROL = Object.freeze({
 
 /** Token-only styling, so light and dark follow the host theme automatically. */
 const STYLE = Object.freeze({
-  form: { display: 'grid', gap: '14px', maxWidth: '520px' },
-  field: { display: 'grid', gap: '4px' },
-  label: {
-    color: 'var(--dsw-alias-label-primary)',
-    fontSize: '13px',
-    fontWeight: 500,
-    lineHeight: 1.4,
-  },
-  hint: { color: 'var(--dsw-alias-label-secondary)', fontSize: '12px', lineHeight: 1.5 },
-  row: { display: 'flex', alignItems: 'center', gap: '8px' },
-  input: Object.freeze({ ...CONTROL, width: '88px' }),
-  select: Object.freeze({ ...CONTROL, width: '160px' }),
-  textInput: Object.freeze({ ...CONTROL, width: '280px' }),
-  unit: { color: 'var(--dsw-alias-label-secondary)', fontSize: '12px' },
-  reset: {
-    background: 'transparent',
-    color: 'var(--dsw-alias-brand-primary)',
-    border: 'none',
-    padding: '0',
-    fontSize: '12px',
-    cursor: 'pointer',
-    fontFamily: 'inherit',
-  },
-  badge: {
-    color: 'var(--dsw-alias-label-secondary)',
-    fontSize: '11px',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    borderRadius: '4px',
-    padding: '0 5px',
-  },
-  notice: { color: 'var(--dsw-alias-state-warn-primary)', fontSize: '12px', lineHeight: 1.5 },
-  error: { color: 'var(--dsw-alias-state-error-primary)', fontSize: '12px', lineHeight: 1.5 },
+  /** Inline notice/error lines shared by the settings surfaces. */
+  notice: { opacity: 0.7, fontSize: 12, lineHeight: 1.6 },
+  error: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, lineHeight: 1.5 },
 });
-
 window.__ModuleLoader__.load({
   id: BUNDLE_NAME,
   factory(require) {
@@ -506,6 +476,17 @@ window.__ModuleLoader__.load({
     });
 
 
+    /** The row page's current owner form; see {@link TurnNotifierRowConfig}. */
+    const rowBridge = { current: undefined };
+
+    /** Stable store identity for the row page, delegating to {@link rowBridge}. */
+    const ROW_STORE = Object.freeze({
+      getSnapshot: () => project(rowBridge.current?.state),
+      subscribe: () => () => undefined,
+      write: (field, value) => Promise.resolve(rowBridge.current?.mutate([{ op: 'set', path: [field], value }], rowBridge.current.state.revision)).then((accepted) => accepted !== false),
+      reset: (field) => Promise.resolve(rowBridge.current?.mutate([{ op: 'unset', path: [field] }], rowBridge.current.state.revision)).then((accepted) => accepted !== false),
+    });
+
     /** One uppercase group heading with its rows. */
     function dialogGroup(key, title, rows) {
       return h('section', { key, style: { marginBottom: 16 } }, [
@@ -583,8 +564,11 @@ window.__ModuleLoader__.load({
      * the same form (`ctx.configForms.get(ENTRY_ID)`).
      */
     function TurnNotifierGroups(props) {
-      const { t, store, audio, running, pending, showStatus } = props;
-      const settings = useStoreValue(store);
+      const { t, store, snapshot, audio, running, pending, showStatus } = props;
+      // Hooks must run unconditionally: subscribe to the live store when one is
+      // given, otherwise to a frozen stand-in, and let an explicit snapshot win.
+      const live = useStoreValue(store ?? FALLBACK_STORE);
+      const settings = snapshot ?? live;
       const [drafts, setDrafts] = React.useState({});
       const [failed, setFailed] = React.useState(false);
 
@@ -608,7 +592,7 @@ window.__ModuleLoader__.load({
         audio.ring(reason, { ...settings, tones: { ...settings.tones, [reason]: tones } });
       };
       const disabled = settings.writable !== true;
-      const status = settings.muted
+      const status = (settings.muted ?? false)
         ? t('statusMuted')
         : pending === true ? t('statusWaiting') : running === true ? t('statusRunning') : t('statusIdle');
 
@@ -742,15 +726,24 @@ window.__ModuleLoader__.load({
       if (form?.state === undefined) return null;
       if (form.state.status === 'loading') return h('div', { role: 'status' }, t('saving'));
       if (form.state.status !== 'ready') return h('div', { style: STYLE.notice }, t('unavailable'));
-      const adapter = {
-        getSnapshot: () => project(form.state),
-        subscribe: () => () => undefined,
-        write: (field, value) => Promise.resolve(form.mutate([{ op: 'set', path: [field], value }], form.state.revision)).then((accepted) => accepted !== false),
-        reset: (field) => Promise.resolve(form.mutate([{ op: 'unset', path: [field] }], form.state.revision)).then((accepted) => accepted !== false),
-      };
+      // One stable bridge for the whole page: the owner hands a fresh `{state,
+      // mutate}` object every render, so an adapter created per render would give
+      // `useStoreValue` a new dependency each time and spin in a setState loop.
+      // The bridge's identity never changes; the page's explicit `snapshot` is
+      // what makes a new revision visible, and the owner re-renders on changes.
+      rowBridge.current = form;
       return h('div', { key: 'page' }, [
         h('p', { key: 'intro', style: { margin: '0 0 12px', opacity: 0.75, lineHeight: 1.6 } }, t('pageIntro')),
-        h(TurnNotifierGroups, { key: 'groups', t, store: adapter, audio, running: undefined, pending: undefined, showStatus: false }),
+        h(TurnNotifierGroups, {
+          key: 'groups',
+          t,
+          store: ROW_STORE,
+          snapshot: project(form.state),
+          audio,
+          running: undefined,
+          pending: undefined,
+          showStatus: false,
+        }),
       ]);
     }
 
