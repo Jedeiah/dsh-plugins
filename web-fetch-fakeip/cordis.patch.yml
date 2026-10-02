@@ -1,0 +1,17 @@
+# Substitute the shipped strict HTTP fetch provider.
+#
+# The replacement keeps the whole SSRF guard — loopback, private, link-local and
+# the literal-IP check all behave exactly as before — and adds one explicit
+# allowance for the fake-ip range a local TUN proxy (Clash / Shadowrocket) hands
+# out. Registering it under the same provider id keeps `web_fetch` selection
+# unchanged, with no configuration anywhere.
+#
+# The shipped row MUST be disabled in the same patch: two registered fetch
+# providers with no configured id resolve to WEB_PROVIDER_AMBIGUOUS, which would
+# break web_fetch entirely.
+- id: web-fetch-http
+  disabled: true
+
+- insert:
+    - id: web-fetch-fakeip
+      name: '@local/web-fetch-fakeip'

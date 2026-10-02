@@ -1,0 +1,29 @@
+{
+  "name": "@local/web-fetch-fakeip",
+  "version": "5.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reuses the shipped HTTP fetch provider and only adds an address allowance for a local TUN proxy's fake-ip range, so web_fetch keeps working with Clash / Shadowrocket on.",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-web-fetch-http": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

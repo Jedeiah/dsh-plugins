@@ -1,0 +1,4 @@
+{
+  "title": "Fetch · fake-ip proxy aware",
+  "description": "Replaces the shipped http fetch provider and additionally allows the fake-ip range a local TUN proxy hands out, so web_fetch keeps working with the proxy on."
+}
