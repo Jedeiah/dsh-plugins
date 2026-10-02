@@ -134,7 +134,6 @@ const zh = {
   unavailable: '回合提醒那一行处于停用状态，现在没有可配置的内容。',
   saveFailed: '本部署没有接受这个值，已保留供你修改。',
   saving: '正在读取设置…',
-  openSettings: '回合提醒设置',
   pageIntro: '三组开关、音量、音调与重复次数，改完立即生效。临时安静请用「静音」，不要停用插件行。',
   groupWhen: '什么时候响',
   groupHow: '怎么响',
@@ -145,11 +144,6 @@ const zh = {
   waitingLabel: '停下来等你操作（审批 / 提问）',
   preview: '试听',
   stopHint: '鼠标或键盘一动，正在重复的提醒立即停止。',
-  statusPrefix: '当前：',
-  statusIdle: '空闲',
-  statusRunning: '正在跑',
-  statusWaiting: '等待你操作',
-  statusMuted: '已静音',
   unavailable: '回合提醒那一行处于停用状态，现在没有可配置的内容。',
 };
 
@@ -428,8 +422,7 @@ window.__ModuleLoader__.load({
 
     /** Snapshot shown when the slot injects no settings store. */
     const FALLBACK_SNAPSHOT = Object.freeze({
-      status: 'unavailable',
-      writable: false,
+          writable: false,
       muted: DEFAULTS.muted,
       notifyOnTurnEnd: DEFAULTS.notifyOnTurnEnd,
       notifyOnWaiting: DEFAULTS.notifyOnWaiting,
@@ -550,7 +543,7 @@ window.__ModuleLoader__.load({
      * the same form (`ctx.configForms.get(ENTRY_ID)`).
      */
     function TurnNotifierGroups(props) {
-      const { t, store, snapshot, audio, running, pending, showStatus } = props;
+      const { t, store, snapshot, audio } = props;
       // Hooks must run unconditionally: subscribe to the live store when one is
       // given, otherwise to a frozen stand-in, and let an explicit snapshot win.
       const live = useStoreValue(store ?? FALLBACK_STORE);
@@ -578,14 +571,8 @@ window.__ModuleLoader__.load({
         audio.ring(reason, { ...settings, tones: { ...settings.tones, [reason]: tones } });
       };
       const disabled = settings.writable !== true;
-      const status = (settings.muted ?? false)
-        ? t('statusMuted')
-        : pending === true ? t('statusWaiting') : running === true ? t('statusRunning') : t('statusIdle');
 
       return h(React.Fragment, null, [
-        showStatus === true
-          ? h('p', { key: 'status', style: { margin: '0 0 12px', opacity: 0.75 } }, `${t('statusPrefix')}${status}`)
-          : null,
         dialogGroup('when', t('groupWhen'), [
           toggleRow('turnEnd', t('turnEndLabel'), settings.notifyOnTurnEnd, disabled, (next) => write('notifyOnTurnEnd', next)),
           toggleRow('waiting', t('waitingLabel'), settings.notifyOnWaiting, disabled, (next) => write('notifyOnWaiting', next)),
@@ -703,9 +690,6 @@ window.__ModuleLoader__.load({
           store: ROW_STORE,
           snapshot: project(form.state),
           audio,
-          running: undefined,
-          pending: undefined,
-          showStatus: false,
         }),
       ]);
     }
@@ -737,8 +721,6 @@ window.__ModuleLoader__.load({
           store: ROW_STORE,
           snapshot: project(form.state),
           audio,
-          running: undefined,
-          pending: undefined,
           showStatus: false,
         }),
       ]);
