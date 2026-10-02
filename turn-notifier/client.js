@@ -93,12 +93,12 @@ const en = {
   interactionPatternHint: 'Same notation. Example: 1046.5:140, 1318.5:140, 1046.5:200',
   invalidPattern: 'Write tones as frequencyHz:durationMs, separated by commas.',
   seconds: 's',
-  reset: 'Reset to default',
-  overridden: 'Overridden',
   readOnly: 'This deployment stores settings read-only.',
   unavailable: 'The notifier row is switched off, so there is nothing to configure right now.',
   saveFailed: 'The deployment did not accept that value; it was left for you to correct.',
+  saving: 'Loading settings…',
   openSettings: 'Turn notifier settings',
+  pageIntro: 'The same settings the composer bell opens: three groups, volume, chimes and repeat count. Changes apply immediately.',
   dialogTitle: 'Turn notifier',
   close: 'Close',
   groupWhen: 'When it rings',
@@ -140,12 +140,12 @@ const zh = {
   interactionPatternHint: '格式相同。例如 1046.5:140, 1318.5:140, 1046.5:200',
   invalidPattern: '请按「频率Hz:时长ms」书写，用逗号分隔。',
   seconds: '秒',
-  reset: '恢复默认',
-  overridden: '已覆盖',
   readOnly: '本部署的设置为只读。',
   unavailable: '回合提醒那一行处于停用状态，现在没有可配置的内容。',
   saveFailed: '本部署没有接受这个值，已保留供你修改。',
+  saving: '正在读取设置…',
   openSettings: '回合提醒设置',
+  pageIntro: '和输入框旁的铃铛是同一套设置：三组开关、音量、音调与重复次数，改完立即生效。',
   dialogTitle: '回合提醒',
   close: '关闭',
   groupWhen: '什么时候响',
@@ -577,8 +577,13 @@ window.__ModuleLoader__.load({
      * (`ctx.configForms.get(ENTRY_ID)`), so the two surfaces can never disagree;
      * the redesign is layout and affordances, not a second source of truth.
      */
-    function TurnNotifierDialog(props) {
-      const { t, store, audio, running, pending, open, onClose } = props;
+    /**
+     * The settings body: three groups, shared by the dock dialog and the row's
+     * configuration page so the two can never drift apart. Every value comes from
+     * the same form (`ctx.configForms.get(ENTRY_ID)`).
+     */
+    function TurnNotifierGroups(props) {
+      const { t, store, audio, running, pending, showStatus } = props;
       const settings = useStoreValue(store);
       const [drafts, setDrafts] = React.useState({});
       const [failed, setFailed] = React.useState(false);
@@ -602,24 +607,118 @@ window.__ModuleLoader__.load({
         const tones = parsePattern(text, PATTERNS[reason]);
         audio.ring(reason, { ...settings, tones: { ...settings.tones, [reason]: tones } });
       };
-
-      if (open !== true) return null;
       const disabled = settings.writable !== true;
       const status = settings.muted
         ? t('statusMuted')
         : pending === true ? t('statusWaiting') : running === true ? t('statusRunning') : t('statusIdle');
 
+      return h(React.Fragment, null, [
+        showStatus === true
+          ? h('p', { key: 'status', style: { margin: '0 0 12px', opacity: 0.75 } }, `${t('statusPrefix')}${status}`)
+          : null,
+        dialogGroup('when', t('groupWhen'), [
+          toggleRow('turnEnd', t('turnEndLabel'), settings.notifyOnTurnEnd, disabled, (next) => write('notifyOnTurnEnd', next)),
+          toggleRow('waiting', t('waitingLabel'), settings.notifyOnWaiting, disabled, (next) => write('notifyOnWaiting', next)),
+          toggleRow('mute', t('muteLabel'), settings.muted, disabled, (next) => write('muted', next), t('muteHint')),
+        ]),
+        dialogGroup('how', t('groupHow'), [
+          h('div', { key: 'volume', style: { marginBottom: 10 } }, [
+            h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, `${t('volume')} · ${settings.volume.toFixed(2)}`),
+            h('input', {
+              key: 'slider',
+              type: 'range',
+              min: 0,
+              max: 1,
+              step: 0.05,
+              value: settings.volume,
+              disabled,
+              onChange: (event) => write('volume', Number(event.target.value)),
+              style: { width: '100%' },
+            }),
+            h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12 } }, t('volumeHint')),
+          ]),
+          h('div', { key: 'waveform', style: { marginBottom: 12 } }, [
+            h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, t('waveform')),
+            h('select', {
+              key: 'select',
+              value: settings.waveform,
+              disabled,
+              onChange: (event) => write('waveform', event.target.value),
+              style: { padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
+            }, WAVEFORMS.map((name) => h('option', { key: name, value: name }, t(`waveform_${name}`)))),
+            h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12 } }, t('waveformHint')),
+          ]),
+          patternRow({
+            key: 'finished',
+            t,
+            label: t('finishedPattern'),
+            hint: t('finishedPatternHint'),
+            value: draftOf('finishedPattern', settings.finishedPattern),
+            disabled,
+            onEdit: (text) => edit('finishedPattern', text),
+            onCommit: () => commit('finishedPattern'),
+            onPreview: () => preview('finished', draftOf('finishedPattern', settings.finishedPattern)),
+          }),
+          patternRow({
+            key: 'interaction',
+            t,
+            label: t('interactionPattern'),
+            hint: t('interactionPatternHint'),
+            value: draftOf('interactionPattern', settings.interactionPattern),
+            disabled,
+            onEdit: (text) => edit('interactionPattern', text),
+            onCommit: () => commit('interactionPattern'),
+            onPreview: () => preview('interaction', draftOf('interactionPattern', settings.interactionPattern)),
+          }),
+        ]),
+        dialogGroup('repeat', t('groupRepeat'), [
+          h('div', { key: 'repeatCount', style: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 } }, [
+            h('span', { key: 'label', style: { fontWeight: 600, flex: 1 } }, t('repeatCount')),
+            h('input', {
+              key: 'input',
+              type: 'number',
+              min: 1,
+              max: 10,
+              value: settings.repeatCount,
+              disabled,
+              onChange: (event) => write('repeatCount', clampInteger(event.target.value, 1, 10, DEFAULTS.repeatCount)),
+              style: { width: 64, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
+            }),
+          ]),
+          h('div', { key: 'repeatCountHint', style: { opacity: 0.66, fontSize: 12, margin: '-6px 0 10px' } }, t('repeatCountHint')),
+          h('div', { key: 'interval', style: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 } }, [
+            h('span', { key: 'label', style: { fontWeight: 600, flex: 1 } }, `${t('intervalSeconds')}（${t('seconds')}）`),
+            h('input', {
+              key: 'input',
+              type: 'number',
+              min: 1,
+              max: 60,
+              value: Math.round(settings.intervalMs / 1000),
+              disabled,
+              onChange: (event) => write('intervalMs', clampInteger(event.target.value, 1, 60, DEFAULTS.intervalMs / 1000) * 1000),
+              style: { width: 64, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
+            }),
+          ]),
+          h('div', { key: 'intervalSecondsHint', style: { opacity: 0.66, fontSize: 12, margin: '-6px 0 10px' } }, t('intervalSecondsHint')),
+          h('div', { key: 'stop', style: { opacity: 0.66, fontSize: 12, lineHeight: 1.5 } }, t('stopHint')),
+        ]),
+        failed ? h('div', { key: 'failed', role: 'alert', style: STYLE.error }, t('saveFailed')) : null,
+      ]);
+    }
+
+    /** The dock dialog: the shared body inside the shell's Modal. */
+    function TurnNotifierDialog(props) {
+      const { t, store, audio, running, pending, open, onClose } = props;
+      if (open !== true) return null;
       return h(primitives.Modal, {
         open: true,
         onClose,
         closeLabel: t('close'),
         title: t('dialogTitle'),
-        description: `${t('statusPrefix')}${status}`,
         footer: h(React.Fragment, null, [
           h(primitives.Button, {
             key: 'restore',
             variant: 'outline',
-            disabled,
             onClick: () => {
               for (const field of ['repeatCount', 'intervalMs', 'volume', 'waveform', 'finishedPattern', 'interactionPattern']) store.reset(field);
             },
@@ -627,94 +726,32 @@ window.__ModuleLoader__.load({
           }),
           h(primitives.Button, { key: 'done', variant: 'primary', onClick: onClose, children: t('done') }),
         ]),
-        children: [
-          dialogGroup('when', t('groupWhen'), [
-            toggleRow('turnEnd', t('turnEndLabel'), settings.notifyOnTurnEnd, disabled, (next) => write('notifyOnTurnEnd', next)),
-            toggleRow('waiting', t('waitingLabel'), settings.notifyOnWaiting, disabled, (next) => write('notifyOnWaiting', next)),
-            toggleRow('mute', t('muteLabel'), settings.muted, disabled, (next) => write('muted', next), t('muteHint')),
-          ]),
-          dialogGroup('how', t('groupHow'), [
-            h('div', { key: 'volume', style: { marginBottom: 10 } }, [
-              h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, `${t('volume')} · ${settings.volume.toFixed(2)}`),
-              h('input', {
-                key: 'slider',
-                type: 'range',
-                min: 0,
-                max: 1,
-                step: 0.05,
-                value: settings.volume,
-                disabled,
-                onChange: (event) => write('volume', Number(event.target.value)),
-                style: { width: '100%' },
-              }),
-              h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12 } }, t('volumeHint')),
-            ]),
-            h('div', { key: 'waveform', style: { marginBottom: 12 } }, [
-              h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, t('waveform')),
-              h('select', {
-                key: 'select',
-                value: settings.waveform,
-                disabled,
-                onChange: (event) => write('waveform', event.target.value),
-                style: { padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
-              }, WAVEFORMS.map((name) => h('option', { key: name, value: name }, t(`waveform_${name}`)))),
-              h('div', { key: 'hint', style: { opacity: 0.66, fontSize: 12 } }, t('waveformHint')),
-            ]),
-            patternRow({
-              key: 'finished',
-              t,
-              label: t('finishedPattern'),
-              hint: t('finishedPatternHint'),
-              value: draftOf('finishedPattern', settings.finishedPattern),
-              disabled,
-              onEdit: (text) => edit('finishedPattern', text),
-              onCommit: () => commit('finishedPattern'),
-              onPreview: () => preview('finished', draftOf('finishedPattern', settings.finishedPattern)),
-            }),
-            patternRow({
-              key: 'interaction',
-              t,
-              label: t('interactionPattern'),
-              hint: t('interactionPatternHint'),
-              value: draftOf('interactionPattern', settings.interactionPattern),
-              disabled,
-              onEdit: (text) => edit('interactionPattern', text),
-              onCommit: () => commit('interactionPattern'),
-              onPreview: () => preview('interaction', draftOf('interactionPattern', settings.interactionPattern)),
-            }),
-          ]),
-          dialogGroup('repeat', t('groupRepeat'), [
-            h('div', { key: 'repeatCount', style: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 } }, [
-              h('span', { key: 'label', style: { fontWeight: 600, flex: 1 } }, t('repeatCount')),
-              h('input', {
-                key: 'input',
-                type: 'number',
-                min: 1,
-                max: 10,
-                value: settings.repeatCount,
-                disabled,
-                onChange: (event) => write('repeatCount', clampInteger(event.target.value, 1, 10, DEFAULTS.repeatCount)),
-                style: { width: 64, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
-              }),
-            ]),
-            h('div', { key: 'interval', style: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 10 } }, [
-              h('span', { key: 'label', style: { fontWeight: 600, flex: 1 } }, `${t('intervalSeconds')}（${t('seconds')}）`),
-              h('input', {
-                key: 'input',
-                type: 'number',
-                min: 1,
-                max: 60,
-                value: Math.round(settings.intervalMs / 1000),
-                disabled,
-                onChange: (event) => write('intervalMs', clampInteger(event.target.value, 1, 60, DEFAULTS.intervalMs / 1000) * 1000),
-                style: { width: 64, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
-              }),
-            ]),
-            h('div', { key: 'stop', style: { opacity: 0.66, fontSize: 12, lineHeight: 1.5 } }, t('stopHint')),
-          ]),
-          failed ? h('div', { key: 'failed', role: 'alert', style: STYLE.error }, t('saveFailed')) : null,
-        ],
+        children: h(TurnNotifierGroups, { t, store, audio, running, pending, showStatus: true }),
       });
+    }
+
+    /**
+     * The row's configuration page on the Plugins page, the same body the dialog
+     * shows. The owner hands the page its form as `{ state, mutate }`; the
+     * adapter below narrows that to the store shape the body already consumes, so
+     * one form backs the dock dialog, this page and the bundle card at once.
+     */
+    function TurnNotifierRowConfig(props) {
+      const { t, view, form, audio } = props;
+      if (view === 'summary') return t('summary');
+      if (form?.state === undefined) return null;
+      if (form.state.status === 'loading') return h('div', { role: 'status' }, t('saving'));
+      if (form.state.status !== 'ready') return h('div', { style: STYLE.notice }, t('unavailable'));
+      const adapter = {
+        getSnapshot: () => project(form.state),
+        subscribe: () => () => undefined,
+        write: (field, value) => Promise.resolve(form.mutate([{ op: 'set', path: [field], value }], form.state.revision)).then((accepted) => accepted !== false),
+        reset: (field) => Promise.resolve(form.mutate([{ op: 'unset', path: [field] }], form.state.revision)).then((accepted) => accepted !== false),
+      };
+      return h('div', { key: 'page' }, [
+        h('p', { key: 'intro', style: { margin: '0 0 12px', opacity: 0.75, lineHeight: 1.6 } }, t('pageIntro')),
+        h(TurnNotifierGroups, { key: 'groups', t, store: adapter, audio, running: undefined, pending: undefined, showStatus: false }),
+      ]);
     }
 
     /** The dock bell: opens the settings dialog and reflects muted state. */
@@ -769,218 +806,27 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** Badge style, computed once instead of per render. */
-    const BADGE_STYLE = Object.freeze(Object.assign({ marginLeft: '6px' }, STYLE.badge));
-
-    /** One labelled control with its hint, override badge and reset link. */
-    function field(props) {
-      const { key, t, id, label, hint, value, overridden, kind, choices, unit, step, min, max, onEdit, onCommit, onPick, onReset } = props;
-      const control = kind === 'select'
-        ? h('select', {
-          key: 'input',
-          id,
-          value,
-          style: STYLE.select,
-          onChange: (event) => onPick(event.target.value),
-        }, choices.map((choice) => h('option', { key: choice.value, value: choice.value }, choice.label)))
-        : h('input', {
-          key: 'input',
-          id,
-          type: kind === 'text' ? 'text' : 'number',
-          step,
-          min,
-          max,
-          value,
-          spellCheck: false,
-          style: kind === 'text' ? STYLE.textInput : STYLE.input,
-          onChange: (event) => onEdit(event.target.value),
-          onBlur: onCommit,
-          onKeyDown: (event) => {
-            if (event.key === 'Enter') onCommit();
-          },
-        });
-      return h('div', { key, style: STYLE.field }, [
-        h('label', { key: 'label', htmlFor: id, style: STYLE.label }, [
-          label,
-          overridden === true
-            ? h('span', { key: 'badge', style: BADGE_STYLE }, t('overridden'))
-            : null,
-        ]),
-        h('div', { key: 'row', style: STYLE.row }, [
-          control,
-          unit === undefined ? null : h('span', { key: 'unit', style: STYLE.unit }, unit),
-          overridden === true
-            ? h('button', { key: 'reset', type: 'button', style: STYLE.reset, onClick: onReset }, t('reset'))
-            : null,
-        ]),
-        h('div', { key: 'hint', style: STYLE.hint }, hint),
-      ]);
-    }
-
     /**
-     * The notifier's configuration page on the Plugins page.
-     *
-     * Edits are staged locally and written on blur or Enter, so typing a number
-     * neither fires one Host write per keystroke nor gets re-clamped out from
-     * under the caret.
-     *
-     * @param props - the asked view, the locale reader and the injected form face.
+     * The bundle card's own page on the Plugins page. It shows exactly the body
+     * the dock dialog and the row's configuration page show, fed by the same
+     * settings store, so all three surfaces are one form with one layout.
      */
     function TurnNotifierSettings(props) {
-      const { t, view } = props;
-      const state = useStoreValue(props.settingsStore ?? FALLBACK_STORE);
-      const [drafts, setDrafts] = React.useState({});
-      const [failed, setFailed] = React.useState(false);
-      const [invalid, setInvalid] = React.useState(false);
-
+      const { t, view, settingsStore, audio } = props;
       if (view === 'summary') return t('summary');
-
+      if (settingsStore === undefined) return h('div', { style: STYLE.notice }, t('unavailable'));
+      const state = settingsStore.getSnapshot();
       if (state.status === 'unavailable' || state.writable !== true) {
         return h('div', { style: STYLE.notice }, state.status === 'unavailable' ? t('unavailable') : t('readOnly'));
       }
-
-      const clearDraft = (name) => setDrafts((current) => {
-        if (current[name] === undefined) return current;
-        const { [name]: _dropped, ...rest } = current;
-        return rest;
+      return h(TurnNotifierGroups, {
+        t,
+        store: settingsStore,
+        audio: audio ?? createAudio(),
+        running: undefined,
+        pending: undefined,
+        showStatus: false,
       });
-      const shown = (name, committed) => (drafts[name] !== undefined ? drafts[name] : String(committed));
-      const edit = (name, text) => setDrafts((current) => ({ ...current, [name]: text }));
-      const write = (name, value) => {
-        setFailed(false);
-        // The slot normally injects this; degrade to the error line rather than
-        // throwing inside an event handler if it ever does not.
-        if (typeof props.writeSetting !== 'function') {
-          setFailed(true);
-          return;
-        }
-        void Promise.resolve(props.writeSetting(name, value)).catch(() => setFailed(true));
-      };
-      const commit = (name, parse) => {
-        const text = drafts[name];
-        clearDraft(name);
-        if (text === undefined || text.trim() === '') return;
-        const value = parse(text);
-        if (value === undefined) return;
-        setInvalid(false);
-        write(name, value);
-      };
-      /** Refuse a pattern the browser cannot play, so a typo never reaches the Host. */
-      const commitPattern = (name) => () => commit(name, (text) => {
-        if (parsePattern(text, null) === null) {
-          setInvalid(true);
-          return undefined;
-        }
-        return text;
-      });
-      const reset = (name) => {
-        clearDraft(name);
-        setInvalid(false);
-        setFailed(false);
-        if (typeof props.resetSetting !== 'function') {
-          setFailed(true);
-          return;
-        }
-        void Promise.resolve(props.resetSetting(name)).catch(() => setFailed(true));
-      };
-
-      return h('div', { style: STYLE.form }, [
-        field({
-          key: 'repeatCount',
-          t,
-          id: 'turn-notifier-repeat-count',
-          label: t('repeatCount'),
-          hint: t('repeatCountHint'),
-          value: shown('repeatCount', state.repeatCount),
-          step: 1,
-          min: 1,
-          max: 10,
-          overridden: state.overridden.repeatCount,
-          onEdit: (text) => edit('repeatCount', text),
-          onCommit: () => commit('repeatCount', (text) => clampInteger(text, 1, 10, state.repeatCount)),
-          onReset: () => reset('repeatCount'),
-        }),
-        field({
-          key: 'intervalSeconds',
-          t,
-          id: 'turn-notifier-interval',
-          label: t('intervalSeconds'),
-          hint: t('intervalSecondsHint'),
-          value: shown('intervalSeconds', state.intervalMs / 1000),
-          unit: t('seconds'),
-          step: 0.5,
-          min: 1,
-          max: 60,
-          overridden: state.overridden.intervalMs,
-          onEdit: (text) => edit('intervalSeconds', text),
-          onCommit: () => commit('intervalSeconds', (text) => {
-            const seconds = Number(text);
-            if (!Number.isFinite(seconds)) return undefined;
-            return clampInteger(seconds * 1000, 1000, 60000, state.intervalMs);
-          }),
-          onReset: () => reset('intervalMs'),
-        }),
-        field({
-          key: 'volume',
-          t,
-          id: 'turn-notifier-volume',
-          label: t('volume'),
-          hint: t('volumeHint'),
-          value: shown('volume', state.volume),
-          step: 0.05,
-          min: 0,
-          max: 1,
-          overridden: state.overridden.volume,
-          onEdit: (text) => edit('volume', text),
-          onCommit: () => commit('volume', (text) => {
-            const number = Number(text);
-            if (!Number.isFinite(number)) return undefined;
-            return Math.min(1, Math.max(0, number));
-          }),
-          onReset: () => reset('volume'),
-        }),
-        field({
-          key: 'waveform',
-          t,
-          id: 'turn-notifier-waveform',
-          label: t('waveform'),
-          hint: t('waveformHint'),
-          kind: 'select',
-          choices: WAVEFORMS.map((name) => ({ value: name, label: t(`waveform_${name}`) })),
-          value: state.waveform,
-          overridden: state.overridden.waveform,
-          onPick: (value) => write('waveform', value),
-          onReset: () => reset('waveform'),
-        }),
-        field({
-          key: 'finishedPattern',
-          t,
-          id: 'turn-notifier-finished-pattern',
-          label: t('finishedPattern'),
-          hint: t('finishedPatternHint'),
-          kind: 'text',
-          value: shown('finishedPattern', state.finishedPattern),
-          overridden: state.overridden.finishedPattern,
-          onEdit: (text) => edit('finishedPattern', text),
-          onCommit: commitPattern('finishedPattern'),
-          onReset: () => reset('finishedPattern'),
-        }),
-        field({
-          key: 'interactionPattern',
-          t,
-          id: 'turn-notifier-interaction-pattern',
-          label: t('interactionPattern'),
-          hint: t('interactionPatternHint'),
-          kind: 'text',
-          value: shown('interactionPattern', state.interactionPattern),
-          overridden: state.overridden.interactionPattern,
-          onEdit: (text) => edit('interactionPattern', text),
-          onCommit: commitPattern('interactionPattern'),
-          onReset: () => reset('interactionPattern'),
-        }),
-        invalid ? h('div', { key: 'invalid', style: STYLE.error }, t('invalidPattern')) : null,
-        failed ? h('div', { key: 'error', style: STYLE.error }, t('saveFailed')) : null,
-      ]);
     }
 
     return {
@@ -1015,15 +861,21 @@ window.__ModuleLoader__.load({
 
         // The bundle's own configuration page, sharing this row's lifecycle:
         // off means nothing is mounted, on means everything comes back.
+        // The row's own configuration page, keyed `<package>#<row id>`: clicking
+        // the row in the bundle card opens the grouped body below. Registered
+        // only while the Host serves this entry's settings namespace.
+        ctx.effect(() => ctx.configForms.whileServed([ENTRY_ID], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+          name: 'plugins.row.config',
+          key: `${BUNDLE_NAME}#${ENTRY_ID}`,
+          locale: LOCALE_NS,
+          inject: () => ({ audio }),
+        }, TurnNotifierRowConfig))), 'turn-notifier: row configuration page');
+
         ctx.effect(() => ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
           name: 'plugins.bundle.config',
           key: BUNDLE_NAME,
           locale: LOCALE_NS,
-          inject: () => ({
-            settingsStore: store,
-            writeSetting: (name, value) => form.set(name, value),
-            resetSetting: (name) => form.unset(name),
-          }),
+          inject: () => ({ settingsStore: store, audio }),
         }, TurnNotifierSettings)), 'turn-notifier: settings page');
 
       },
