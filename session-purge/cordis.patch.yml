@@ -1,0 +1,9 @@
+# Session Purge — delete a session (and its subagent children) from disk.
+#
+# The row mounts the Host half, which owns the purge engine and publishes the
+# `sessionPurge` Remote namespace; the sidebar button, the confirmation dialog
+# and the toast live in the Client half declared by `dsh.client` in package.json.
+
+- insert:
+    - id: session-purge
+      name: '@local/session-purge'

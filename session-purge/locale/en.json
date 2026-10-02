@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Purge",
+    "description": "Adds a delete-session button to the sidebar row and its \"…\" menu: removes the session log, projection checkpoint, workspace slot, bound reminders, spilled tool output and its subagent children from disk, optionally purging attachment objects no surviving session references."
+  }
+}
