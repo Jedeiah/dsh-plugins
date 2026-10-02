@@ -121,7 +121,9 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 
 **不再有"卡片配置区"。** 1.6.0 曾在 `plugins.bundle.config` 另放一份，导致同一个卡片里出现"配置区 + 组件行页"两份入口（1.6.1 已删）。现在两处入口渲染的都是 `TurnNotifierGroups`（三组：什么时候响 / 怎么响 / 重复与停止），读写同一个 `ctx.configForms.get('turn-notifier')`，不存在两套界面或两套值。
 
-**停用/启用插件行之后，行右侧的 `›` 会消失** —— 这是 deepseek-harness#8452 的直接表现：客户端半边被卸载后不会重新挂载，`whileServed` 注册的行页随之消失。**重载界面（⌘R）即可恢复**；想临时安静请用设置里的静音开关，不要动行开关。行配置页由宿主在每次渲染时新给一个 `{ state, mutate }`，插件侧用一个**身份稳定**的桥接对象 + 显式快照把新 revision 传进去——适配器若每次渲染都新建，`useStoreValue` 的依赖会不停变化并陷入 setState 循环。
+**关于"停用/启用后 `›` 消失"**：`session-purge` 在同样操作下能保住行页，差异在**激活面**——它把 `configForms` 当**可选**服务（`ctx.get('configForms')` + `whileServed` 守卫），而本插件原先把它写进模块级 `inject`。写进 `inject` 意味着"服务不齐就不激活"：行在停用→启用的重建窗口里如果等不到它，插件就停在未激活状态，`apply` 不再执行，行页与铃铛一起消失（deepseek-harness#8452 的同一族现象）。1.6.2 起本插件与 `session-purge` 同形：`inject` 只留 `slots`/`locale`，`configForms` 缺失时退化为按 schema 默认值只读（铃铛与响铃照常），行页只在宿主确实提供该命名空间时注册。
+
+若仍然出现 `›` 消失，**重载界面（⌘R）**即可恢复；想临时安静请用设置里的静音开关，不要动行开关。行配置页由宿主在每次渲染时新给一个 `{ state, mutate }`，插件侧用一个**身份稳定**的桥接对象 + 显式快照把新 revision 传进去——适配器若每次渲染都新建，`useStoreValue` 的依赖会不停变化并陷入 setState 循环。
 
 **响铃行为是另一个隐形条目**（同一槽位、id `turn-notifier-alert`）：它只订阅 `useSessionStatus`，与铃铛/对话框互不影响。
 

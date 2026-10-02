@@ -801,13 +801,20 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale', 'configForms'],
+      inject: ['slots', 'locale'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), 'turn-notifier: dictionaries');
 
-        const form = ctx.configForms.get(ENTRY_ID);
-        const store = createSettingsStore(form);
-        ctx.effect(() => () => store.dispose(), 'turn-notifier: settings subscription');
+        // `configForms` is optional: a composition without the settings UI must
+        // still get the bell and the chime (with schema defaults, read-only). It
+        // is also deliberately NOT part of this plugin's `inject` face — a plugin
+        // whose activation waits on a service that is being rebuilt during a row
+        // toggle can end up never activating, which is how the row page (`›`)
+        // disappeared after 停用→启用 while the same-shaped session-purge survived.
+        const forms = ctx.get('configForms');
+        const form = forms?.get?.(ENTRY_ID);
+        const store = form === undefined ? FALLBACK_STORE : createSettingsStore(form);
+        if (form !== undefined) ctx.effect(() => () => store.dispose(), 'turn-notifier: settings subscription');
 
         const audio = createAudio();
 
@@ -835,7 +842,7 @@ window.__ModuleLoader__.load({
         // The row's own configuration page, keyed `<package>#<row id>`: clicking
         // the row in the bundle card opens the grouped body below. Registered
         // only while the Host serves this entry's settings namespace.
-        ctx.effect(() => ctx.configForms.whileServed([ENTRY_ID], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+        if (forms?.whileServed !== undefined) ctx.effect(() => forms.whileServed([ENTRY_ID], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
           name: 'plugins.row.config',
           key: `${BUNDLE_NAME}#${ENTRY_ID}`,
           locale: LOCALE_NS,
