@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Turn Notifier",
-    "description": "Chimes when the agent finishes a turn or waits for you (approval or question), repeating every 5 seconds up to three times until you touch the mouse or keyboard."
+    "title": "Chime",
+    "description": "Rings when the agent needs your attention; use the row's arrow to tune the chime."
   }
 }

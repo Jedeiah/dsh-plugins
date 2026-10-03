@@ -1,13 +1,14 @@
 {
   "name": "@jedeiah/turn-notifier",
-  "version": "1.6.6",
+  "version": "1.7.0",
   "private": true,
   "type": "module",
-  "description": "回合提醒：智能体答完一轮、或停下来等你操作时响铃；不动鼠标就按设定间隔重复（默认 5 秒 ×3），一动鼠标键盘立刻停。两套音调、波形、音量、次数都能在 Plugins 页面里配置。",
+  "description": "提示铃（Chime）：智能体需要你注意时响铃提醒；波形、音量、提示音、重复次数都能在 Plugins 页面里配置。",
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./typert": "./typert.js",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json"
@@ -15,15 +16,20 @@
   "files": [
     "index.js",
     "client.js",
+    "typert.js",
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json"
   ],
   "peerDependencies": {
-    "@deepseek-ai/schemastery": "*"
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*"
   },
   "devDependencies": {
-    "@deepseek-ai/schemastery": "*"
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*"
   },
   "dsh": {
     "bundle": {
@@ -32,9 +38,12 @@
     "client": {
       "platform": "web",
       "inject": [
+        "@deepseek-ai/dsh-api-gateway",
+        "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-client-locale",
         "@deepseek-ai/dsh-client-ui-plugin-manager",
-        "@deepseek-ai/dsh-client-ui-settings"
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots"
       ]
     }
   }

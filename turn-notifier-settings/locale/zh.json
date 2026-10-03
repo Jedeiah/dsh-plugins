@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "回合提醒设置",
-    "description": "@jedeiah/turn-notifier 的设置页：由独立 bundle 提供提醒那一行的配置页，这样停用→启用提醒行之后，右侧 `›` 设置入口不会跟着消失。"
-  }
-}
