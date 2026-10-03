@@ -1,19 +1,19 @@
 # dsh 插件集
 
-一组 **[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）** 组合包（bundle）：
-装上就能用的小功能，每个插件一个顶层目录。
+我自己在用的 **[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）** 插件集。
 
-> ⚠️ **非官方项目。** 本仓库由社区维护，与 deepseek-ai 无隶属关系，也不属于官方插件市场。
+平时用得上、顺手的小功能，就写成一个组合包（bundle）收进来，每个插件一个顶层目录——换机器或重装时能一把装回；攒下来的顺手公开，别人看着有用可以直接拿去用。
+
+> ⚠️ **非官方项目。** 与 deepseek-ai 无隶属关系，也不属于官方插件市场。仓库里都是自己用得上才写的插件，想到什么加什么。
 
 ## 插件一览
 
 | 插件 | 作用 | 版本 |
 |---|---|---|
-| **[turn-notifier](turn-notifier/README.md)** | **回合提醒**：智能体答完一轮、或停下来等你操作（审批 / 提问）时响铃；不动鼠标键盘就按设定间隔重复（默认 5 秒 ×3），一动就停。设置页由配对包 [turn-notifier-settings](turn-notifier-settings/README.md) 提供（Plugins 页卡片里点开 `turn-notifier` 那一行右侧的 `›`；键 `@jedeiah/turn-notifier#turn-notifier`、挂 `whileServed` 反应式门），所以「停用→启用响铃那一行」不再弄丢设置入口；响铃本身仍随行开关进出，回到界面需重载页面 | 1.6.6 |
-| **[turn-notifier-settings](turn-notifier-settings/README.md)** | **回合提醒设置**：`turn-notifier` 的设置页半边，三组排版（什么时候响 / 怎么响 / 重复与停止）含试听与静音。拆成独立 bundle 是为了让设置入口与「可被停用的那一行」解耦：本包的行不需要开关，且注册挂在命名空间反应式门上，命名空间回来时自动重挂 | 1.0.0 |
-| **[web-fetch-fakeip](web-fetch-fakeip/README.md)** | **抓取兼容 fake-ip 代理**：复用官方 HTTP 抓取提供方的整条流水线，只额外放行本地 TUN 代理（Clash / Shadowrocket）的 fake-ip 段，让 `web_fetch` 开着代理时也能正常工作 | 5.0.0 |
-| **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **Chrome DevTools MCP**：给模型浏览器调试工具（页面管理、快照、截图、DOM/JS 求值、控制台、网络、性能分析），工具名形如 `mcp__chrome-devtools__<tool>` | 1.0.0 |
-| **[session-purge](session-purge/README.md)** | **会话彻底删除**：侧栏会话行的悬停按钮 / 「…」菜单里加「删除会话」，把会话连同子 agent 会话从磁盘上连根清掉——日志与锁、投影缓存、工作区归属、绑定的提醒、工具落盘文件，可选清掉无人引用的附件对象；活会话拒绝删除（先重启 App） | 1.0.0 |
+| **[turn-notifier](turn-notifier/README.md)** | **提示铃**：智能体需要你注意时响铃提醒（答完一轮 / 停下来等你操作），不理会就按间隔重复，一动鼠标键盘就停。点组件行的箭头可调提示音、波形、音量与重复次数 | 1.7.0 |
+| **[session-purge](session-purge/README.md)** | **删除会话**：在会话行的悬停按钮 / 「…」菜单里加「删除会话」，把会话连同子 agent 会话真正从磁盘上删掉。点组件行的箭头可配置清理范围 | 1.0.0 |
+| **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **浏览器调试**：接入 chrome-devtools-mcp，给模型浏览器调试工具（页面、快照、截图、DOM/JS 求值、控制台、网络、性能），工具名形如 `mcp__chrome-devtools__<tool>` | 1.0.0 |
+| **[web-fetch-fakeip](web-fetch-fakeip/README.md)** | **代理抓取**：让 `web_fetch` 在 TUN + fake-ip 代理（Clash / Shadowrocket）下也能正常工作 | 5.0.0 |
 
 每个插件都是**独立、可单独安装**的组合包：`package.json` 里声明 `dsh.bundle.patch`，patch 文件插入该插件的行；带界面/交互的插件再声明 `dsh.client` 提供客户端半边。
 
@@ -81,16 +81,19 @@ dsh plugin --profile <你的profile> add "github:Jedeiah/dsh-plugins#path:turn-n
 
 ## 已知的 dsh 侧问题
 
-- **停用一行带客户端半边的插件后再启用，客户端半边不会重新挂载**（表现为该行的界面/配置页消失，内置插件面板报 `loaded without registering ... via __ModuleLoader__.load`）。原因是浏览器模块表认为该包已加载、不再执行它的 `apply`；**重载界面（⌘R）即可恢复**，重启 App 当然也行（不必为此重启整个应用）。已上报：[deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)。在修好之前：**别用行开关去临时静音**——`turn-notifier` 现在自带「静音」开关，其它插件把自己的行为改成可配置而不是需要停用。
-- **静态 `import` dsh 自带包：作者在 0.2.0-rc.2 上遇到过一次「条目建不起来、诊断只报 `failed to import`」（当时 specifier 就是同一个）；后续复核里，把该包写进 `peerDependencies` 之后静态导入可以正常组合（`schemastery`、`dsh-web-fetch-http` 都是静态导入）。因此本仓库仍统一用模块作用域的 `await import(...)` 兜底，见 `web-fetch-fakeip` 的 README《实现注记》。
+- **停用一行带客户端半边的插件后再启用，客户端半边不保证重新挂载**：浏览器模块表认为该包已加载，于是不再执行它的 `apply`（[deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)）。
+  **本仓库的规避方式**：把配置页的注册放进一道 `ctx.inject(['remote.<本插件自己的服务>', …], cb)` 依赖门里——`apply` 不重跑时，Host 半边重建仍会让依赖消失又出现，门于是重开、页面重新挂上。`turn-notifier` 与 `session-purge` 都用了这个形状，实测「停用 → 启用」后 `›` 和页面内容都在。
+  隐形条目（响铃、按钮等）不走这道门，其恢复情况未逐项验证；**若发现某行界面消失，重载界面（⌘R）即可恢复**，不必重启 App。
 
-## 贡献
+- **静态 `import` dsh 自带包**：作者在 0.2.0-rc.2 上遇到过一次「条目建不起来、诊断只报 `failed to import`」（当时 specifier 就是同一个）；后续复核里，把该包写进 `peerDependencies` 之后静态导入可以正常组合（`schemastery`、`dsh-web-fetch-http` 都是静态导入）。因此本仓库仍统一用模块作用域的 `await import(...)` 兜底，见 `web-fetch-fakeip` 的 README《实现注记》。
 
-欢迎提 PR / issue：
+## 反馈
+
+仓库首先是自用的，插件都按"自己用得上"的标准写。有 bug、有建议，或者想加个类似的插件，欢迎提 issue / PR：
 
 - 加插件：按上面《新增一个插件》的文件与约定来。
 - 改现有插件：请保持**纯 JS、零构建**，可调参数走 `Config`，界面文案走客户端 locale。
-- 如果踩到 dsh 自身的坑，欢迎连带把复现步骤写进对应插件的 README（本仓库的风格是"把坑记在原地"）。
+- 如果踩到 dsh 自身的坑，欢迎连带把复现步骤写进对应插件的 README——本仓库的习惯是"把坑记在原地"。
 
 ## 许可
 
