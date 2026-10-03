@@ -41,7 +41,7 @@ const DEFAULTS = Object.freeze({
   notifyOnWaiting: true,
   repeatCount: 3,
   intervalMs: 5000,
-  volume: 0.35,
+  volume: 1,
   waveform: 'sine',
   finishedPattern: '880:170, 1318.5:300',
   interactionPattern: '1046.5:140, 1318.5:140, 1046.5:200',
@@ -132,7 +132,7 @@ window.__ModuleLoader__.load({
         notifyOnWaiting: value.notifyOnWaiting !== false,
         repeatCount: clampInteger(value.repeatCount, 1, 10, DEFAULTS.repeatCount),
         intervalMs: clampInteger(value.intervalMs, 1000, 60000, DEFAULTS.intervalMs),
-        volume: Math.min(1, Math.max(0, Number.isFinite(value.volume) ? value.volume : DEFAULTS.volume)),
+        volume: Math.min(2, Math.max(0, Number.isFinite(value.volume) ? value.volume : DEFAULTS.volume)),
         waveform: WAVEFORMS.includes(value.waveform) ? value.waveform : DEFAULTS.waveform,
         finishedPattern,
         interactionPattern,
@@ -199,6 +199,7 @@ window.__ModuleLoader__.load({
      */
     function createAudio() {
       let context = null;
+      let limiter = null;
 
       function ensure() {
         try {
@@ -210,6 +211,20 @@ window.__ModuleLoader__.load({
           if (context.state === 'suspended') {
             // Autoplay policy rejects this before a user gesture; not an error.
             void Promise.resolve(context.resume()).catch(() => {});
+          }
+          // One compressor for every tone, built once and reused. Volume goes up to
+          // 2 so a quiet laptop speaker can still be pushed; past 1.0 the summed
+          // samples would clip against the output range, so the chain ends here
+          // instead of at `destination` and the peaks get caught rather than
+          // squared off. Settings chosen to be inert below the threshold.
+          if (limiter === null) {
+            limiter = context.createDynamicsCompressor();
+            limiter.threshold.value = -3;
+            limiter.knee.value = 4;
+            limiter.ratio.value = 12;
+            limiter.attack.value = 0.003;
+            limiter.release.value = 0.12;
+            limiter.connect(context.destination);
           }
           return context;
         } catch {
@@ -235,7 +250,7 @@ window.__ModuleLoader__.load({
           gain.gain.linearRampToValueAtTime(volume, startsAt + 0.015);
           gain.gain.exponentialRampToValueAtTime(0.0001, endsAt);
           oscillator.connect(gain);
-          gain.connect(audio.destination);
+          gain.connect(limiter ?? audio.destination);
           oscillator.start(startsAt);
           oscillator.stop(endsAt + 0.02);
         }
@@ -406,7 +421,7 @@ const en = {
   groupTones: 'Chimes',
   groupRepeat: 'Repeats',
   tone: 'Chime set',
-  toneHint: 'Pick a set, or edit each chime yourself under Custom.',
+  toneHint: 'Picking a set plays it right away.',
   tone_bright: 'Bright',
   tone_soft: 'Soft',
   tone_deep: 'Deep',
@@ -417,7 +432,7 @@ const en = {
   muteLabel: 'Mute',
   muteHint: 'Silences every chime and leaves the other settings alone.',
   volume: 'Volume',
-  volumeHint: '0 is silent, 1 is full.',
+  volumeHint: '0 is silent, 2 is the top.',
   waveform: 'Waveform',
   waveformHint: 'Timbre shared by every tone.',
   waveform_sine: 'Sine',
@@ -429,7 +444,6 @@ const en = {
   interactionPatternHint: 'Same notation. Example: 1046.5:140, 1318.5:200',
   invalidPattern: 'Use frequencyHz:durationMs, separated by commas.',
   preview: 'Preview',
-  previewAll: 'Preview both',
   playing: 'Playing',
   repeatCount: 'Rings',
   repeatCountHint: 'Including the first one. 1–10.',
@@ -452,7 +466,7 @@ const zh = {
   groupTones: '音调',
   groupRepeat: '重复',
   tone: '提示音',
-  toneHint: '选一套预设，或在「自定义」里逐个编辑音调。',
+  toneHint: '换一套会立刻试听。',
   tone_bright: '清脆',
   tone_soft: '柔和',
   tone_deep: '沉稳',
@@ -463,7 +477,7 @@ const zh = {
   muteLabel: '静音',
   muteHint: '只让铃不响，其它设置不受影响。',
   volume: '音量',
-  volumeHint: '0 为静音，1 为最大。',
+  volumeHint: '0 是静音，2 是最大。',
   waveform: '波形',
   waveformHint: '所有音共用的波形。',
   waveform_sine: '正弦',
@@ -475,7 +489,6 @@ const zh = {
   interactionPatternHint: '格式相同。例如 1046.5:140, 1318.5:200',
   invalidPattern: '请按「频率Hz:时长ms」书写，用逗号分隔。',
   preview: '试听',
-  previewAll: '一起试听',
   playing: '播放中',
   repeatCount: '响几声',
   repeatCountHint: '含第一次。1–10。',
@@ -740,7 +753,10 @@ const STYLE = Object.freeze({
               'aria-haspopup': 'menu',
               'aria-expanded': open,
               onClick: () => setOpen(true),
-            }, t(labelKey)),
+            }, h('span', {
+              key: 'face',
+              style: { display: 'inline-flex', alignItems: 'center', gap: 6 },
+            }, [t(labelKey), h(primitives.IconChevronDownOutlineRegular, { key: 'chevron' })])),
             onClose: () => setOpen(false),
             items: TONE_SETS.map((set) => ({ id: set.key, label: t(`tone_${set.key}`) })).concat([{ id: 'custom', label: t('tone_custom') }]),
             selectedId: active,
@@ -755,7 +771,7 @@ const STYLE = Object.freeze({
             variant: 'ghost',
             disabled,
             onClick: onPreview,
-          }, playing ? t('playing') : t('previewAll')),
+          }, playing ? t('playing') : t('preview')),
         ]),
         h('span', { key: 'hint', style: LAYOUT.hint }, t('toneHint')),
       ]);
@@ -864,7 +880,7 @@ const STYLE = Object.freeze({
               key: 'slider',
               type: 'range',
               min: 0,
-              max: 1,
+              max: 2,
               step: 0.05,
               value: settings.volume,
               disabled,

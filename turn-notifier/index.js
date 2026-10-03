@@ -46,8 +46,8 @@ export const Config = z.object({
   repeatCount: z.number().step(1).min(1).max(10).default(3).volatile(),
   /** Milliseconds between the first ring and each repeat. */
   intervalMs: z.number().step(100).min(1000).max(60000).default(5000).volatile(),
-  /** Chime volume, 0..1. */
-  volume: z.number().min(0).max(1).default(0.35).volatile(),
+  /** Chime volume, 0..2. Above 1 the output limiter catches the peaks. */
+  volume: z.number().min(0).max(2).default(1).volatile(),
   /** Oscillator waveform for every tone. */
   waveform: z.union(['sine', 'square', 'triangle']).default('sine').volatile(),
   /** Tones of the "turn finished" chime, as `frequencyHz:durationMs` pairs played in order. */
@@ -63,7 +63,7 @@ const CONFIG_DEFAULTS = Object.freeze({
   notifyOnWaiting: true,
   repeatCount: 3,
   intervalMs: 5000,
-  volume: 0.35,
+  volume: 1,
   waveform: 'sine',
   finishedPattern: '880:170, 1318.5:300',
   interactionPattern: '1046.5:140, 1318.5:140, 1046.5:200',
