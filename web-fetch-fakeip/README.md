@@ -1,4 +1,4 @@
-# @jedeiah/web-fetch-fakeip
+# 代理抓取（Proxy Fetch）
 
 **开着本地 TUN 代理时，让 dsh 的 `web_fetch` 继续可用。**
 

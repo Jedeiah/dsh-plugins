@@ -3,7 +3,7 @@
   "version": "5.0.0",
   "private": true,
   "type": "module",
-  "description": "抓取兼容 fake-ip 代理：复用官方 HTTP 抓取提供方的整条流水线，只额外放行本地 TUN 代理（Clash / Shadowrocket）的 fake-ip 段，让 web_fetch 开着代理时也能正常工作。",
+  "description": "代理抓取（Proxy Fetch）：让 web_fetch 在 TUN、fake-ip 代理（Clash / Shadowrocket）下也能正常工作——复用官方 HTTP 抓取提供方的整条流水线，只额外放行 fake-ip 段。",
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",

@@ -1,4 +1,4 @@
-# @jedeiah/chrome-devtools-mcp
+# 浏览器调试（Browser Debugging）
 
 一个**纯配置型 dsh 组合包**：通过官方自带的 `@deepseek-ai/dsh-mcp-client` 桥接，把
 [`chrome-devtools-mcp`](https://www.npmjs.com/package/chrome-devtools-mcp) 服务器接进当前

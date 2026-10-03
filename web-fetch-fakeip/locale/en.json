@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Fetch · fake-ip proxy aware",
-    "description": "Reuses the shipped HTTP fetch provider's whole pipeline and only adds an allowance for the fake-ip range a local TUN proxy hands out, so web_fetch keeps working with the proxy on."
+    "title": "Proxy Fetch",
+    "description": "Keeps web_fetch working behind a TUN proxy such as Clash or Shadowrocket."
   }
 }
