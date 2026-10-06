@@ -1,6 +1,6 @@
 {
   "name": "@jedeiah/web-fetch-fakeip",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "private": true,
   "type": "module",
   "description": "代理抓取（Proxy Fetch）：让 web_fetch 在 TUN、fake-ip 代理（Clash / Shadowrocket）下也能正常工作——复用官方 HTTP 抓取提供方的整条流水线，只额外放行 fake-ip 段。",

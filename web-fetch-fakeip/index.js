@@ -24,6 +24,14 @@ import { isIP } from 'node:net';
  *      configured in `allowRanges`;
  *   3. otherwise rethrow the shipped error untouched.
  *
+ * On the rescuing path an IPv4 destination wrapped in IPv6 — the IPv4-mapped
+ * `::ffff:a.b.c.d` and the IPv4-translated `::ffff:0:a.b.c.d` a proxy with IPv6
+ * DNS answers AAAA with — is handed on as the IPv4 destination itself. The
+ * shipped pinning takes the first eligible address, and a `::ffff:0:x` literal
+ * is not routeable everywhere the proxy's own fake-ip is. Nothing else about the
+ * answer is touched, and the strict path (`allowRanges` empty) returns the
+ * shipped verdict verbatim.
+ *
  * Nothing about "which addresses are public" is reimplemented here, so an
  * upstream change to that policy keeps applying. The plugin can only ever widen
  * the verdict for addresses inside its own configured ranges, and it fails
@@ -139,9 +147,16 @@ function parseAllowance(text) {
 }
 
 /**
- * Read an address as an unsigned 32-bit IPv4 destination, covering the textual
- * forms a resolver can hand back for an IPv4 answer: a dotted quad, a dotted
- * IPv4-mapped IPv6 (`::ffff:a.b.c.d`), and a hexadecimal IPv4-mapped IPv6.
+ * Read an address as an unsigned 32-bit IPv4 destination when the resolver handed
+ * back an IPv4 one wrapped in IPv6: the IPv4-mapped form (`::ffff:a.b.c.d`) and
+ * the IPv4-translated form (`::ffff:0:a.b.c.d`) a TUN proxy with IPv6 DNS answers
+ * AAAA with for the very same fake-ip it hands out as A.
+ *
+ * The textual IPv6 forms are not matched one by one — compressed or not, case,
+ * leading zeros and an embedded dotted quad all spell the same destination. The
+ * address is normalized through the WHATWG URL parser first, whose IPv6
+ * serialization is specified, then expanded into its eight groups, where the
+ * 96-bit prefix decides.
  *
  * @param address - the address text.
  * @returns the address as an integer, or undefined when it is not an IPv4 destination.
@@ -154,17 +169,29 @@ function ipv4ValueOf(address) {
     if (octets.some((octet) => octet > 255)) return undefined;
     return (((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0);
   }
-  const mapped = /^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/i.exec(text);
-  if (mapped !== null) {
-    const octets = mapped.slice(1).map(Number);
-    if (octets.some((octet) => octet > 255)) return undefined;
-    return (((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0);
+  let normalized;
+  try {
+    normalized = new URL(`http://[${text}]/`).hostname.slice(1, -1);
+  } catch {
+    // Not a spelling the URL parser accepts as an IPv6 literal: fail closed.
+    return undefined;
   }
-  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(text);
-  if (mappedHex !== null) {
-    return ((((parseInt(mappedHex[1], 16) << 16) | parseInt(mappedHex[2], 16)) >>> 0));
-  }
-  return undefined;
+  const [head, tail] = normalized.split("::");
+  const headGroups = head === "" ? [] : head.split(":");
+  const tailGroups = tail === undefined || tail === "" ? [] : tail.split(":");
+  const groups = [
+    ...headGroups,
+    ...Array(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill("0"),
+    ...tailGroups
+  ];
+  if (groups.length !== 8) return undefined;
+  const values = groups.map((group) => parseInt(group, 16));
+  if (values.some((value) => !Number.isInteger(value))) return undefined;
+  const prefix = values.slice(0, 6).join(",");
+  const mapped = prefix === "0,0,0,0,0,65535";
+  const translated = prefix === "0,0,0,0,65535,0";
+  if (!mapped && !translated) return undefined;
+  return (((values[6] << 16) | values[7]) >>> 0);
 }
 
 /**
@@ -205,6 +232,7 @@ function raceWithSignal(promise, signal) {
  * @param allowance - the parsed allowance.
  * @returns the accepted address set, or undefined when the answer does not
  *   qualify (a mixed set, an IPv6 answer, or an address outside the allowance).
+ *   Wrapped IPv4 destinations are handed over as the IPv4 address itself.
  */
 async function addressesInsideAllowance(hostname, signal, allowance) {
   if (allowance.length === 0) return undefined;
@@ -223,9 +251,19 @@ async function addressesInsideAllowance(hostname, signal, allowance) {
   }
   if (resolved.length === 0) return undefined;
   const addresses = [];
+  const seen = new Set();
   for (const entry of resolved) {
     if (!isInsideAllowance(entry.address, allowance)) return undefined;
-    addresses.push({ address: entry.address, family: entry.family });
+    // Hand the connector the IPv4 destination an IPv6 wrapper stands for: the
+    // pinned lookup takes the first eligible address, and a `::ffff:0:x` literal
+    // is not routeable everywhere the proxy's own fake-ip is.
+    const value = ipv4ValueOf(entry.address);
+    const address = value === undefined ? entry.address : `${value >>> 24}.${(value >>> 16) & 255}.${(value >>> 8) & 255}.${value & 255}`;
+    const family = value === undefined ? entry.family : 4;
+    const key = `${address}/${family}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    addresses.push({ address, family });
   }
   return addresses;
 }

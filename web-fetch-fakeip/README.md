@@ -36,6 +36,8 @@ constructor(limits, resolveAddresses = publicHttpNetwork.resolve) { … }
 
 下列行为**全部是官方实现**，一行没改：URL 策略、**只跟随同源重定向**、错误码、字节/字符/
 超时上限、**按 charset 解码**、连接固定（防 DNS rebinding）、代理路由（`proxyRouteFor`）。
+唯一一处例外在**放行路径**上：交出去的地址由本插件归一化（见下文「四条性质」之后那段）；
+严格模式（`allowRanges` 空）返回的仍是官方判定，逐条一致。
 
 ## 官方改了判定怎么办？——这次有答案
 
@@ -60,6 +62,11 @@ constructor(limits, resolveAddresses = publicHttpNetwork.resolve) { … }
 | ② 放行模式下，被放行的**恰好只有**配置段内的地址 | 仅 `198.18.0.18`、`198.19.5.5`、`[198.18.0.18]`、`::ffff:198.18.0.18` ✅ |
 | ③ **有界性**：凡是我放行而官方拒绝的，地址必落在配置段内 | 放大路径共 4 个地址，全部在 `198.18.0.0/15` 内 ✅ |
 | ④ 其余拒绝场景**原样抛出官方错误** | `127.0.0.1`、`::ffff:7f00:1`、`64:ff9b::c0a8:101`、`2002:7f00:1::`、`169.254.169.254`、`2001:db8::1` 全部 `WEB_BLOCKED_URL` ✅ |
+
+归一化与去重**只发生在放行路径上**：官方解析器没有拒绝的答案照旧原样透传（官方永远权威）。
+凡走放行路径的地址，一律以其代表的 IPv4 目的地交给连接层 —— 连接固定用的是
+`createPinnedLookup()`，它取**首个可用地址**，而 `::ffff:0:x` 这种字面量并非在哪儿都可路由；
+同一地址重复出现（A 与 AAAA 各一条）只留一条，首个可用地址因此是确定的。
 
 ## 配置
 
@@ -151,6 +158,7 @@ try {
 | `web_fetch https://api.github.com/repos/deepseek-ai/deepseek-harness` | **HTTP 200** ✅ —— 当初报告里**必被拒**的那条 URL |
 | `web_fetch http://127.0.0.1:8080/` | **仍被拒** ✅ `resolves to a non-public IP address` |
 | 同一时刻 `nslookup example.com` | `198.18.0.79` —— 代理 fake-ip **确实开着** ✅ |
+| 目标域名同时返回 A + AAAA（translated fake-ip）两条记录 | **HTTP 200** ✅ —— 5.1.0 之前每次必被拒 |
 
 即"开着代理能抓公网"与"内网仍被挡住"**同时成立**。
 
@@ -171,7 +179,15 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_APP/Contents/MacOS/DeepSeek Harness" \
 
 ## 已知限制
 
-- **只处理 IPv4 fake-ip**。若代理返回 IPv6 fake-ip（罕见），需要把对应段配进 `allowRanges`。
+- **只处理 IPv4 fake-ip**，但**不挑剔书写形式**：代理把同一个 fake-ip 用 IPv6 回在 AAAA 里时
+  （`::ffff:0:a.b.c.d`，IPv4-translated；Clash / Shadowrocket 开着 DNS IPv6 时都会这样，而且
+  与 A 记录同时返回），照样放行 —— 地址先过 WHATWG `URL` 规范序列化，再展开成八组按前缀判断，
+  压缩/大写/前导零/内嵌点分四段都归一到同一个判定；交给连接层的始终是其中的 IPv4 目的地。
+- **真 IPv6 fake-ip 池仍未支持**（例如 Clash 的 `fake-ip-range6`，`fc00::/x`）：`allowRanges`
+  只接受 IPv4 CIDR，这类答案会 fail closed —— 抓取被拒，**不会误放行**。要支持需要新增一个
+  IPv6 允许段配置项。
+- **NAT64 前缀（`64:ff9b::/96`）故意不收**：那是可路由的真实 IPv6 目的地，收进来等于把可连
+  目的地的类别放宽一级，而 fake-ip 代理不会发这种地址。
 - 抓取仍然**不发送任何凭据**，与内置提供方一致。
 - 只跟随同源重定向（继承自内置实现）：跨源跳转需要模型再次调用工具。
 - 放行路径会**多解析一次**（官方先解析并拒绝，插件再解析一次确认地址在放行段内）；
