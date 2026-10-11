@@ -7,15 +7,23 @@
  * (`@deepseek-ai/dsh-typert-loader`'s `validateTypertManifest` and
  * `@deepseek-ai/dsh-typert-registry`'s `validateInvocation`).
  *
- * The single invocation below exposes the Host's authoritative view of this row's
- * configuration to its own Client half. The Client half uses it in two ways:
+ * Three invocations, all on this bundle's own `reaAgents` namespace. Declaring any of
+ * them is also what makes the namespace service exist at all — and that service is the
+ * reactive dependency the Client half's `ctx.inject` gate waits on, which is what lets
+ * the row's settings entry survive a 停用→启用 cycle (deepseek-harness#8452: a client
+ * half's `apply` does not re-run).
  *
- *   1. as the read-only configuration source when `configForms` is unavailable
- *      (a composition without the settings UI), replacing a hard-coded default
- *      snapshot with the values the Host actually holds;
- *   2. as the reactive dependency its `ctx.inject` gate waits on, which is what
- *      lets the row's settings entry survive a 停用→启用 cycle
- *      (deepseek-harness#8452: a client half's `apply` does not re-run).
+ *   - `snapshot` — this row's configuration plus the status the page renders;
+ *   - `diagnose` — what is actually running, and why, assembled from the
+ *     launcher's own record rather than from anything declared;
+ *   - `checkUpdate` — what REA and this bundle have published lately;
+ *   - `setVersion` — pin the bridge to one release, or drop the pin.
+ *
+ * **Every one of these must also appear in `client.js`'s `TYPERT_REMOTE` mirror.**
+ * The Host manifest is what the loader validates; the mirror is what the browser
+ * resolves a call through. Declaring only one side throws inside the page's render,
+ * and React turns that into a blank settings page. `selftest.mjs` compares the two
+ * lists so the pair cannot drift apart unnoticed.
  *
  * @module @jedeiah/rea-dsh/typert
  */
@@ -28,26 +36,66 @@ function passthroughCodec() {
 /** Endpoint ids are spelled `<package>#<namespace>/<method>`, like the generated ones. */
 const PACKAGE = '@jedeiah/rea-dsh';
 
+/**
+ * Build one invocation entry.
+ * @param method - the method name on the `reaAgents` service.
+ * @param typeSymbol - the result type symbol, spelled like the generator's.
+ * @param parameters - parameter descriptors, in call order.
+ * @returns the manifest entry.
+ */
+function invocation(method, typeSymbol, parameters = []) {
+  return {
+    id: `${PACKAGE}#reaAgents/${method}`,
+    service: 'reaAgents',
+    namespace: 'reaAgents',
+    method,
+    invocation: { kind: 'direct' },
+    parameters,
+    cancellation: { parameter: 'signal' },
+    result: {
+      mode: 'strict',
+      typeSymbol,
+      create: passthroughCodec,
+    },
+  };
+}
+
+/**
+ * One parameter descriptor for a string argument.
+ *
+ * The field set mirrors the generator's output exactly — `name`, `wire`, `source`, and
+ * a nested `codec` — because the loader validates the shape and reports only the first
+ * missing field it finds.
+ * @param method - the method the parameter belongs to, for the type symbol.
+ * @param index - its position in the call.
+ * @param name - its name, as the Host method names it.
+ * @returns the parameter descriptor.
+ */
+function stringParameter(method, index, name) {
+  return {
+    name,
+    wire: name,
+    source: 'json',
+    codec: {
+      mode: 'strict',
+      typeSymbol: `${PACKAGE}#${method}:parameter:${String(index)}`,
+      create: passthroughCodec,
+    },
+  };
+}
+
 /** The Host manifest consumed by the Typert loader on the row that mounts this bundle. */
 export const TYPERT = {
   package: PACKAGE,
   face: 'host',
   schemas: [],
   invocations: [
-    {
-      id: `${PACKAGE}#reaAgents/introspect`,
-      service: 'reaAgents',
-      namespace: 'reaAgents',
-      method: 'introspect',
-      invocation: { kind: 'direct' },
-      parameters: [],
-      cancellation: { parameter: 'signal' },
-      result: {
-        mode: 'strict',
-        typeSymbol: `${PACKAGE}#ReaAgentsConfig`,
-        create: passthroughCodec,
-      },
-    },
+    invocation('snapshot', `${PACKAGE}#ReaAgentsSnapshot`),
+    invocation('diagnose', `${PACKAGE}#ReaAgentsDiagnosis`),
+    invocation('checkUpdate', `${PACKAGE}#ReaAgentsUpdateCheck`),
+    invocation('setVersion', `${PACKAGE}#ReaAgentsSetVersionResult`, [
+      stringParameter('ReaAgentsSetVersion', 0, 'spec'),
+    ]),
   ],
   model: {
     services: [],

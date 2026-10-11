@@ -78,6 +78,10 @@ open "/Applications/DeepSeek Harness.app"
 - **改了技能目录要显式调 `ctx.skills.invalidateCache()`。** provider 的失效路径只认**经 dsh 工具
   产生的文件变更**（`fs/observed` 里非工具变更直接 return）；插件自己用 `fs` 写的它看不见，
   于是已经收到过目录的会话永远拿不到新的。
+  补充（2026-10）：它**不在上游公开契约里** —— `dsh-skill` 的 README 只承诺 provider 自持的
+  `invalidate()`，`invalidateCache` 只出现在 `lib` 实现中。所以它是"必需但非契约"的调用：
+  保留，但做成可选链 + **缺失时告警**（否则 dsh 改名后静默失效，表现为"开关不生效"）。
+  `rea-dsh` 的 `invalidateCatalog()` 与 `selftest.mjs` Part E 就是这么守的。
   *已知边界*：浏览器 `/` 列表另有一套按 session 的缓存，只在切预设或重连时重建，所以那个列表不会实时刷新
   （[讨论 #9401](https://github.com/deepseek-ai/deepseek-harness/discussions/9401)）；模型端是实时的。
 - **`.volatile()` 字段是活句柄，不是值。** 直接读会拿到一个**永远为真**的句柄对象，要 `.get()` 解包；
@@ -98,6 +102,24 @@ open "/Applications/DeepSeek Harness.app"
   可以并存，Host 半随后按设置页的值纠正 —— 也才谈得上"把列表里的点击当成切换意图"（写行 +
   `ctx.settings.update(ns, {…})` 把设置页的值也改过去，`ns` 是 profile 条目 id）。
   本仓库 `chrome-devtools-mcp` 就是这么做的，README 里有那张"两行状态 → 含义 → 处理"的表。
+- **profile 的 `cordis.patch.yml` 必须是顶层数组；空文件与纯注释文件都过不了。**（2026-10 实测）
+  用 dsh 自己的 schema（`JSON_SCHEMA.extend(JsExpr)`）测：`""`→`undefined`、`"\n"`→`undefined`、
+  `"# 注释\n"`→`null`，而 `"[]\n"`→`[]`；`Include.read()` 对非数组直接抛
+  `config file must be a top-level array of entries`。所以**插件往这个文件写东西时，"没内容了"要写成 `[]`**，
+  不能留一个裸换行 —— 否则你交出去的是 dsh 拒绝加载的配置（当前会话不受影响，**下次启动组不出来**）。
+- **改别人的文件要守三条：整行锚定标记、拒绝就说拒绝、原子写并保留 mode。**（2026-10 code review 教训）
+  ① 标记用 `indexOf` 找子串的话，一段"提到"该标记的用户注释会被当成管理块的开始，下一次移除会**连带删掉用户自己的行**；
+  改成按整行匹配 + 块内必须含本插件的行 id，不满足就拒写。
+  ② "我认不出这个布局"和"内容已经一致"是两个答案，报成后者会让用户以为钉上了。
+  ③ `writeFileSync` 直接写会截断（崩在中间 → 下次启动失败）且把 0600 变成 0644。正解是**用 dsh 自己那套**：
+  `@deepseek-ai/dsh-atomic-write` 的 `withFileLock(join(profileDir,'package.json'), cb)` + `writeFileAtomic(path, text, {mode: 0o600})`
+  —— `dsh-config-editor` 写同一个文件时锁的就是这个路径，锁对了才不会互相覆盖；`withFileLock` **会返回** cb 的结果（`return await operation()`），
+  但读文件必须在**锁内**（先读后锁等于没锁）。裸导入这个包需要 `peerDependencies` 里声明。
+- **`config` 覆盖能触发那一行原地重载 —— 但需要 10~30 秒，且必须写全量 config。**（2026-10 实测）
+  在 profile 的 `cordis.patch.yml` 里按 id 写一行覆盖，`applyEntryPatches` 会把它盖到目标 entry 上；
+  对 `config` 是**整体赋值**（`target[key] = value`），不是深合并 —— 少写一个 `serverName` 就把那一行配坏。
+  实测：写入后桥约 10 秒重载（新 pid），撤销后约 31 秒重载；`rea-dsh` 的 `setVersion` 因此把等待窗口设为 45 秒，
+  并等启动器自己的记录来证明重载发生，而不是自己宣布成功。
 - **想让开关"即点即生效"，载体必须是 patch 的结构性字段。** dsh 的 HMR 按 `id` 比较条目、只重挂变化
   的那几行，所以改 `disabled` 是即时的（本机实测约 4 秒，双向）。两个反例，都实现过：
   - **两次 `plugin_manager.setPluginEnabled()` 有竞态**：第一次返回时被禁用的那行 **fiber 还没卸载**，
