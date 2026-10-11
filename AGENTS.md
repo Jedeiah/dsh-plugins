@@ -47,12 +47,30 @@ osascript -e 'if application "DeepSeek Harness" is running then tell application
 open "/Applications/DeepSeek Harness.app"
 ```
 
-## 细节在 `.agents/notes/`
+## 容易重踩的坑
 
-`AGENTS.md` 只放契约定；踩坑的**理由**与**复现**在 notes 里（沿用 dsh 自己的 `.agents/notes/` 约定）：
+下面每条都踩过，且**多数是静默失败** —— 不报错，只是功能不出现。
 
-- [bundle 的技能开关](.agents/notes/implemented/architecture/2026-10-11-bundle-skill-toggle.md) —— 开关怎么变成文件系统事件、为什么 `/` 列表不实时刷新
-- [bundle 写作要点](.agents/notes/implemented/architecture/2026-10-11-bundle-authoring.md) —— `ctx.baseUrl` 指向哪、schemastery 读默认值、安装 spec 的形态
-- [给 bundle 写离线自测](.agents/notes/implemented/process/2026-10-11-bundle-selftest.md) —— 绕过裸导入、可注入的纯函数
+- **`ctx.baseUrl` 指向 profile 目录，不是 bundle 目录。** 在 `!!js` 里推导自身路径必须用
+  `createRequire(String(ctx.baseUrl ?? '')).resolve('<包名>/package.json')` 再取 `dirname`。
+  直接往它上面拼 `skills/` 会指向一个不存在的空目录，**技能静默消失、无任何报错**。
+- **被监视的目录必须在启动时就存在。** `dsh-skill-filesystem` 的 watcher 只监视它**第一次看到**的根；
+  后来才创建的目录永远不被监听。所以 `skills-live/` 即使为空也要在启动时 `mkdirSync`。
+- **改了技能目录要显式调 `ctx.skills.invalidateCache()`。** provider 的失效路径只认**经 dsh 工具
+  产生的文件变更**（`fs/observed` 里非工具变更直接 return）；插件自己用 `fs` 写的它看不见，
+  于是已经收到过目录的会话永远拿不到新的。
+  *已知边界*：浏览器 `/` 列表另有一套按 session 的缓存，只在切预设或重连时重建，所以那个列表不会实时刷新
+  （[讨论 #9401](https://github.com/deepseek-ai/deepseek-harness/discussions/9401)）；模型端是实时的。
+- **`.volatile()` 字段是活句柄，不是值。** 直接读会拿到一个**永远为真**的句柄对象，要 `.get()` 解包；
+  用 schema 校验 `{}` 时 volatile 字段同样给出句柄而不是默认值。读取失败**不要静默回退**，要报出来。
+- **从 schema 自取默认值：`dict` 挂在 `refs[uid]` 节点上，顶层没有。**
+  `schema.toJSON()` 里 `refs[json.uid].dict` 给「字段名 → uid」，再由 `refs[uid].meta.default` 取值。
+  这种函数**一定要带空结果告警** —— 否则形状一变就静默丢光全部默认值。
+- **`selftest.mjs` 要绕过裸导入。** bundle 顶部有 `import('@deepseek-ai/…')`，而 clone 没有自己的
+  `node_modules`（profile 是 `link:` 过来的）。用 `module.register` 把 `@deepseek-ai/*` 锚到 `--app`
+  目录（默认 `/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai`），
+  不在磁盘上留任何东西。让纯函数接受可注入的目录参数，测试才不碰 bundle 自己的目录。
+- **停用再启用带客户端半边的插件，`apply` 不保证重跑**（[deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)）。
+  配置页要注册在 `ctx.inject(['remote.<本插件自己的服务>', …], cb)` 依赖门里，靠 Host 半边重建把页面重新挂上。
 
-本机特定的事项在 `AGENTS.local.md`（不入 git）。
+本机特定的事项（node 从哪来、dsh 路径、重启命令等）在 `AGENTS.local.md`（不入 git）。
