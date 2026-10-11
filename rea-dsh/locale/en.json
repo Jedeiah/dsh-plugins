@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Reverse Engineering",
-    "description": "Wires REA's MCP server in so the model can reverse engineer binaries, applications and web targets; its bundled skill toggles on the component row."
+    "description": "Wires REA's MCP server in so the model can reverse engineer binaries, applications and web targets; use the row's arrow to set whether its bundled skill is offered."
   }
 }

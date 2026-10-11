@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Chime",
-    "description": "Rings when the agent needs your attention; use the row's arrow to tune the chime."
+    "description": "Rings when the agent needs your attention; use the row's arrow to set the chime, waveform, volume and repeat count."
   }
 }

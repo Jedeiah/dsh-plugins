@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Delete Session",
-    "description": "Adds \"Delete session\" to the session list, removing a session from disk; use the row's arrow to choose what gets cleared."
+    "description": "Adds \"Delete session\" to the session list, removing a session from disk; use the row's arrow to set what gets cleared."
   }
 }
