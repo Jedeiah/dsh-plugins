@@ -124,23 +124,28 @@ const SKILLS_LIVE_DIR = join(PACKAGE_DIR, 'skills-live');
  * and always reflects the shipped copy. Existing entries are cleared first, so a
  * skill removed upstream also disappears here.
  * @param enabled - whether the skills should be exposed.
+ * @returns the names of skills that could not be exposed.
  */
 function syncLiveSkills(enabled) {
   rmSync(SKILLS_LIVE_DIR, { recursive: true, force: true });
   mkdirSync(SKILLS_LIVE_DIR, { recursive: true });
-  if (!enabled) return;
-  if (!existsSync(SKILLS_SOURCE_DIR)) return;
+  if (!enabled) return [];
+  if (!existsSync(SKILLS_SOURCE_DIR)) return [];
+  const failed = [];
   for (const entry of readdirSync(SKILLS_SOURCE_DIR, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const from = join(SKILLS_SOURCE_DIR, entry.name);
     const to = join(SKILLS_LIVE_DIR, entry.name);
     try {
+      // 'junction' is what Windows needs to link a directory without elevation.
+      // POSIX ignores the type, so this one call covers both platforms.
       symlinkSync(from, to, 'junction');
     } catch {
       // Filesystems without symlink support fall back to a copy.
-      try { cpSync(from, to, { recursive: true }); } catch { /* 单个技能失败不影响其它 */ }
+      try { cpSync(from, to, { recursive: true }); } catch { failed.push(entry.name); }
     }
   }
+  return failed;
 }
 
 /**
@@ -162,8 +167,33 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
     this.ctx = ctx;
     this.config = config ?? {};
     this.applied = undefined;
-    this.sync();
+    // The first sync touches the filesystem (it creates or clears `skills-live/`).
+    // A failure there must not take the row down: this row also carries the MCP
+    // bridge, which has nothing to do with the skills toggle, and a load failure
+    // would read to the user as "the plugin is broken". Failures degrade to
+    // "toggle not applied yet" and the poll retries.
+    try {
+      this.sync();
+    } catch (error) {
+      this.warn('initial skills sync', error);
+    }
     this.startWatch(ctx);
+  }
+
+  /**
+   * Report a non-fatal failure.
+   *
+   * These paths are all "the optional skills toggle did not work", never "the row
+   * is broken", so they are logged rather than thrown: a silent failure here would
+   * leave someone flipping a switch that never does anything.
+   * @param what - the operation that failed.
+   * @param error - the thrown value.
+   */
+  warn(what, error) {
+    const detail = error === undefined ? '' : `: ${error?.message ?? error}`;
+    try {
+      this.ctx?.logger?.warn?.(`chrome-devtools-mcp: ${what} failed${detail}`);
+    } catch { /* a logger that throws must not become the failure */ }
   }
 
   /**
@@ -175,7 +205,8 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
   sync() {
     const enabled = readConfigValue(this.config.skills, CONFIG_DEFAULTS.skills) === true;
     if (enabled === this.applied) return;
-    syncLiveSkills(enabled);
+    const failed = syncLiveSkills(enabled);
+    if (failed.length > 0) this.warn(`linking ${failed.join(', ')}`);
     this.applied = enabled;
     // Tell the skill registry its cached catalog is stale, so the agent sees the
     // new catalog on its next step. The provider's own file watcher does not
@@ -186,7 +217,8 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
     // cache (dsh-client-ui-skill) and only rebuilds it on `agent-preset/selected`
     // or `connection/reset`. A toggle therefore reaches the model immediately but
     // not that menu until the chat is reopened. See README.
-    try { this.ctx?.get?.('skills')?.invalidateCache?.(); } catch { /* 无 skills 服务时跳过 */ }
+    try { this.ctx?.get?.('skills')?.invalidateCache?.(); }
+    catch (error) { this.warn('skills cache invalidation', error); }
   }
 
   /**
@@ -199,10 +231,16 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
    */
   startWatch(ctx) {
     const timer = setInterval(() => {
-      try { this.sync(); } catch { /* 同步失败下次再试 */ }
+      try { this.sync(); } catch (error) { this.warn('skills sync', error); }
     }, 1000);
     if (typeof timer.unref === 'function') timer.unref();
-    try { ctx.effect(() => () => clearInterval(timer)); } catch { /* 无 effect 时靠 unref */ }
+    try {
+      ctx.effect(() => () => clearInterval(timer), 'chrome-devtools-mcp: skills toggle poll');
+    } catch (error) {
+      // No effect channel: `unref` above still keeps the timer from holding the
+      // process open, but it will outlive this row. Report rather than hide it.
+      this.warn('timer cleanup registration', error);
+    }
   }
 
   /**

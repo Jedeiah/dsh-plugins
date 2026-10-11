@@ -83,6 +83,7 @@ window.__ModuleLoader__.load({
       saving: '正在保存…',
       unavailable: '设置暂不可用',
       readOnly: '当前组合下不可修改（缺少设置界面时只读）。',
+      saveFailed: '设置没能保存：本部署没有接受这个改动。',
     };
 
     const en = {
@@ -93,6 +94,7 @@ window.__ModuleLoader__.load({
       saving: 'Saving…',
       unavailable: 'Settings unavailable',
       readOnly: 'Not editable in this composition (read-only without a settings surface).',
+      saveFailed: 'The change was not saved: this deployment did not accept it.',
     };
 
     /**
@@ -125,6 +127,10 @@ window.__ModuleLoader__.load({
      */
     function ChromeDevtoolsRowConfig(props) {
       const { t, view, form } = props;
+      // Hooks run before every early return: the owner renders this component in
+      // both its summary and its page shape, so the hook order must not differ
+      // between renders.
+      const [saveFailed, setSaveFailed] = React.useState(false);
       if (view === 'summary') return t('summary');
       if (form?.state === undefined) return null;
       if (form.state.status === 'loading') return h('div', { role: 'status' }, t('saving'));
@@ -135,11 +141,18 @@ window.__ModuleLoader__.load({
       const write = (next) => {
         // The revision is deliberately left to the form: one read at render time
         // goes stale the moment the write lands.
-        void form.mutate([{ op: 'set', path: ['skills'], value: next }]);
+        //
+        // The mutation resolves with whether the form accepted the change, and a
+        // rejection is the same outcome from the reader's side. Either way the
+        // switch must not silently spring back with no explanation.
+        Promise.resolve(form.mutate([{ op: 'set', path: ['skills'], value: next }]))
+          .then((accepted) => setSaveFailed(accepted === false))
+          .catch(() => setSaveFailed(true));
       };
 
       return h('div', { key: 'page', style: LAYOUT.page }, [
         locked ? h('div', { key: 'readonly', style: STYLE.notice }, t('readOnly')) : null,
+        saveFailed ? h('div', { key: 'failed', role: 'alert', style: STYLE.error }, t('saveFailed')) : null,
         h('p', { key: 'intro', style: { margin: 0, ...LAYOUT.hint, fontSize: 13 } }, t('pageIntro')),
         switchRow(
           'skills',
