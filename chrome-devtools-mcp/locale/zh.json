@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "浏览器调试",
-    "description": "接入 chrome-devtools-mcp，让模型能调试真实浏览器。"
+    "description": "接入 chrome-devtools-mcp，让模型能调试真实浏览器；自带的 7 个调试技能可在组件行里开关。"
   }
 }

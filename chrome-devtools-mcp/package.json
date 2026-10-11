@@ -1,24 +1,51 @@
 {
   "name": "@jedeiah/chrome-devtools-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
-  "description": "浏览器调试（Browser Debugging）：把 chrome-devtools-mcp 服务器（stdio 桥接）接进本 dsh profile，让模型能调试真实浏览器；原先手写在 profile patch 里的那几行现在由本组合包管理。",
+  "description": "浏览器调试（Browser Debugging）：把 chrome-devtools-mcp 服务器（stdio 桥接）接进本 dsh profile，让模型能调试真实浏览器；随包附带它的 7 个调试技能，可在 Plugins 页面开关。",
   "icon": "./icon.svg",
   "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./typert": "./typert.js",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json"
   },
   "files": [
+    "index.js",
+    "client.js",
+    "typert.js",
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",
     "skills/**"
   ],
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-gateway",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
     }
   }
 }

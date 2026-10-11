@@ -1,22 +1,29 @@
 # Chrome DevTools MCP — provided by the local bundle @jedeiah/chrome-devtools-mcp.
 #
-# 第一条 insert：把服务器从手写配置收进本组合包，于是它能从 Plugins 页面管理
-# （停用即摘掉，卸载即回退）。它插入 dsh 自带的 `@deepseek-ai/dsh-mcp-client` 桥，
-# 由 npx 经 stdio 拉起 chrome-devtools-mcp，工具注册为 `mcp__chrome-devtools__<tool>`。
+# 三条 insert：
+#
+#   ① chrome-devtools-mcp   本包（Host 半 + Client 半）。Host 半持有 `skills` 开关
+#                           并把它变成文件系统事件；Client 半在 Plugins 页面提供设置页。
+#                           行名必须是本包名 —— 浏览器模块表按行名取包，写官方桥名的话
+#                           本包的 Client 半边永远不会被加载。
+#
+#   ② chrome-devtools-bridge 官方 `@deepseek-ai/dsh-mcp-client` 桥，由 npx 经 stdio
+#                           拉起 chrome-devtools-mcp，工具注册为 `mcp__chrome-devtools__<tool>`。
+#                           单独一行，这样它不受技能开关影响。
+#
+#   ③ chrome-devtools-skills 技能提供方，扫本包的 `skills-live/`。
+#                           那个目录由 Host 半按开关维护：开则把 `skills/` 下每个技能软链进去，
+#                           关则清空。官方 provider 的文件监视器（默认跟随软链）会自己感知，
+#                           于是技能在会话目录里实时出现或消失 —— 不用重挂、不用重启。
 #
 # `chrome-devtools-mcp` 由宿主 PATH 上的 `npx` 解析并缓存到 ~/.npm/_npx，
 # 因此首次运行需要宿主有 node/npm 与 registry 访问。
-#
-# 第二条 insert：注册 skill 提供方。chrome-devtools-mcp 自带 7 个技能
-# （a11y-debugging、chrome-devtools、chrome-devtools-cli、cookie-debugging、
-# debug-optimize-lcp、memory-leak-debugging、troubleshooting），原先只存在于
-# npx 缓存里 —— 那不在 dsh 的任何 skill 扫描根之下，所以从未生效。副本随本包分发，
-# 路径用 createRequire 从 profile 锚点解析：ctx.baseUrl 指向的是 profile 目录，
-# 而不是提供本 patch 的 bundle 目录，不能直接往上拼 `skills/`。
-# 手法与 @jedeiah/rea-mcp 一致。
 
 - insert:
     - id: chrome-devtools-mcp
+      name: '@jedeiah/chrome-devtools-mcp'
+
+    - id: chrome-devtools-bridge
       name: '@deepseek-ai/dsh-mcp-client'
       config:
         serverName: chrome-devtools
@@ -29,7 +36,7 @@
           - '--no-usage-statistics'
           - '--no-performance-crux'
 
-    - id: chrome-devtools-skills-filesystem
+    - id: chrome-devtools-skills
       name: '@deepseek-ai/dsh-skill-filesystem'
       config:
         providerName: chrome-devtools-skills
@@ -37,9 +44,7 @@
         customSkillDirs:
           - !!js |-
             (() => {
-              const fs = process.getBuiltinModule('node:fs');
               const path = process.getBuiltinModule('node:path');
-              const os = process.getBuiltinModule('node:os');
               const { createRequire } = process.getBuiltinModule('node:module');
 
               // ctx.baseUrl 指向 profile 目录，而不是提供本 patch 的 bundle 目录。
@@ -47,21 +52,5 @@
               const pkgDir = path.dirname(
                 createRequire(String(ctx.baseUrl ?? '')).resolve('@jedeiah/chrome-devtools-mcp/package.json'),
               );
-              const dest = path.join(pkgDir, 'skills');
-
-              // 机会性刷新：npx 缓存里若有 chrome-devtools-mcp 的 skills，覆盖副本（best effort）。
-              try {
-                const npxRoot = path.join(os.homedir(), '.npm', '_npx');
-                for (const entry of fs.readdirSync(npxRoot)) {
-                  const src = path.join(npxRoot, entry, 'node_modules', 'chrome-devtools-mcp', 'skills');
-                  if (fs.existsSync(src)) {
-                    fs.cpSync(src, dest, { recursive: true, force: true });
-                    break;
-                  }
-                }
-              } catch {
-                // 缓存不存在属正常：副本本身就是基线。
-              }
-
-              return dest;
+              return path.join(pkgDir, 'skills-live');
             })()
