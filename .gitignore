@@ -2,3 +2,5 @@
 node_modules/
 *.log
 .idea/
+chrome-devtools-mcp/skills-live/
+rea-dsh/skills-live/
