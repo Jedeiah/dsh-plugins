@@ -2,5 +2,6 @@
 node_modules/
 *.log
 .idea/
+AGENTS.local.md
 chrome-devtools-mcp/skills-live/
 rea-dsh/skills-live/
