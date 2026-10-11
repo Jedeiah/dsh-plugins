@@ -12,7 +12,8 @@ Harness profile。
 | 文件 | 作用 |
 |---|---|
 | `package.json` | 组合包清单；`dsh.bundle.patch` 指向下面的 patch |
-| `cordis.patch.yml` | 插入一行 `dsh-mcp-client`（`serverName: chrome-devtools`） |
+| `cordis.patch.yml` | 两行：插入 `dsh-mcp-client`（`serverName: chrome-devtools`）+ 注册技能提供方 |
+| `skills/` | 随包分发的 7 个技能副本（见下） |
 | `locale/{en,zh}.json` | Plugins 卡片上的标题与描述 |
 | `icon.svg` | 卡片图标 |
 
@@ -35,6 +36,37 @@ args: ['-y', 'chrome-devtools-mcp@latest', '--autoConnect', '--no-usage-statisti
 
 `npx` 从宿主 `PATH` 解析，所以需要装好 node/npm，且首次运行要能访问 npm 源。包会缓存
 在 `~/.npm/_npx/`，之后启动直接复用。工具对模型呈现为 `mcp__chrome-devtools__<tool>`。
+
+## 随包的技能
+
+`chrome-devtools-mcp` 自带 7 个技能，本包把它们**随包分发**（`skills/`）：
+
+| 技能 | 用途 |
+|---|---|
+| `chrome-devtools` | 总览：怎么用这套工具 |
+| `chrome-devtools-cli` | CLI 形态的用法与安装 |
+| `a11y-debugging` | 无障碍（a11y）问题调试 |
+| `cookie-debugging` | Cookie 相关问题排查 |
+| `debug-optimize-lcp` | LCP 性能诊断与优化 |
+| `memory-leak-debugging` | 内存泄漏定位 |
+| `troubleshooting` | 连接与常见故障排查 |
+
+**为什么必须随包带**：这些技能原本只存在于 `~/.npm/_npx/…/chrome-devtools-mcp/skills/`。
+而 `dsh-skill-filesystem` 只扫这几个根 —— `<项目>/.agents/skills`、`$DSH_HOME/skills`、
+`~/.agents/skills`、`customSkillDirs`、`bundledSkillDir` —— **npx 缓存不在其中**，
+所以它们此前**从未生效**（在 `/` 列表里看不到）。
+
+patch 的第二条 insert 注册一个**只扫本包 `skills/`** 的提供方，`includeDefaultRoots: false`，
+**不读写 `~/.agents/skills`**：
+
+> ⚠️ **注意**：`ctx.baseUrl` 指向的是 **profile 目录**（`~/.dsh/profiles/<name>/`），
+> **不是**提供 patch 的 bundle 目录。所以不能直接往它上面拼 `skills/` —— 那样会指向一个
+> 不存在的空目录，技能**静默消失**（无任何报错）。这里用
+> `createRequire(ctx.baseUrl).resolve('<包名>/package.json')` 从 profile 锚点解析出本包
+> 真实安装位置，与 dsh 自己的 preset patch 是同一手法。
+
+副本之外还做**机会性刷新**：若 `~/.npm/_npx` 下当时恰好存在 `chrome-devtools-mcp/skills`，
+就覆盖副本，让技能尽量跟上包版本；缓存不存在时副本本身就是基线。
 
 ## 安装 / 卸载
 
