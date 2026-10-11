@@ -1,0 +1,62 @@
+# REA MCP — 由本地组合包 @jedeiah/rea-mcp 提供。
+#
+# 本行原先需要手写在 profile 的 `cordis.patch.yml` 里；现在收进这个组合包，
+# 于是它能像其它插件一样从 Plugins 页面管理（停用即摘掉，卸载即回退）。
+#
+# 两条 insert：
+#   ① rea-mcp                插入 dsh 自带的 mcp-client 桥，由 npx 拉起 REA，
+#                            工具注册为 `mcp__rea__<tool>`
+#   ② rea-skills-filesystem  往 global 层注册一个只扫本包技能副本的 skill 提供方
+#
+# 技能路径由 ctx.baseUrl 推导（= 本文件所在目录），不硬编码任何机器路径。
+# 附带机会性刷新：~/.npm/_npx 下若已存在 rea-agents 的 skills，就覆盖副本，
+# 让技能尽量跟上 REA 版本；缓存不在是常态（npx 用完即弃），此时副本照常可用。
+
+- insert:
+    - id: rea-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: rea
+        transport: stdio
+        command: npx
+        args:
+          - '-y'
+          - 'rea-agents@latest'
+          - 'mcp'
+
+    - id: rea-skills-filesystem
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: rea-skills
+        includeDefaultRoots: false
+        customSkillDirs:
+          - !!js |-
+            (() => {
+              const fs = process.getBuiltinModule('node:fs');
+              const path = process.getBuiltinModule('node:path');
+              const os = process.getBuiltinModule('node:os');
+              const { createRequire } = process.getBuiltinModule('node:module');
+
+              // ctx.baseUrl 指向 profile 目录，而不是提供本 patch 的 bundle 目录。
+              // 因此从这个锚点解析本包的真实安装位置（与 dsh-web-app 的 preset patch 同一手法）。
+              const pkgDir = path.dirname(
+                createRequire(String(ctx.baseUrl ?? '')).resolve('@jedeiah/rea-mcp/package.json'),
+              );
+              const dest = path.join(pkgDir, 'skills');
+
+              // 机会性刷新：npx 缓存里若有 rea-agents 的 skills，覆盖副本（best effort）。
+              try {
+                const npxRoot = path.join(os.homedir(), '.npm', '_npx');
+                for (const entry of fs.readdirSync(npxRoot)) {
+                  const src = path.join(npxRoot, entry, 'node_modules', 'rea-agents', 'skills');
+                  if (fs.existsSync(src)) {
+                    fs.cpSync(src, dest, { recursive: true, force: true });
+                    break;
+                  }
+                }
+              } catch {
+                // 缓存不存在属正常：副本本身就是基线。
+              }
+
+              return dest;
+            })()

@@ -1,0 +1,24 @@
+{
+  "name": "@jedeiah/rea-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "逆向工程（Reverse Engineering）：把 REA 的 MCP 服务器（stdio 桥接）接进本 dsh profile，让模型能逆向分析二进制、Electron 应用、APK、固件与网页；随包附带 REA 的完整技能副本，并往 global 层注册一个只扫该副本的技能提供方。",
+  "icon": "./icon.svg",
+  "exports": {
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "skills/**"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

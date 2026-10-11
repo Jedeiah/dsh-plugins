@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Reverse Engineering",
+    "description": "Wires REA's MCP server in so the model can reverse engineer binaries, applications and web targets."
+  }
+}

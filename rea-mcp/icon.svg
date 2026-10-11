@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="Reverse Engineering">
+  <rect x="4" y="7" width="40" height="34" rx="6" fill="none" stroke="#3FB950" stroke-width="3"/>
+  <line x1="4" y1="17" x2="44" y2="17" stroke="#3FB950" stroke-width="3"/>
+  <circle cx="11" cy="12" r="1.8" fill="#3FB950"/>
+  <circle cx="17" cy="12" r="1.8" fill="#3FB950"/>
+  <circle cx="23" cy="12" r="1.8" fill="#3FB950"/>
+  <path d="M16 25 L11 30.5 L16 36" fill="none" stroke="#3FB950" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M32 25 L37 30.5 L32 36" fill="none" stroke="#3FB950" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M27.5 23.5 L20.5 37.5" fill="none" stroke="#3FB950" stroke-width="2.4" stroke-linecap="round"/>
+</svg>
