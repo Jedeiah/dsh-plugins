@@ -1,5 +1,5 @@
 import z from '@deepseek-ai/schemastery';
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -24,11 +24,20 @@ const REMOTE_METHOD_DESCRIPTOR = '@deepseek-ai/dsh-typert-protocol/remote-method
 /**
  * Host half of the chrome-devtools-mcp bundle.
  *
- * It owns one tunable — whether chrome-devtools-mcp's seven bundled skills are
- * exposed to the agent — so it can be set in `cordis.patch.yml` or on the
- * bundle's page, instead of being edited here. Only `.volatile()` fields are
- * projected to the browser; the settings service turns them into the form the
- * Client half reads through `ctx.configForms`.
+ * It owns two tunables — whether chrome-devtools-mcp's bundled skills are exposed
+ * to the agent, and which browser the MCP server talks to — so both can be set in
+ * `cordis.patch.yml` or on the bundle's page, instead of being edited here. Only
+ * `.volatile()` fields are projected to the browser; the settings service turns
+ * them into the form the Client half reads through `ctx.configForms`.
+ *
+ * The `browser` tunable reaches the MCP bridge by rewriting this profile's
+ * `cordis.patch.yml`: the bundle ships two mutually exclusive rows
+ * (`chrome-devtools-launch` / `chrome-devtools-attach`) and exactly one of them is
+ * disabled. That file is watched by dsh's HMR, so the switch takes effect without
+ * a restart when HMR is on (the code warns when it is not). The alternative — a
+ * single row whose `args` a `!!js` expression derives from a file in this bundle —
+ * was rejected because a file inside the bundle is not watched, so nothing would
+ * notice the change.
  *
  * It also publishes the `chromeDevtoolsMcp` Remote service (see
  * {@link ChromeDevtoolsMcpRuntime}), which is what makes this bundle survive a
@@ -51,6 +60,21 @@ export const Config = z.object({
    * an extra the repo publishes for agents that have a skill mechanism.
    */
   skills: z.boolean().default(false).volatile(),
+  /**
+   * Which browser the MCP server drives.
+   *
+   * - `launch` — the server starts its own Chrome, using
+   *   `~/.cache/chrome-devtools-mcp/chrome-profile`. Nothing to set up; but it is a
+   *   separate browser, so it has none of your tabs, cookies or logins.
+   * - `attach` — the server drives the Chrome you are already using, so the agent
+   *   sees your real session. Needs Chrome 144+ with Remote Debugging enabled at
+   *   `chrome://inspect/#remote-debugging`, and Chrome asks for confirmation once
+   *   per connection.
+   *
+   * Switching rewrites this profile's `cordis.patch.yml` to disable one of the two
+   * mutually exclusive bridge rows; see the module doc above for why.
+   */
+  browser: z.union(['launch', 'attach']).default('launch').volatile(),
 });
 
 /**
@@ -192,6 +216,82 @@ function syncLiveSkills(enabled, { liveDir = SKILLS_LIVE_DIR, sourceDir = SKILLS
 }
 
 /**
+ * Absolute path of this profile's patch file.
+ *
+ * `ctx.baseUrl` is the *profile* directory, not the bundle directory — the same
+ * trap the patch's `!!js` works around. Here it is exactly the right anchor: the
+ * only file that can disable a bridge row is the profile's own `cordis.patch.yml`.
+ * @param ctx - owning Cordis context.
+ * @returns the patch path, or undefined when the profile location is unavailable.
+ */
+function profilePatchPath(ctx) {
+  const base = String(ctx?.baseUrl ?? '');
+  if (base === '') return undefined;
+  try {
+    return join(fileURLToPath(base), 'cordis.patch.yml');
+  } catch {
+    return undefined;
+  }
+}
+
+/** Delimiters of the block this bundle owns inside the profile patch. */
+const BROWSER_BLOCK_BEGIN = '# @jedeiah/chrome-devtools-mcp: browser mode (managed) — begin';
+const BROWSER_BLOCK_END = '# @jedeiah/chrome-devtools-mcp: browser mode (managed) — end';
+
+/** The two mutually exclusive bridge rows this bundle ships. */
+const LAUNCH_ROW = 'chrome-devtools-launch';
+const ATTACH_ROW = 'chrome-devtools-attach';
+
+/**
+ * Force exactly one of the two mutually exclusive bridge rows to be enabled.
+ *
+ * Both rows are written in one pass, so there is never a moment where both are
+ * live — they share a `serverName`, and two at once is exactly what makes
+ * `mcp-client` throw "serverName is already in use".
+ *
+ * Rewrites one delimited block instead of parsing and re-serializing the file: a
+ * YAML round-trip would drop the user's comments and formatting, and this file is
+ * theirs. The block is replaced in place when the markers are present, appended
+ * otherwise.
+ *
+ * `disabled` is a plain field, not an expression — that is what makes the switch
+ * apply without a restart. dsh's HMR watches this file, and the loader compares
+ * entries by `id`, re-mounting only the rows that changed.
+ *
+ * Compare-before-write, so the 1s poll cannot keep rewriting the file and keep
+ * re-mounting the rows.
+ * @param patchPath - absolute path of the profile patch file.
+ * @param mode - `launch` (this bundle's own Chrome) or `attach` (the user's).
+ * @returns whether the file content actually changed.
+ */
+function writeBrowserMode(patchPath, mode) {
+  const block = [
+    BROWSER_BLOCK_BEGIN,
+    `- id: ${LAUNCH_ROW}`,
+    `  disabled: ${mode === 'launch' ? 'false' : 'true'}`,
+    `- id: ${ATTACH_ROW}`,
+    `  disabled: ${mode === 'attach' ? 'false' : 'true'}`,
+    BROWSER_BLOCK_END,
+  ].join('\n');
+  const previous = readFileSync(patchPath, 'utf8');
+  const start = previous.indexOf(BROWSER_BLOCK_BEGIN);
+  let next;
+  if (start === -1) {
+    next = `${previous.replace(/\s*$/, '')}\n\n${block}\n`;
+  } else {
+    // `tail` keeps whatever followed the block, leading newline included, so an
+    // unchanged mode round-trips to byte-identical text and the caller can tell
+    // "wrote something" from "nothing to do".
+    const end = previous.indexOf(BROWSER_BLOCK_END, start);
+    const tail = end === -1 ? '' : previous.slice(end + BROWSER_BLOCK_END.length);
+    next = `${previous.slice(0, start)}${block}${tail}`;
+  }
+  if (next === previous) return false;
+  writeFileSync(patchPath, next);
+  return true;
+}
+
+/**
  * The Remote service: the Host's authoritative view of this row's configuration.
  *
  * The Client half reads it when `configForms` is unavailable — a composition
@@ -209,16 +309,22 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
     super(ctx, 'chromeDevtoolsMcp');
     this.ctx = ctx;
     this.config = config ?? {};
-    this.applied = undefined;
-    // The first sync touches the filesystem (it creates or clears `skills-live/`).
-    // A failure there must not take the row down: this row also carries the MCP
-    // bridge, which has nothing to do with the skills toggle, and a load failure
-    // would read to the user as "the plugin is broken". Failures degrade to
-    // "toggle not applied yet" and the poll retries.
+    this.appliedSkills = undefined;
+    this.appliedBrowser = undefined;
+    // The first syncs touch the filesystem (they create or clear `skills-live/`)
+    // and this profile's patch file. Neither may take the row down: this row also
+    // carries the MCP bridge, which has nothing to do with either tunable, and a
+    // load failure would read to the user as "the plugin is broken". Failures
+    // degrade to "not applied yet" and the poll retries.
     try {
-      this.sync();
+      this.syncSkills();
     } catch (error) {
       this.warn('initial skills sync', error);
+    }
+    try {
+      this.syncBrowser();
+    } catch (error) {
+      this.warn('initial browser sync', error);
     }
     this.startWatch(ctx);
   }
@@ -240,21 +346,32 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
   }
 
   /**
-   * Bring the live skill directory in line with the configured toggle.
+   * Report an informational event — something that worked, but that the operator
+   * should know about, such as "written, but a restart is needed to apply it".
+   * @param message - what happened.
+   */
+  notify(message) {
+    try {
+      this.ctx?.logger?.info?.(`chrome-devtools-mcp: ${message}`);
+    } catch { /* a logger that throws must not become the failure */ }
+  }
+
+  /**
+   * Bring the live skill directory in line with the `skills` tunable.
    *
    * Idempotent: repeating the current state is a no-op, so the watcher can call
    * this cheaply.
    */
-  sync() {
+  syncSkills() {
     const enabled = readConfigValue(
       this.config.skills,
       CONFIG_DEFAULTS.skills,
       (error) => this.warn('reading the skills toggle', error),
     ) === true;
-    if (enabled === this.applied) return;
+    if (enabled === this.appliedSkills) return;
     const failed = syncLiveSkills(enabled);
     if (failed.length > 0) this.warn(`linking ${failed.join(', ')}`);
-    this.applied = enabled;
+    this.appliedSkills = enabled;
     // Tell the skill registry its cached catalog is stale, so the agent sees the
     // new catalog on its next step. The provider's own file watcher does not
     // cover this: it only reacts to host mutations made through dsh tools, and it
@@ -269,6 +386,46 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
   }
 
   /**
+   * Bring this profile's patch file in line with the `browser` tunable.
+   *
+   * The two bridge rows share a `serverName`, so exactly one may be enabled; this
+   * writes the override that disables the other. Idempotent and compare-before-
+   * write: a steady state costs one config read and never touches the file, so
+   * dsh's HMR is not re-triggered on every poll.
+   */
+  syncBrowser() {
+    const mode = readConfigValue(
+      this.config.browser,
+      CONFIG_DEFAULTS.browser,
+      (error) => this.warn('reading the browser tunable', error),
+    ) === 'attach' ? 'attach' : 'launch';
+    if (mode === this.appliedBrowser) return;
+    const patchPath = profilePatchPath(this.ctx);
+    if (patchPath === undefined) {
+      this.warn('locating the profile patch file');
+      return;
+    }
+    let changed;
+    try {
+      changed = writeBrowserMode(patchPath, mode);
+    } catch (error) {
+      this.warn(`writing the browser mode to ${patchPath}`, error);
+      return;
+    }
+    this.appliedBrowser = mode;
+    // dsh's HMR watches this file, and the loader compares entries by `id`, so the
+    // row this disables and the row it enables are re-mounted on their own — no
+    // restart, no `plugin_manager` call, no other row touched.
+    //
+    // It must *not* be two `setPluginEnabled` calls: the first returns before the
+    // row it disabled has unloaded, so the second trips `mcp-client`'s "serverName
+    // is already in use". Writing both rows in one pass has no such window.
+    if (changed && this.ctx?.get?.('hmr') === undefined) {
+      this.notify(`switched to "${mode}" — restart dsh to apply (HMR is not running)`);
+    }
+  }
+
+  /**
    * Poll the volatile toggle.
    *
    * The settings service rewrites a volatile field's value in place but emits no
@@ -278,7 +435,8 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
    */
   startWatch(ctx) {
     const timer = setInterval(() => {
-      try { this.sync(); } catch (error) { this.warn('skills sync', error); }
+      try { this.syncSkills(); } catch (error) { this.warn('skills sync', error); }
+      try { this.syncBrowser(); } catch (error) { this.warn('browser sync', error); }
     }, 1000);
     if (typeof timer.unref === 'function') timer.unref();
     try {
@@ -300,7 +458,8 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
    * @returns this row's live configuration with schema defaults applied.
    */
   introspect() {
-    this.sync();
+    this.syncSkills();
+    this.syncBrowser();
     return snapshotConfig(this.config, (error) => this.warn('reading the configuration', error));
   }
 }
@@ -344,4 +503,4 @@ export function apply(ctx, config) {
   new ChromeDevtoolsMcpRuntime(ctx, config);
 }
 
-export { CONFIG_DEFAULTS, ChromeDevtoolsMcpRuntime, SKILLS_LIVE_DIR, SKILLS_SOURCE_DIR, syncLiveSkills };
+export { CONFIG_DEFAULTS, ChromeDevtoolsMcpRuntime, SKILLS_LIVE_DIR, SKILLS_SOURCE_DIR, syncLiveSkills, writeBrowserMode };

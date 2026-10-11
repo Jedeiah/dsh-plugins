@@ -1,20 +1,39 @@
 # Chrome DevTools MCP — provided by the local bundle @jedeiah/chrome-devtools-mcp.
 #
-# 三条 insert：
+# 四条 insert：
 #
-#   ① chrome-devtools-mcp   本包（Host 半 + Client 半）。Host 半持有 `skills` 开关
-#                           并把它变成文件系统事件；Client 半在 Plugins 页面提供设置页。
-#                           行名必须是本包名 —— 浏览器模块表按行名取包，写官方桥名的话
-#                           本包的 Client 半边永远不会被加载。
+#   ① chrome-devtools-mcp      本包（Host 半 + Client 半）。Host 半持有 `skills` 与 `browser`
+#                              两个开关；Client 半在 Plugins 页面提供设置页。
+#                              行名必须是本包名 —— 浏览器模块表按行名取包，写官方桥名的话
+#                              本包的 Client 半边永远不会被加载。
 #
-#   ② chrome-devtools-bridge 官方 `@deepseek-ai/dsh-mcp-client` 桥，由 npx 经 stdio
-#                           拉起 chrome-devtools-mcp，工具注册为 `mcp__chrome-devtools__<tool>`。
-#                           单独一行，这样它不受技能开关影响。
+#   ② chrome-devtools-launch   ┐ 两条**互斥**的官方 `@deepseek-ai/dsh-mcp-client` 桥：由 npx 经
+#   ③ chrome-devtools-attach   ┘ stdio 拉起 chrome-devtools-mcp，工具注册为
+#                              `mcp__chrome-devtools__<tool>`。由本包的 `browser` 开关二选一。
 #
-#   ③ chrome-devtools-skills 技能提供方，扫本包的 `skills-live/`。
-#                           那个目录由 Host 半按开关维护：开则把 `skills/` 下每个技能软链进去，
-#                           关则清空。官方 provider 的文件监视器（默认跟随软链）会自己感知，
-#                           于是技能在会话目录里实时出现或消失 —— 不用重挂、不用重启。
+#       launch —— 不给 `--autoConnect`，MCP 自己拉起一个 Chrome，用
+#                 `~/.cache/chrome-devtools-mcp/chrome-profile` 当 profile。
+#                 **用户零操作**；代价是那是独立浏览器，没有你当前的登录态与标签页。
+#       attach —— 带 `--autoConnect`，接管你**正在用**的 Chrome，复用登录态与已开标签页。
+#                 前提：Chrome 144+，且在 `chrome://inspect/#remote-debugging` 打开
+#                 Remote Debugging；另外每次连接 Chrome 还会弹一次 Allow 让用户确认。
+#
+#       **两者 serverName 相同，绝不能同时启用**，否则会起两个同名 MCP 服务器。
+#
+#       切换方式：Host 半一次原子改写 profile 的 `cordis.patch.yml`，给不用的那条写
+#       `disabled: true`。profile 层按 id 覆盖 bundle 层（cordis-plugin-include 的
+#       `applyEntryPatches`）。dsh 的 HMR 监视着 profile patch，而 loader **按 id 比较**
+#       条目、只重挂变化的那几行 —— 所以开关是**即点即生效**的，不用重启，也不碰别的行。
+#
+#       不用 `plugin_manager.setPluginEnabled()` 逐条切：那要调两次，而第一次返回时旧行的
+#       fiber 还没卸载，第二次启用就会撞上 `serverName` 冲突。自己一次写完两条没有这个中间态。
+#       也不在 `args` 里用 `!!js` 读包内文件：config 里的 `!!js` **只在条目激活时求值**，
+#       而改包内文件不会让任何条目激活 —— 那样切换就必须重启 dsh。
+#
+#   ④ chrome-devtools-skills   技能提供方，扫本包的 `skills-live/`。
+#                              那个目录由 Host 半按 `skills` 开关维护：开则把 `skills/` 下每个
+#                              技能软链进去，关则清空。官方 provider 的文件监视器（默认跟随软链）
+#                              会自己感知，于是技能在会话目录里实时出现或消失 —— 不用重挂、不用重启。
 #
 # `chrome-devtools-mcp` 由宿主 PATH 上的 `npx` 解析并缓存到 ~/.npm/_npx，
 # 因此首次运行需要宿主有 node/npm 与 registry 访问。
@@ -23,7 +42,21 @@
     - id: chrome-devtools-mcp
       name: '@jedeiah/chrome-devtools-mcp'
 
-    - id: chrome-devtools-bridge
+    # 自己拉起 Chrome：零操作，独立 profile（~/.cache/chrome-devtools-mcp/chrome-profile）。
+    - id: chrome-devtools-launch
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: chrome-devtools
+        transport: stdio
+        command: npx
+        args:
+          - '-y'
+          - 'chrome-devtools-mcp@latest'
+          - '--no-usage-statistics'
+          - '--no-performance-crux'
+
+    # 接管你自己的浏览器：复用登录态，但需先开 Remote Debugging 并逐次确认。
+    - id: chrome-devtools-attach
       name: '@deepseek-ai/dsh-mcp-client'
       config:
         serverName: chrome-devtools
@@ -35,6 +68,7 @@
           - '--autoConnect'
           - '--no-usage-statistics'
           - '--no-performance-crux'
+      disabled: true
 
     - id: chrome-devtools-skills
       name: '@deepseek-ai/dsh-skill-filesystem'

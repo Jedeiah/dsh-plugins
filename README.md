@@ -25,7 +25,7 @@
 | 项 | 说明 |
 |---|---|
 | dsh 版本 | **0.2.0-rc.2**（桌面端）实测通过；更早版本未验证 |
-| 构建步骤 | **不需要** —— 五个插件都是**零构建**（没有 `src/`、没有 tsdown、没有 install 脚本）；`chrome-devtools-mcp` 与 `rea-dsh` 另含 Host/Client 半边与一段运行期 `!!js` 表达式 |
+| 构建步骤 | **不需要** —— 五个插件都是**零构建**（没有 `src/`、没有 tsdown、没有 install 脚本）；除 `web-fetch-fakeip`（纯 Host 插件）外都含 Host/Client 半边；`!!js` 只在确实需要时用 —— 目前只有 `chrome-devtools-mcp` 与 `rea-dsh` 各一处，用来算出 `skills-live/` 的绝对路径 |
 | 依赖安装 | **不需要手动装** —— 对 dsh 自带包的依赖写在 `peerDependencies` 里，由 dsh 的模块解析器路由到安装里的副本 |
 | 平台 | 插件本身与平台无关；`chrome-devtools-mcp` 与 `rea-dsh` 需要宿主有 `node`/`npm`（首次运行由 `npx` 拉取 MCP 服务器） |
 | 适用场景 | `web-fetch-fakeip` 只在使用 TUN + fake-ip 代理（Clash / Shadowrocket 等）时才有意义 |

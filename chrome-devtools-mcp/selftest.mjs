@@ -28,7 +28,7 @@
  * @module @jedeiah/chrome-devtools-mcp/selftest
  */
 
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { register } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -87,17 +87,22 @@ const plain = (value) => (typeof value?.get === 'function' ? value.get() : value
 console.log("\nPart A — the toggle's building blocks");
 {
   check('CONFIG_DEFAULTS was read from the schema, not hand-copied',
-    Object.keys(host.CONFIG_DEFAULTS).join(',') === 'skills' && host.CONFIG_DEFAULTS.skills === false,
+    Object.keys(host.CONFIG_DEFAULTS).sort().join(',') === 'browser,skills'
+    && host.CONFIG_DEFAULTS.skills === false
+    && host.CONFIG_DEFAULTS.browser === 'launch',
     JSON.stringify(host.CONFIG_DEFAULTS));
 
   const validated = host.Config['~standard'].validate({});
   check('the row configuration validates',
     validated.issues === undefined, JSON.stringify(validated.issues));
-  check("the schema's own default agrees with CONFIG_DEFAULTS",
-    validated.issues === undefined && plain(validated.value.skills) === host.CONFIG_DEFAULTS.skills,
-    JSON.stringify(plain(validated.value.skills)));
+  check("the schema's own defaults agree with CONFIG_DEFAULTS",
+    validated.issues === undefined
+    && plain(validated.value.skills) === host.CONFIG_DEFAULTS.skills
+    && plain(validated.value.browser) === host.CONFIG_DEFAULTS.browser,
+    JSON.stringify([plain(validated.value.skills), plain(validated.value.browser)]));
   check('.volatile() arrives as a live handle (why readConfigValue exists)',
-    typeof validated.value?.skills?.get === 'function');
+    typeof validated.value?.skills?.get === 'function'
+    && typeof validated.value?.browser?.get === 'function');
 
   const root = mkdtempSync(join(tmpdir(), 'chrome-devtools-mcp-selftest-'));
   const liveDir = join(root, 'live');
@@ -130,6 +135,45 @@ console.log("\nPart A — the toggle's building blocks");
     host.syncLiveSkills(true, { liveDir, sourceDir });
     check('a missing source directory is not an error',
       host.syncLiveSkills(true, { liveDir, sourceDir: join(root, 'absent') }).length === 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+console.log('\nPart A2 — the browser switch rewrites the profile patch');
+{
+  const root = mkdtempSync(join(tmpdir(), 'chrome-devtools-mcp-browser-'));
+  const patch = join(root, 'cordis.patch.yml');
+  try {
+    // Stand in for a user's patch file: their own entries and comment.
+    writeFileSync(patch, [
+      '# 用户自己的注释',
+      '- insert:',
+      '    - id: something-else',
+      "      name: 'some-plugin'",
+      '',
+    ].join('\n'));
+
+    check('first write appends the managed block', host.writeBrowserMode(patch, 'launch') === true);
+    let text = readFileSync(patch, 'utf8');
+    check("the user's own content survives",
+      text.startsWith('# 用户自己的注释') && text.includes('some-plugin'));
+    check('launch enables launch and disables attach',
+      text.includes('- id: chrome-devtools-launch\n  disabled: false')
+      && text.includes('- id: chrome-devtools-attach\n  disabled: true'));
+
+    check('writing the same mode again is a no-op (so HMR is not re-triggered every second)',
+      host.writeBrowserMode(patch, 'launch') === false);
+
+    check('switching to attach rewrites the block', host.writeBrowserMode(patch, 'attach') === true);
+    text = readFileSync(patch, 'utf8');
+    check('attach enables attach and disables launch',
+      text.includes('- id: chrome-devtools-launch\n  disabled: true')
+      && text.includes('- id: chrome-devtools-attach\n  disabled: false'));
+    check('the block is replaced, not appended a second time',
+      text.split('browser mode (managed) — begin').length === 2);
+    check('exactly one row is left enabled (both enabled would collide on serverName)',
+      (text.match(/disabled: false/g) ?? []).length === 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

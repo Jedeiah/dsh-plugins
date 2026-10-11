@@ -19,7 +19,8 @@
     "typert.js",
     "cordis.patch.yml",
     "icon.svg",
-    "locale/*.json"
+    "locale/*.json",
+    "selftest.mjs"
   ],
   "peerDependencies": {
     "@deepseek-ai/schemastery": "*",

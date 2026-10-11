@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Browser Debugging",
-    "description": "Wires chrome-devtools-mcp in so the model can debug a real browser; use the row's arrow to set whether its 7 bundled skills are offered."
+    "description": "Wires chrome-devtools-mcp in so the model can debug a real browser; use the row's arrow to set the skills and which browser the agent drives."
   }
 }

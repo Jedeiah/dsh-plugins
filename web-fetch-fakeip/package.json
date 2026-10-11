@@ -15,7 +15,8 @@
     "index.js",
     "cordis.patch.yml",
     "icon.svg",
-    "locale/*.json"
+    "locale/*.json",
+    "selftest.mjs"
   ],
   "peerDependencies": {
     "@deepseek-ai/dsh-web-fetch-http": "*",

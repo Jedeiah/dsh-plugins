@@ -77,9 +77,11 @@ window.__ModuleLoader__.load({
     /** Page dictionary. Kept local: this bundle exposes no model-facing text. */
     const zh = {
       summary: '浏览器调试',
-      pageIntro: 'chrome-devtools-mcp 自带 7 个调试技能（无障碍、Cookie、LCP 性能、内存泄漏等）。默认关闭，与上游一致——上游把它作为 MCP 服务器分发，技能是给有技能机制的 agent 额外提供的。',
+      pageIntro: '接入 chrome-devtools-mcp，让模型能调试真实浏览器。下面两项都可随时改。',
       skillsLabel: '向智能体提供自带技能',
-      skillsHint: '开启后，7 个技能会出现在会话的技能目录中，可用 / 调用。改动立即生效。',
+      skillsHint: '开启后，自带的 7 个调试技能会出现在会话的技能目录中，可用 / 调用。改动立即生效。',
+      browserLabel: '接管我自己的浏览器',
+      browserHint: '开启后，智能体操作你正在用的 Chrome，能复用登录态与已打开的标签页。前提：Chrome 144+，且已在 chrome://inspect/#remote-debugging 打开 Remote Debugging；每次连接还会要你确认一次。关闭则自己拉起一个独立的 Chrome，零配置，但没有你的登录态。',
       saving: '正在保存…',
       unavailable: '设置暂不可用',
       readOnly: '当前组合下不可修改（缺少设置界面时只读）。',
@@ -88,9 +90,11 @@ window.__ModuleLoader__.load({
 
     const en = {
       summary: 'Browser Debugging',
-      pageIntro: 'chrome-devtools-mcp ships 7 debugging skills (a11y, cookies, LCP performance, memory leaks and more). Off by default, matching upstream — upstream distributes it as an MCP server, and the skills are an extra for agents that have a skill mechanism.',
+      pageIntro: 'Wires chrome-devtools-mcp in so the model can debug a real browser. Both settings below can be changed at any time.',
       skillsLabel: 'Offer the bundled skills to the agent',
-      skillsHint: 'When on, the 7 skills appear in the session skill catalog and can be called with /. Changes apply immediately.',
+      skillsHint: 'When on, the 7 bundled debugging skills appear in the session skill catalog and can be called with /. Changes apply immediately.',
+      browserLabel: 'Drive the browser I am already using',
+      browserHint: 'When on, the agent drives the Chrome you are using now, so it keeps your logins and open tabs. Requires Chrome 144+ with Remote Debugging already enabled at chrome://inspect/#remote-debugging, and Chrome asks you to confirm once per connection. When off, the server starts its own separate Chrome: nothing to set up, but none of your logins.',
       saving: 'Saving…',
       unavailable: 'Settings unavailable',
       readOnly: 'Not editable in this composition (read-only without a settings surface).',
@@ -137,19 +141,19 @@ window.__ModuleLoader__.load({
       if (form.state.status !== 'ready') return h('div', { style: STYLE.notice }, t('unavailable'));
 
       const locked = form.state.writable !== true;
-      // The `?? false` must match the `skills` default in ../index.js's Config:
-      // a ready form carries the schema-projected value, but a field the schema
-      // ever stops projecting would otherwise read as `undefined` and flip the
-      // switch to the opposite of what the Host holds.
+      // These defaults must match ../index.js's Config: a ready form carries the
+      // schema-projected value, but a field the schema ever stops projecting would
+      // otherwise read as `undefined` and show the opposite of what the Host holds.
       const skills = form.state.value?.skills ?? false;
-      const write = (next) => {
+      const attach = (form.state.value?.browser ?? 'launch') === 'attach';
+      const write = (field, next) => {
         // The revision is deliberately left to the form: one read at render time
         // goes stale the moment the write lands.
         //
         // The mutation resolves with whether the form accepted the change, and a
         // rejection is the same outcome from the reader's side. Either way the
         // switch must not silently spring back with no explanation.
-        Promise.resolve(form.mutate([{ op: 'set', path: ['skills'], value: next }]))
+        Promise.resolve(form.mutate([{ op: 'set', path: [field], value: next }]))
           .then((accepted) => setSaveFailed(accepted === false))
           .catch(() => setSaveFailed(true));
       };
@@ -164,8 +168,16 @@ window.__ModuleLoader__.load({
           skills,
           locked,
           // `primitives.Switch` hands back the next value, not a DOM event.
-          (next) => write(next === true),
+          (next) => write('skills', next === true),
           t('skillsHint'),
+        ),
+        switchRow(
+          'browser',
+          t('browserLabel'),
+          attach,
+          locked,
+          (next) => write('browser', next === true ? 'attach' : 'launch'),
+          t('browserHint'),
         ),
       ]);
     }
