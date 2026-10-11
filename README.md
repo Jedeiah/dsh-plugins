@@ -12,7 +12,8 @@
 |---|---|---|
 | **[turn-notifier](turn-notifier/README.md)** | **提示铃**：智能体需要你注意时响铃提醒（答完一轮 / 停下来等你操作），不理会就按间隔重复，一动鼠标键盘就停。点组件行的箭头可调提示音、波形、音量与重复次数 | 1.7.0 |
 | **[session-purge](session-purge/README.md)** | **删除会话**：在会话行的悬停按钮 / 「…」菜单里加「删除会话」，把会话连同子 agent 会话真正从磁盘上删掉。点组件行的箭头可配置清理范围 | 1.0.0 |
-| **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **浏览器调试**：接入 chrome-devtools-mcp，给模型浏览器调试工具（页面、快照、截图、DOM/JS 求值、控制台、网络、性能），工具名形如 `mcp__chrome-devtools__<tool>` | 1.0.0 |
+| **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **浏览器调试**：接入 chrome-devtools-mcp，给模型浏览器调试工具（页面、快照、截图、DOM/JS 求值、控制台、网络、性能），工具名形如 `mcp__chrome-devtools__<tool>`；并附带随包分发的 7 个调试技能 | 1.1.0 |
+| **[rea-mcp](rea-mcp/README.md)** | **逆向工程**：接入 REA 的 MCP 服务器，给模型逆向工程工具（原生二进制、Electron/JS 应用、.NET 程序集、APK、固件、网页），工具名形如 `mcp__rea__<tool>`；并附带 `reverse-engineer-anything` 技能副本 | 1.0.0 |
 | **[web-fetch-fakeip](web-fetch-fakeip/README.md)** | **代理抓取**：让 `web_fetch` 在 TUN + fake-ip 代理（Clash / Shadowrocket）下也能正常工作 | 5.1.0 |
 
 每个插件都是**独立、可单独安装**的组合包：`package.json` 里声明 `dsh.bundle.patch`，patch 文件插入该插件的行；带界面/交互的插件再声明 `dsh.client` 提供客户端半边。
@@ -22,9 +23,9 @@
 | 项 | 说明 |
 |---|---|
 | dsh 版本 | **0.2.0-rc.2**（桌面端）实测通过；更早版本未验证 |
-| 构建步骤 | **不需要** —— 四个插件都是**纯 JS、零构建**（没有 `src/`、没有 tsdown、没有 install 脚本） |
+| 构建步骤 | **不需要** —— 五个插件都是**零构建**（没有 `src/`、没有 tsdown、没有 install 脚本）；`chrome-devtools-mcp` 与 `rea-mcp` 另含一段运行期 `!!js` 表达式，用于推导随包技能的位置 |
 | 依赖安装 | **不需要手动装** —— 对 dsh 自带包的依赖写在 `peerDependencies` 里，由 dsh 的模块解析器路由到安装里的副本 |
-| 平台 | 插件本身与平台无关；`chrome-devtools-mcp` 需要宿主有 `node`/`npm`（首次运行由 `npx` 拉取 MCP 服务器） |
+| 平台 | 插件本身与平台无关；`chrome-devtools-mcp` 与 `rea-mcp` 需要宿主有 `node`/`npm`（首次运行由 `npx` 拉取 MCP 服务器） |
 | 适用场景 | `web-fetch-fakeip` 只在使用 TUN + fake-ip 代理（Clash / Shadowrocket 等）时才有意义 |
 
 ## 安装
