@@ -1,24 +1,51 @@
 {
-  "name": "@jedeiah/rea-mcp",
-  "version": "1.0.0",
+  "name": "@jedeiah/rea-dsh",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "逆向工程（Reverse Engineering）：把 REA 的 MCP 服务器（stdio 桥接）接进本 dsh profile，让模型能逆向分析二进制、Electron 应用、APK、固件与网页；随包附带 REA 的完整技能副本，并往 global 层注册一个只扫该副本的技能提供方。",
+  "description": "逆向工程（Reverse Engineering）：把 REA 的 MCP 服务器（stdio 桥接）接进本 dsh profile，让模型能逆向分析二进制、应用与网页；随包附带它的技能，可在 Plugins 页面开关。",
   "icon": "./icon.svg",
   "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./typert": "./typert.js",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json"
   },
   "files": [
+    "index.js",
+    "client.js",
+    "typert.js",
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",
     "skills/**"
   ],
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-gateway",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
     }
   }
 }
