@@ -1,6 +1,6 @@
 {
   "name": "@jedeiah/turn-notifier",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": true,
   "type": "module",
   "description": "提示铃（Chime）：智能体需要你注意时响铃提醒；波形、音量、提示音、重复次数都能在 Plugins 页面里配置。",

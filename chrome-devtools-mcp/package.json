@@ -1,9 +1,9 @@
 {
   "name": "@jedeiah/chrome-devtools-mcp",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
-  "description": "浏览器调试（Browser Debugging）：把 chrome-devtools-mcp 服务器（stdio 桥接）接进本 dsh profile，让模型能调试真实浏览器；随包附带它的 7 个调试技能，可在 Plugins 页面开关。",
+  "description": "浏览器调试（Browser Debugging）：把 chrome-devtools-mcp 服务器（stdio 桥接）接进本 dsh profile，让模型能调试真实浏览器；随包附带它的 7 个调试技能。点组件行的箭头可设置技能开关，以及让智能体操作哪个浏览器（自己拉起一个，或接管你正在用的）。",
   "icon": "./icon.svg",
   "exports": {
     ".": "./index.js",
