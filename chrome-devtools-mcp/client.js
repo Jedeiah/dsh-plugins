@@ -29,6 +29,16 @@ const ENTRY_ID = 'chrome-devtools-mcp';
 const SETTINGS_LOCALE_NS = 'plugin.chromeDevtoolsMcpSettings';
 
 /**
+ * How long the page says "switching…" after the browser switch is flipped.
+ *
+ * Time-boxed rather than polled: `form` moves at once, but the MCP server only
+ * changes after dsh re-mounts the changed rows, and no page-side signal marks the
+ * moment that finishes. Measured here, the round trip is roughly four to eight
+ * seconds.
+ */
+const SWITCH_NOTICE_MS = 8000;
+
+/**
  * Token-only styling, so light and dark follow the host theme automatically.
  */
 const LAYOUT = Object.freeze({
@@ -86,6 +96,7 @@ window.__ModuleLoader__.load({
       unavailable: '设置暂不可用',
       readOnly: '当前组合下不可修改（缺少设置界面时只读）。',
       saveFailed: '设置没能保存：本部署没有接受这个改动。',
+      switching: '正在切换…',
     };
 
     const en = {
@@ -99,6 +110,7 @@ window.__ModuleLoader__.load({
       unavailable: 'Settings unavailable',
       readOnly: 'Not editable in this composition (read-only without a settings surface).',
       saveFailed: 'The change was not saved: this deployment did not accept it.',
+      switching: 'Switching…',
     };
 
     /**
@@ -135,6 +147,29 @@ window.__ModuleLoader__.load({
       // both its summary and its page shape, so the hook order must not differ
       // between renders.
       const [saveFailed, setSaveFailed] = React.useState(false);
+      const [switchingUntil, setSwitchingUntil] = React.useState(0);
+      const [clock, setClock] = React.useState(0);
+      // What the browser switch showed when the change was requested. While a switch is
+      // in flight the control keeps showing *this* rather than the form's value: the
+      // form updates optimistically, so otherwise the switch would claim the new mode
+      // seconds before the MCP server actually has it.
+      const [frozenAttach, setFrozenAttach] = React.useState(null);
+      // Tick only while a notice is on screen, and stop as soon as it expires: an
+      // interval that outlives the notice would re-render the page every 500ms for
+      // the rest of the session.
+      React.useEffect(() => {
+        if (switchingUntil === 0) return undefined;
+        const timer = setInterval(() => {
+          const now = Date.now();
+          if (now >= switchingUntil) {
+            clearInterval(timer);
+            setSwitchingUntil(0);
+            return;
+          }
+          setClock(now);
+        }, 500);
+        return () => clearInterval(timer);
+      }, [switchingUntil]);
       if (view === 'summary') return t('summary');
       if (form?.state === undefined) return null;
       if (form.state.status === 'loading') return h('div', { role: 'status' }, t('saving'));
@@ -145,8 +180,20 @@ window.__ModuleLoader__.load({
       // schema-projected value, but a field the schema ever stops projecting would
       // otherwise read as `undefined` and show the opposite of what the Host holds.
       const skills = form.state.value?.skills ?? false;
-      const attach = (form.state.value?.browser ?? 'launch') === 'attach';
+      const live = (form.state.value?.browser ?? 'launch') === 'attach';
+      const switching = switchingUntil > clock;
+      // Hold the pre-change value until the wait is over, so the switch and the notice
+      // tell the same story: the switch moves when the MCP server actually has.
+      const attach = switching && frozenAttach !== null ? frozenAttach : live;
       const write = (field, next) => {
+        // Only the browser switch has a server behind it — the skills switch is a
+        // symlink swap under a file watcher, which shows up in about a second.
+        if (field === 'browser') {
+          const now = Date.now();
+          setFrozenAttach(live);
+          setClock(now);
+          setSwitchingUntil(now + SWITCH_NOTICE_MS);
+        }
         // The revision is deliberately left to the form: one read at render time
         // goes stale the moment the write lands.
         //
@@ -161,6 +208,7 @@ window.__ModuleLoader__.load({
       return h('div', { key: 'page', style: LAYOUT.page }, [
         locked ? h('div', { key: 'readonly', style: STYLE.notice }, t('readOnly')) : null,
         saveFailed ? h('div', { key: 'failed', role: 'alert', style: STYLE.error }, t('saveFailed')) : null,
+        switching ? h('div', { key: 'switching', role: 'status', style: STYLE.notice }, t('switching')) : null,
         h('p', { key: 'intro', style: { margin: 0, ...LAYOUT.hint, fontSize: 13 } }, t('pageIntro')),
         switchRow(
           'skills',

@@ -91,8 +91,13 @@ open "/Applications/DeepSeek Harness.app"
   不在磁盘上留任何东西。让纯函数接受可注入的目录参数，测试才不碰 bundle 自己的目录。
 - **停用再启用带客户端半边的插件，`apply` 不保证重跑**（[deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)）。
   配置页要注册在 `ctx.inject(['remote.<本插件自己的服务>', …], cb)` 依赖门里，靠 Host 半边重建把页面重新挂上。
-- **一个 `serverName` 只能有一条 MCP 桥行。** 两条会起两个同名服务器、工具表打架。要提供互斥的两种
-  连接方式（例："自己拉起 Chrome" / "接管我的浏览器"），就定义**两条行**、由开关改写 `disabled` 二选一。
+- **要提供互斥的两种连接方式（例："自己拉起 Chrome" / "接管我的浏览器"），就定义两条行、由开关改写
+  `disabled` 二选一 —— 但两条行的 `serverName` 必须给成不同的。** dsh 给**每一行**都配了启用开关，
+  而那个开关只改自己那一行、管不了另一行；同名的话，用户在插件列表里点另一条**必然**撞上
+  `mcp-client` 的 `serverName is already in use`（这一秒我们的轮询还没轮到）。不同名则那一瞬间两条
+  可以并存，Host 半随后按设置页的值纠正 —— 也才谈得上"把列表里的点击当成切换意图"（写行 +
+  `ctx.settings.update(ns, {…})` 把设置页的值也改过去，`ns` 是 profile 条目 id）。
+  本仓库 `chrome-devtools-mcp` 就是这么做的，README 里有那张"两行状态 → 含义 → 处理"的表。
 - **想让开关"即点即生效"，载体必须是 patch 的结构性字段。** dsh 的 HMR 按 `id` 比较条目、只重挂变化
   的那几行，所以改 `disabled` 是即时的（本机实测约 4 秒，双向）。两个反例，都实现过：
   - **两次 `plugin_manager.setPluginEnabled()` 有竞态**：第一次返回时被禁用的那行 **fiber 还没卸载**，
@@ -102,7 +107,12 @@ open "/Applications/DeepSeek Harness.app"
     不会让任何条目激活（HMR 不监视 `node_modules`），切换就退化成"必须重启"。
     对比：`disabled` 的 `!!js` 是另一条路径 —— **每次挂载决策时求值**（官方文档
     `develop/cordis-tutorial/05-config` 明确写了这是 dsh 的扩展）。
-- **改写 profile 的 `cordis.patch.yml` 必须幂等。** dsh 的 HMR **监视那个文件**（`dsh-hmr` 的
+- **Remote 方法要在两处声明，缺一处会让设置页整个空白。** `typert.js` 的 `invocations` 是 Host 交给
+  Gateway 的清单，`client.js` 里的 `TYPERT_REMOTE.descriptors` 是客户端查找用的镜像 —— 只加一处，
+  调用时会在页面里**同步抛错**，而报错发生在 `useEffect` 里，React 会把整个设置页渲染成空白
+  （现象：点组件行的箭头进去什么都没有）。`selftest.mjs` 的 Part A5 用文本比对守这条。
+- **在页面组件里读 Host 状态要包 try/catch。** 上面那种缺声明就是同步抛，`Promise.resolve(fn())`
+  包不住它。取数函数写成 `try { … } catch { return Promise.resolve(落空值) }`，页面最坏是少个提示而不是白屏。
   `patchFiles = [profile.patchPath, join(profile.home, 'cordis.patch.yml')]`），插件若在 1 秒轮询里
   无脑写入 —— 哪怕内容没变 —— 会让 HMR 反复重挂那两行。**写前比较内容，一样就不写。**
   另外 `disabled` 是 patch 的合法字段，按 id 覆盖（`cordis-plugin-include` 的 `applyEntryPatches`

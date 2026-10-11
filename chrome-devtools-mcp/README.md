@@ -30,7 +30,7 @@
 
     - id: chrome-devtools-attach     # ③ 官方 MCP 桥：接管你自己的 Chrome
       name: '@deepseek-ai/dsh-mcp-client'
-      config: { serverName: chrome-devtools, transport: stdio, command: npx, args: [... , '--autoConnect'] }
+      config: { serverName: chrome-devtools-attach, transport: stdio, command: npx, args: [... , '--autoConnect'] }
       disabled: true                 # 与 ② 互斥，由 browser 开关二选一
 
     - id: chrome-devtools-skills     # ④ 技能提供方，扫本包 skills-live/
@@ -39,7 +39,7 @@
 ```
 
 **① 行名必须是本包名** —— 浏览器模块表按行名取包，写官方桥名的话本包的 Client 半边永远不会被加载。
-**② ③ 是两条互斥的桥**（`serverName` 相同，同时启用会起两个同名服务器），由 `browser` 开关二选一。
+**② ③ 是两条互斥的桥**，由 `browser` 开关二选一。两者 **`serverName` 刻意不同**（见下）。
 **④ 单独一行**，这样 MCP 工具不受技能开关影响。
 
 ## 让智能体操作哪个浏览器
@@ -63,16 +63,39 @@
 写法上只替换一个带标记的区块，**不做 YAML 往返** —— 那是用户的文件，往返会丢掉他的注释和格式。
 万一 HMR 没在跑，会写一条日志提示需要重启。
 
+**插件列表里那两行的开关也算数。** 设置页的 `browser` 是唯一真源，但 dsh 给**每一行**都配了启用开关，
+而那个开关只改自己那一行、管不了另一行 —— 所以直接点它必然会和当前模式打架。本包的做法是
+**每秒核对一次**并把它当成你的意图：
+
+| 两行的实际状态 | 含义 | 处理 |
+|---|---|---|
+| 设置页要的那条在跑，另一条不在 | 正常 | 什么都不做（每秒一次文件读取，不写） |
+| 只有**另一条**在跑 | 设置页的值领先于文件 | 按设置页的值把文件追上 |
+| **两条都在跑** | 只有列表开关能做到这个 —— 你点了另一条 | **切到那一侧**：写行 + `ctx.settings.update()` 把设置页的值也改过去 |
+| **两条都关** | 你在列表里把当前这条关掉了 | 同上（总得有一条在跑） |
+| **文件里没有这两行** | 新装、或你把那个块删了 | 按 bundle 自带的默认读（launch 开、attach 关），一致就什么都不做 |
+
+**为什么最后一行要单独列**：那两行本身是**组合包**提供的，profile 里可以一个字都没有 —— 把"没有"当成"关掉了"会让一套全新安装被静默改成 `attach`（要求 Chrome 144+ 和 Remote Debugging）。所以 `undefined`（文件里没提）与 `disabled: true`（明确关掉）是**两回事**。
+
+**两条桥不再共用 `serverName`**（`chrome-devtools` / `chrome-devtools-attach`），就是为了让"两条都开"
+的那一瞬间**不会冲突** —— 否则你在列表里点开另一条必然收到 `serverName is already in use`，而那一秒本包还没轮到处理。代价是**两种模式下 MCP 工具名前缀不同**（`mcp__chrome-devtools__*` / `mcp__chrome-devtools-attach__*`）。
+
+**⚠️ 已知边界：设置页改动后，插件列表那两行不会自动跟着变。** 需要（在你的插件页里手动刷新，或切走再切回）才显示最新状态。这不是本包的疏忽 —— dsh 插件页的刷新处理器是
+`if (controller.getSnapshot().status !== "idle") controller.load()`：**只在那个页面正忙时才重新拉取**，而它空闲时（例如你在设置页操作的那一刻）会把通知丢掉；那个控制器是页面私有的，包外面够不着，也就没有任何合法的办法从外部触发一次刷新。
+
+**实际影响**：列表会短暂显示**过期**的行状态。**如果你照着列表去点，可能点到一个其实已经开着的开关** —— dsh 会写一个和现状相同的值，patch 因此毫无变化、HMR 不重挂，而它的控制器在等一个不会到来的回执，界面就一直转。**所以请只用设置页那两个开关**（它们读的是设置值，那是权威）；列表里那两行只在"你已经知道自己在做什么"时才用。
+
 **两条试错记录**（都实现过，都被否掉，留在这里省得再踩）：
 
 - **不要用两次 `plugin_manager.setPluginEnabled()`。** 第一次返回时，它禁用的那行 **fiber 还没卸载**，
-  第二次启用就撞上 `mcp-client` 的 `serverName is already in use`。一次写完两条没有这个中间态。
+  第二次启用就可能撞上 `mcp-client` 的 `serverName is already in use`。一次写完两条没有这个中间态。
 - **不要把模式放进 `args` 的 `!!js` 去读包内文件。** `config` 里的 `!!js` **只在条目激活时求值**，
   而改包内文件不会激活任何条目（HMR 不监视 `node_modules`），结果是切换**必须重启 dsh** —— 
   与 dsh 里其他插件"即点即用"的行为不一致。
 
-> ⚠️ 两条桥的 `serverName` 都是 `chrome-devtools`，**绝不能同时启用**，否则会起两个同名 MCP 服务器。
-> 本包保证只启用一条：写入时两条都显式写 `disabled`，不会留下过期的 `true`。
+> ⚠️ 正常运行时**只有一条**桥启用（Host 半每秒核对）。两条 `serverName` 不同，所以万一同时起来
+> 也不会互相打断，但那一刻会多一个 MCP 进程 —— 一秒内会被纠正。
+> 写入时两条都显式写 `disabled`，不会留下过期的 `true`。
 
 ## 技能开关
 

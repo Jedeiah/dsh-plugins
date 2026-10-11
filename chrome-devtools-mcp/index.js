@@ -242,6 +242,30 @@ const BROWSER_BLOCK_END = '# @jedeiah/chrome-devtools-mcp: browser mode (managed
 const LAUNCH_ROW = 'chrome-devtools-launch';
 const ATTACH_ROW = 'chrome-devtools-attach';
 
+/** This bundle's own entry id — the settings namespace the `browser` switch lives in. */
+const ENTRY_ID = 'chrome-devtools-mcp';
+
+/**
+ * What this bundle's own patch ships for the two rows: `launch` on, `attach` off.
+ *
+ * The rows are defined in *this bundle's* `cordis.patch.yml`, so a profile that
+ * never touched them has neither id in its own patch file. A row missing there
+ * means "whatever the bundle ships" — **not** "disabled": in YAML a missing
+ * `disabled` is enabled, and the bundle's own default for `attach` is disabled.
+ */
+const BUNDLE_ROW_ENABLED = Object.freeze({
+  [LAUNCH_ROW]: true,
+  [ATTACH_ROW]: false,
+});
+
+/**
+ * Stop waiting for an adopted click to reach the settings value after this long.
+ *
+ * `settings.update` resolving is the normal end of that wait; this only exists so
+ * that a value which never follows cannot leave the reconciler parked forever.
+ */
+const ADOPT_TIMEOUT_MS = 15000;
+
 /**
  * Force exactly one of the two mutually exclusive bridge rows to be enabled.
  *
@@ -292,6 +316,47 @@ function writeBrowserMode(patchPath, mode) {
 }
 
 /**
+ * What the profile patch says about each bridge row.
+ *
+ * Reads the text rather than parsing YAML: only two `disabled` values are needed,
+ * and this is a file the user may have hand-edited — a parser round-trip would
+ * risk normalizing their formatting.
+ *
+ * Each row answers `true` (enabled), `false` (explicitly disabled) or `undefined`
+ * (**the row is not in this file at all** — the normal state, since the rows
+ * themselves come from the bundle's patch). Callers must not read `undefined` as
+ * "disabled"; {@link BUNDLE_ROW_ENABLED} is the fallback.
+ *
+ * Later entries override earlier ones key by key (`cordis-plugin-include`'s
+ * `applyEntryPatches`), so the last explicit `disabled` wins — including when it
+ * sits under a later, differently-shaped entry for the same id.
+ * @param patchPath - absolute path of the profile patch file.
+ * @returns whether each row is enabled, keyed by {@link LAUNCH_ROW} / {@link ATTACH_ROW}.
+ */
+function readBrowserRows(patchPath) {
+  const text = readFileSync(patchPath, 'utf8');
+  const out = {};
+  for (const row of [LAUNCH_ROW, ATTACH_ROW]) {
+    // Indented entries count too: the bundle's own rows are nested four spaces
+    // under `- insert:`, and a user may have re-indented theirs. `\r?` keeps CRLF
+    // files working.
+    const entry = new RegExp(
+      `^[ \\t]*- id:[ \\t]*${row}[ \\t]*\\r?\\n((?:[ \\t]+[^\\n]*\\r?\\n)*)`,
+      'gm',
+    );
+    let disabled;
+    for (const match of text.matchAll(entry)) {
+      const found = /^[ \t]+disabled:[ \t]*(true|false)\b/m.exec(match[1]);
+      if (found !== null) disabled = found[1] === 'true';
+    }
+    // `undefined` stays `undefined`: "this file says nothing", which is not the same
+    // as "disabled".
+    out[row] = disabled === undefined ? undefined : !disabled;
+  }
+  return out;
+}
+
+/**
  * The Remote service: the Host's authoritative view of this row's configuration.
  *
  * The Client half reads it when `configForms` is unavailable — a composition
@@ -310,7 +375,9 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
     this.ctx = ctx;
     this.config = config ?? {};
     this.appliedSkills = undefined;
-    this.appliedBrowser = undefined;
+    /** Mode being adopted into the settings value, and when that started. */
+    this.browserAdopting = undefined;
+    this.browserAdoptingAt = 0;
     // The first syncs touch the filesystem (they create or clear `skills-live/`)
     // and this profile's patch file. Neither may take the row down: this row also
     // carries the MCP bridge, which has nothing to do with either tunable, and a
@@ -321,11 +388,7 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
     } catch (error) {
       this.warn('initial skills sync', error);
     }
-    try {
-      this.syncBrowser();
-    } catch (error) {
-      this.warn('initial browser sync', error);
-    }
+    this.syncBrowser().catch((error) => this.warn('initial browser sync', error));
     this.startWatch(ctx);
   }
 
@@ -386,42 +449,126 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
   }
 
   /**
-   * Bring this profile's patch file in line with the `browser` tunable.
+   * Keep the bridge rows and the settings switch in agreement.
    *
-   * The two bridge rows share a `serverName`, so exactly one may be enabled; this
-   * writes the override that disables the other. Idempotent and compare-before-
-   * write: a steady state costs one config read and never touches the file, so
-   * dsh's HMR is not re-triggered on every poll.
+   * Two things can move this, so "write when the config changed" is not enough:
+   * the settings page writes `config.browser`, while the per-row switches in the
+   * Plugins list make `plugin_manager` rewrite a single row's `disabled` on its
+   * own. This looks at the rows every second and reconciles.
+   *
+   * The rows are read through {@link BUNDLE_ROW_ENABLED}, so a profile that has
+   * never mentioned them — the state every fresh install is in — counts as the
+   * bundle's own default rather than as "both disabled".
+   *
+   * - the row the settings value asks for is the only one on → nothing to do. That
+   *   is the steady state: one file read per second and never a write.
+   * - only the *other* row is on → the settings value is ahead of the file (the
+   *   switch moved on the settings page, or an earlier write failed). Catch up.
+   * - both on, or both off → only the list's per-row switches produce that, and
+   *   they move one row at a time. Read it as "switch me to the other mode", write
+   *   it, and adopt it into the settings value so the two never disagree.
+   *
+   * Adopting the click is safe precisely because the rows no longer share a
+   * `serverName` — the moment where both are on cannot collide.
    */
-  syncBrowser() {
+  async syncBrowser() {
     const mode = readConfigValue(
       this.config.browser,
       CONFIG_DEFAULTS.browser,
       (error) => this.warn('reading the browser tunable', error),
     ) === 'attach' ? 'attach' : 'launch';
-    if (mode === this.appliedBrowser) return;
+
+    // Waiting for an adopted click to reach the settings value. There is a timeout
+    // so a value that never follows cannot park this reconciler forever: nothing
+    // else clears the guard, and every tick would return at this line.
+    if (this.browserAdopting !== undefined) {
+      if (mode === this.browserAdopting) {
+        this.browserAdopting = undefined;
+      } else if (Date.now() - this.browserAdoptingAt < ADOPT_TIMEOUT_MS) {
+        return;
+      } else {
+        this.browserAdopting = undefined;
+        this.warn(`the plugin-list switch did not reach the settings value within ${ADOPT_TIMEOUT_MS}ms`);
+      }
+    }
+
     const patchPath = profilePatchPath(this.ctx);
     if (patchPath === undefined) {
       this.warn('locating the profile patch file');
       return;
     }
+
+    let rows;
+    try {
+      rows = readBrowserRows(patchPath);
+    } catch (error) {
+      this.warn(`reading the browser rows from ${patchPath}`, error);
+      return;
+    }
+
+    // What is actually in effect: the profile's own value where it has one, and what
+    // the bundle ships where it does not. A row absent from the profile is **not**
+    // disabled — reading it that way would take a fresh install (neither row in the
+    // profile yet) for "the user turned both off" and silently flip it to `attach`.
+    const wanted = mode === 'attach' ? ATTACH_ROW : LAUNCH_ROW;
+    const other = mode === 'attach' ? LAUNCH_ROW : ATTACH_ROW;
+    const on = (row) => (rows[row] === undefined ? BUNDLE_ROW_ENABLED[row] : rows[row]);
+
+    if (on(wanted) && !on(other)) return;   // steady state: nothing to do
+
+    // - only the other row on → the settings value is ahead of the file (the switch
+    //   moved on the settings page, or an earlier write failed). Catch the file up.
+    // - both on, or both off → only the Plugins list's per-row switches produce
+    //   that, and they move one row at a time. Read it as "switch me to the other
+    //   mode", write it, and adopt it into the settings value so the two agree.
+    const target = on(wanted) === on(other)
+      ? (mode === 'attach' ? 'launch' : 'attach')
+      : mode;
+    const adopting = target !== mode;
+
     let changed;
     try {
-      changed = writeBrowserMode(patchPath, mode);
+      changed = writeBrowserMode(patchPath, target);
     } catch (error) {
       this.warn(`writing the browser mode to ${patchPath}`, error);
       return;
     }
-    this.appliedBrowser = mode;
+    // NOTE: no `plugin-manager/changed` is emitted here, on purpose. The Plugins page
+    // subscribes to it, but its handler is
+    //     const refresh = () => {
+    //       if (controller.getSnapshot().status !== "idle") controller.load();
+    //     };
+    // — it only reloads while that page is mid-operation, so an idle page drops the
+    // event no matter which context emitted it. The controller is page-private, so
+    // nothing outside can drive a reload either. A change made from the settings page
+    // therefore shows up in the row list only after that page reloads on its own.
+    // Nothing else in the page is affected: the settings switch reads the settings
+    // value, which is the authority.
     // dsh's HMR watches this file, and the loader compares entries by `id`, so the
-    // row this disables and the row it enables are re-mounted on their own — no
-    // restart, no `plugin_manager` call, no other row touched.
-    //
-    // It must *not* be two `setPluginEnabled` calls: the first returns before the
-    // row it disabled has unloaded, so the second trips `mcp-client`'s "serverName
-    // is already in use". Writing both rows in one pass has no such window.
+    // rows are re-mounted on their own — no restart, no `plugin_manager` call, no
+    // other row touched. Without HMR the write is inert until the next boot.
     if (changed && this.ctx?.get?.('hmr') === undefined) {
-      this.notify(`switched to "${mode}" — restart dsh to apply (HMR is not running)`);
+      this.notify(`switched to "${target}" — restart dsh to apply (HMR is not running)`);
+    }
+
+    if (!adopting) return;   // the settings value was ahead: only the file needed it
+
+    const settings = this.ctx?.get?.('settings');
+    if (typeof settings?.update !== 'function') {
+      this.warn('no settings service: the browser switch and the plugin list can disagree');
+      return;
+    }
+    this.browserAdopting = target;
+    this.browserAdoptingAt = Date.now();
+    try {
+      await settings.update(ENTRY_ID, { browser: target });
+      // Resolved means the service committed it. Clear here instead of waiting for a
+      // later tick to observe the new value: a read that never follows would
+      // otherwise wedge the reconciler, and this guard only covers the in-flight call.
+      this.browserAdopting = undefined;
+    } catch (error) {
+      this.browserAdopting = undefined;
+      this.warn('adopting the browser mode chosen in the plugin list', error);
     }
   }
 
@@ -436,7 +583,7 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
   startWatch(ctx) {
     const timer = setInterval(() => {
       try { this.syncSkills(); } catch (error) { this.warn('skills sync', error); }
-      try { this.syncBrowser(); } catch (error) { this.warn('browser sync', error); }
+      this.syncBrowser().catch((error) => this.warn('browser sync', error));
     }, 1000);
     if (typeof timer.unref === 'function') timer.unref();
     try {
@@ -459,7 +606,9 @@ class ChromeDevtoolsMcpRuntime extends TypertRemoteService {
    */
   introspect() {
     this.syncSkills();
-    this.syncBrowser();
+    // Fire-and-forget: this reconciles the rows for whoever reads them next, and the
+    // snapshot below is about the config value, not about which rows are enabled.
+    this.syncBrowser().catch((error) => this.warn('browser sync', error));
     return snapshotConfig(this.config, (error) => this.warn('reading the configuration', error));
   }
 }
@@ -503,4 +652,4 @@ export function apply(ctx, config) {
   new ChromeDevtoolsMcpRuntime(ctx, config);
 }
 
-export { CONFIG_DEFAULTS, ChromeDevtoolsMcpRuntime, SKILLS_LIVE_DIR, SKILLS_SOURCE_DIR, syncLiveSkills, writeBrowserMode };
+export { CONFIG_DEFAULTS, ChromeDevtoolsMcpRuntime, SKILLS_LIVE_DIR, SKILLS_SOURCE_DIR, readBrowserRows, syncLiveSkills, writeBrowserMode };

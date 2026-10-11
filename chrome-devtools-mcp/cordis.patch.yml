@@ -18,15 +18,21 @@
 #                 前提：Chrome 144+，且在 `chrome://inspect/#remote-debugging` 打开
 #                 Remote Debugging；另外每次连接 Chrome 还会弹一次 Allow 让用户确认。
 #
-#       **两者 serverName 相同，绝不能同时启用**，否则会起两个同名 MCP 服务器。
+#       **两者 `serverName` 不同**（`chrome-devtools` / `chrome-devtools-attach`），
+#       所以可以短暂并存而不冲突。这一条是必需的：插件列表给每行都配了开关，用户点了
+#       哪一行就可能多起一条，同名会让那一次点击必然以 `serverName is already in use` 失败。
 #
-#       切换方式：Host 半一次原子改写 profile 的 `cordis.patch.yml`，给不用的那条写
-#       `disabled: true`。profile 层按 id 覆盖 bundle 层（cordis-plugin-include 的
-#       `applyEntryPatches`）。dsh 的 HMR 监视着 profile patch，而 loader **按 id 比较**
-#       条目、只重挂变化的那几行 —— 所以开关是**即点即生效**的，不用重启，也不碰别的行。
+#       切换方式：设置页的 `browser` 开关是**唯一真源**。Host 半每秒核对 profile patch，
+#       一次原子写两条 `disabled`（profile 层按 id 覆盖 bundle 层，见 cordis-plugin-include
+#       的 `applyEntryPatches`）。dsh 的 HMR 监视着 profile patch，而 loader **按 id 比较**
+#       条目、只重挂变化的那几行 —— 所以切换是**即点即生效**的，不用重启，也不碰别的行。
+#
+#       插件列表里那两行的开关被**当成意图**：点开另一条 = "我要换成那个模式"。Host 半会
+#       把它写回设置页的值（`ctx.settings.update`），于是两处永远一致；点错了也只会被
+#       纠正回去，不会有冲突报错。
 #
 #       不用 `plugin_manager.setPluginEnabled()` 逐条切：那要调两次，而第一次返回时旧行的
-#       fiber 还没卸载，第二次启用就会撞上 `serverName` 冲突。自己一次写完两条没有这个中间态。
+#       fiber 还没卸载，第二次启用就可能撞上冲突。自己一次写完两条没有这个中间态。
 #       也不在 `args` 里用 `!!js` 读包内文件：config 里的 `!!js` **只在条目激活时求值**，
 #       而改包内文件不会让任何条目激活 —— 那样切换就必须重启 dsh。
 #
@@ -56,10 +62,14 @@
           - '--no-performance-crux'
 
     # 接管你自己的浏览器：复用登录态，但需先开 Remote Debugging 并逐次确认。
+    #
+    # `serverName` 刻意与 ② 不同。相同的话，在插件列表里点开这一行会撞上
+    # `serverName is already in use` —— 列表里的开关只改自己那一行，管不了另一行，
+    # 于是那一次点击必然失败。不同名则两条可以短暂并存，Host 半随后按设置页的值纠正。
     - id: chrome-devtools-attach
       name: '@deepseek-ai/dsh-mcp-client'
       config:
-        serverName: chrome-devtools
+        serverName: chrome-devtools-attach
         transport: stdio
         command: npx
         args:

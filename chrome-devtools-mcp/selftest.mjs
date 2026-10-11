@@ -172,11 +172,131 @@ console.log('\nPart A2 — the browser switch rewrites the profile patch');
       && text.includes('- id: chrome-devtools-attach\n  disabled: false'));
     check('the block is replaced, not appended a second time',
       text.split('browser mode (managed) — begin').length === 2);
-    check('exactly one row is left enabled (both enabled would collide on serverName)',
+    check('exactly one row is left enabled',
       (text.match(/disabled: false/g) ?? []).length === 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+console.log('\nPart A3 — reading the rows back (the reconciler depends on this)');
+{
+  const root = mkdtempSync(join(tmpdir(), 'chrome-devtools-mcp-rows-'));
+  const patch = join(root, 'cordis.patch.yml');
+  const LAUNCH = 'chrome-devtools-launch';
+  const ATTACH = 'chrome-devtools-attach';
+  // Mirrors BUNDLE_ROW_ENABLED in ../index.js: what the bundle ships when the
+  // profile says nothing about a row.
+  const BUNDLE = { [LAUNCH]: true, [ATTACH]: false };
+  try {
+    // The state a fresh profile is in. The two rows are defined by *this bundle's*
+    // patch, so the profile file has neither id — and that must not read as
+    // "disabled", or the reconciler would take a fresh install for "both off" and
+    // silently switch it to attach.
+    writeFileSync(patch, '# nothing about the bridge rows yet\n');
+    let rows = host.readBrowserRows(patch);
+    check('an untouched profile reports neither row',
+      rows[LAUNCH] === undefined && rows[ATTACH] === undefined, JSON.stringify(rows));
+    check('…so the bundle default applies: launch on, attach off',
+      (rows[LAUNCH] ?? BUNDLE[LAUNCH]) === true && (rows[ATTACH] ?? BUNDLE[ATTACH]) === false);
+
+    host.writeBrowserMode(patch, 'launch');
+    rows = host.readBrowserRows(patch);
+    check('after writing launch: launch on, attach explicitly off',
+      rows[LAUNCH] === true && rows[ATTACH] === false, JSON.stringify(rows));
+
+    host.writeBrowserMode(patch, 'attach');
+    rows = host.readBrowserRows(patch);
+    check('after writing attach: attach on, launch explicitly off',
+      rows[LAUNCH] === false && rows[ATTACH] === true, JSON.stringify(rows));
+
+    // What the Plugins list produces: `plugin_manager` flips one row on its own, so
+    // both end up enabled. The rows share no `serverName`, so that state is
+    // survivable, and the reconciler reads it as "switch me to the other mode".
+    writeFileSync(patch, readFileSync(patch, 'utf8').replace(
+      '- id: chrome-devtools-launch\n  disabled: true',
+      '- id: chrome-devtools-launch\n  disabled: false',
+    ));
+    rows = host.readBrowserRows(patch);
+    check('a row flipped on by hand shows both enabled',
+      rows[LAUNCH] === true && rows[ATTACH] === true, JSON.stringify(rows));
+
+    writeFileSync(patch, readFileSync(patch, 'utf8')
+      .replace('- id: chrome-devtools-launch\n  disabled: false', '- id: chrome-devtools-launch\n  disabled: true')
+      .replace('- id: chrome-devtools-attach\n  disabled: false', '- id: chrome-devtools-attach\n  disabled: true'));
+    rows = host.readBrowserRows(patch);
+    check('both flipped off reads as both explicitly off',
+      rows[LAUNCH] === false && rows[ATTACH] === false, JSON.stringify(rows));
+
+    // The bundle's own rows are nested four spaces under `- insert:`, and a user may
+    // have re-indented theirs; both must still be found.
+    writeFileSync(patch, ['- insert:', `    - id: ${LAUNCH}`, '      disabled: true', ''].join('\n'));
+    rows = host.readBrowserRows(patch);
+    check('an indented entry (the bundle shape) is read too', rows[LAUNCH] === false, JSON.stringify(rows));
+
+    // A CRLF file must not read as "row absent" — that would trigger one silent
+    // flip to the other mode.
+    writeFileSync(patch, `- id: ${LAUNCH}\r\n  disabled: false\r\n- id: ${ATTACH}\r\n  disabled: true\r\n`);
+    rows = host.readBrowserRows(patch);
+    check('a CRLF file reads the same as LF',
+      rows[LAUNCH] === true && rows[ATTACH] === false, JSON.stringify(rows));
+
+    // Later entries override earlier ones key by key, so the last explicit
+    // `disabled` for an id is the one that counts.
+    writeFileSync(patch, [
+      `- id: ${LAUNCH}`,
+      '  disabled: false',
+      '',
+      '# a later override of the same id',
+      `- id: ${LAUNCH}`,
+      '  disabled: true',
+      '',
+    ].join('\n'));
+    rows = host.readBrowserRows(patch);
+    check('the last explicit disabled wins', rows[LAUNCH] === false, JSON.stringify(rows));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+console.log('\nPart A4 — the Host Remote surface');
+{
+  check('switching() is gone (the settings page times the wait itself, not the Host)',
+    host.ChromeDevtoolsMcpRuntime?.prototype?.switching === undefined);
+  check('introspect() is still there',
+    typeof host.ChromeDevtoolsMcpRuntime?.prototype?.introspect === 'function');
+
+  const methods = TYPERT.invocations.map((entry) => entry.method).sort();
+  check('the manifest declares exactly introspect',
+    methods.join(',') === 'introspect', methods.join(','));
+}
+
+console.log('\nPart A5 — the three Remote declarations agree');
+{
+  // A Remote method has to be declared in THREE places, and missing any one of them
+  // fails differently and quietly:
+  //   - `typert.js`      — what the Host serves (the Gateway resolves this)
+  //   - `client.js`      — the mirror it looks the method up in; a mismatch throws
+  //                        inside the page's effect and blanks the settings page
+  //   - `markRemoteMethods` below — what actually lands on the prototype; a mismatch
+  //                        makes the call fail at runtime with no visible cause
+  const served = TYPERT.invocations.map((entry) => entry.method).sort();
+  check('typert.js declares a non-empty method set', served.length > 0, served.join(','));
+
+  const source = readFileSync(join(here, 'client.js'), 'utf8');
+  const declared = [...source.matchAll(/method: '([a-zA-Z]+)'/g)].map((match) => match[1]).sort();
+  check('client.js declares exactly the methods typert.js serves',
+    declared.join(',') === served.join(','),
+    `host=[${served.join(',')}] client=[${declared.join(',')}]`);
+
+  const descriptor = Object.getOwnPropertyDescriptor(
+    host.ChromeDevtoolsMcpRuntime.prototype,
+    '@deepseek-ai/dsh-typert-protocol/remote-methods',
+  );
+  const marked = (descriptor?.value?.methods ?? []).map((entry) => entry.method).sort();
+  check('markRemoteMethods marks exactly those methods',
+    marked.join(',') === served.join(','),
+    `host=[${served.join(',')}] marked=[${marked.join(',')}]`);
 }
 
 console.log('\nPart B — the hand-written Host manifest');
