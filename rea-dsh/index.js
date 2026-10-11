@@ -51,10 +51,44 @@ export const Config = z.object({
   skills: z.boolean().default(true).volatile(),
 });
 
-/** Defaults mirroring the schema above, used when a field cannot be read. */
-const CONFIG_DEFAULTS = Object.freeze({
-  skills: true,
-});
+/**
+ * Defaults read from the schema itself, so there is one source of truth.
+ *
+ * `toJSON()` renders every node as `{ type, meta: { default } }` keyed by uid,
+ * with `dict` mapping field names to those uids — the same serialization the
+ * settings service round-trips when it projects a row's form. Reading defaults
+ * from there keeps this table from drifting away from the schema, which a
+ * hand-written copy silently would.
+ *
+ * A `.volatile()` field cannot be defaulted by validating `{}`: that yields the
+ * live handle rather than the value, so the `meta.default` path is the only way.
+ * @param schema - the exported Config schema.
+ * @returns a frozen field-to-default table (empty if the shape is ever different).
+ */
+function schemaDefaults(schema) {
+  const out = {};
+  try {
+    const json = schema.toJSON();
+    // schemastery puts the field→uid map on the root *node* (`refs[uid].dict`),
+    // not at the top level; falling back to `json` itself covers a shape where it
+    // is hoisted instead.
+    const root = json?.refs?.[json?.uid] ?? json;
+    for (const [field, uid] of Object.entries(root?.dict ?? {})) {
+      const node = json?.refs?.[uid];
+      if (node?.meta !== undefined && 'default' in node.meta) out[field] = node.meta.default;
+    }
+    // Import-time only, before any logger exists, so console is the honest channel.
+    if (Object.keys(out).length === 0) {
+      console.warn('rea-dsh: Config exposes no readable defaults; unread fields will not fall back');
+    }
+  } catch (error) {
+    console.warn(`rea-dsh: Config defaults could not be read: ${error?.message ?? error}`);
+  }
+  return out;
+}
+
+/** Schema defaults, used when a field cannot be read. */
+const CONFIG_DEFAULTS = Object.freeze(schemaDefaults(Config));
 
 /**
  * Read one configured value.
@@ -66,26 +100,34 @@ const CONFIG_DEFAULTS = Object.freeze({
  * unchanged.
  * @param value - the configured value or volatile reference.
  * @param fallback - used when the field is absent or unreadable.
+ * @param onError - called with the thrown value when a volatile handle refuses to
+ *   read; without it a failed read would silently look like the default.
  * @returns the current plain value.
  */
-function readConfigValue(value, fallback) {
+function readConfigValue(value, fallback, onError) {
   if (value === undefined) return fallback;
   if (typeof value?.get === 'function') {
     try {
       const current = value.get();
       return current === undefined ? fallback : current;
-    } catch {
+    } catch (error) {
+      onError?.(error);
       return fallback;
     }
   }
   return value;
 }
 
-/** Defaults merged under a `null` protection so `introspect` never returns holes. */
-function snapshotConfig(config) {
+/**
+ * Snapshot every known field, so `introspect` never returns holes.
+ * @param config - the row configuration.
+ * @param onError - forwarded to {@link readConfigValue} for unreadable fields.
+ * @returns a plain field-to-value object.
+ */
+function snapshotConfig(config, onError) {
   const out = {};
   for (const [field, fallback] of Object.entries(CONFIG_DEFAULTS)) {
-    out[field] = readConfigValue(config?.[field], fallback);
+    out[field] = readConfigValue(config?.[field], fallback, onError);
   }
   return out;
 }
@@ -122,18 +164,19 @@ const SKILLS_LIVE_DIR = join(PACKAGE_DIR, 'skills-live');
  * and always reflects the shipped copy. Existing entries are cleared first, so a
  * skill removed upstream also disappears here.
  * @param enabled - whether the skills should be exposed.
+ * @param opts - directory overrides, so a test can drive this without touching the bundle.
  * @returns the names of skills that could not be exposed.
  */
-function syncLiveSkills(enabled) {
-  rmSync(SKILLS_LIVE_DIR, { recursive: true, force: true });
-  mkdirSync(SKILLS_LIVE_DIR, { recursive: true });
+function syncLiveSkills(enabled, { liveDir = SKILLS_LIVE_DIR, sourceDir = SKILLS_SOURCE_DIR } = {}) {
+  rmSync(liveDir, { recursive: true, force: true });
+  mkdirSync(liveDir, { recursive: true });
   if (!enabled) return [];
-  if (!existsSync(SKILLS_SOURCE_DIR)) return [];
+  if (!existsSync(sourceDir)) return [];
   const failed = [];
-  for (const entry of readdirSync(SKILLS_SOURCE_DIR, { withFileTypes: true })) {
+  for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
-    const from = join(SKILLS_SOURCE_DIR, entry.name);
-    const to = join(SKILLS_LIVE_DIR, entry.name);
+    const from = join(sourceDir, entry.name);
+    const to = join(liveDir, entry.name);
     try {
       // 'junction' is what Windows needs to link a directory without elevation.
       // POSIX ignores the type, so this one call covers both platforms.
@@ -201,7 +244,11 @@ class ReaAgentsRuntime extends TypertRemoteService {
    * this cheaply.
    */
   sync() {
-    const enabled = readConfigValue(this.config.skills, CONFIG_DEFAULTS.skills) === true;
+    const enabled = readConfigValue(
+      this.config.skills,
+      CONFIG_DEFAULTS.skills,
+      (error) => this.warn('reading the skills toggle', error),
+    ) === true;
     if (enabled === this.applied) return;
     const failed = syncLiveSkills(enabled);
     if (failed.length > 0) this.warn(`linking ${failed.join(', ')}`);
@@ -242,11 +289,17 @@ class ReaAgentsRuntime extends TypertRemoteService {
   }
 
   /**
+   * The Remote read the Client half falls back to when `configForms` is missing.
+   *
+   * This deliberately syncs before answering: the toggle's value and the live
+   * directory are two halves of one fact, and a caller asking what the Host holds
+   * wants the answer the filesystem agrees with, not the value from up to one
+   * poll interval ago. The sync is idempotent, so the cost is one comparison.
    * @returns this row's live configuration with schema defaults applied.
    */
   introspect() {
     this.sync();
-    return snapshotConfig(this.config);
+    return snapshotConfig(this.config, (error) => this.warn('reading the configuration', error));
   }
 }
 
@@ -289,4 +342,4 @@ export function apply(ctx, config) {
   new ReaAgentsRuntime(ctx, config);
 }
 
-export { ReaAgentsRuntime, SKILLS_LIVE_DIR };
+export { CONFIG_DEFAULTS, ReaAgentsRuntime, SKILLS_LIVE_DIR, SKILLS_SOURCE_DIR, syncLiveSkills };

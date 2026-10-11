@@ -137,7 +137,11 @@ window.__ModuleLoader__.load({
       if (form.state.status !== 'ready') return h('div', { style: STYLE.notice }, t('unavailable'));
 
       const locked = form.state.writable !== true;
-      const skills = form.state.value?.skills !== false;
+      // The `?? true` must match the `skills` default in ../index.js's Config:
+      // a ready form carries the schema-projected value, but a field the schema
+      // ever stops projecting would otherwise read as `undefined` and flip the
+      // switch to the opposite of what the Host holds.
+      const skills = form.state.value?.skills ?? true;
       const write = (next) => {
         // The revision is deliberately left to the form: one read at render time
         // goes stale the moment the write lands.
