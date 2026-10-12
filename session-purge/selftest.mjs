@@ -591,6 +591,56 @@ async function testClientHalf(app) {
   check('contributes a sidebar row action', slots.includes('sidebar.workspaces.session.row.action'));
   check('contributes a sidebar menu row', slots.includes('sidebar.workspaces.session.menu.item'));
   check('contributes two overlay entries (dialog + toast)', slots.filter((slot) => slot === 'shell.overlay').length === 2, slots.join(', '));
+
+  // The dialog's geometry, both halves of it. Neither failure is visible in a
+  // page: drop the hooks and the card sizes to its content again (an 80-target
+  // preview measured 3657px tall on an 828px viewport, footer buttons off-screen);
+  // drop the stylesheet and the same thing happens with the classes in place.
+  const confirmEntry = entries.find((entry) => entry.options.id === 'session-purge-confirm');
+  const confirm = confirmEntry?.options.inject();
+  confirm?.purge.open('session-hooks', 'Hooks');
+  const dialogTree = confirmEntry?.component({ purge: confirm?.purge, t: (key) => key });
+  check(
+    'the confirmation dialog hands both geometry hooks to the Modal primitive',
+    dialogTree?.props?.className === 'sessionPurge-dialog' && dialogTree?.props?.contentClassName === 'sessionPurge-dialog-content',
+    JSON.stringify([dialogTree?.props?.className, dialogTree?.props?.contentClassName]),
+  );
+  confirm?.purge.dismiss();
+
+  // A second materialisation, this time with a document: the only DOM write the
+  // module makes is that one stylesheet, and it must be tagged so a page inspector
+  // can find it next to the ones dsh's own plugins leave.
+  {
+    const created = [];
+    let domSpec;
+    const dom = {
+      console,
+      window: { __ModuleLoader__: { load: (contribution) => { domSpec = contribution; } } },
+      document: {
+        head: { appendChild: (tag) => created.push(tag) },
+        querySelector: () => null,
+        createElement: (name) => ({ name, dataset: {}, textContent: '' }),
+      },
+    };
+    vm.createContext(dom);
+    try {
+      vm.runInContext(source, dom, { filename: 'client.js' });
+      domSpec.factory(require);
+      const style = created[0];
+      check(
+        'the module injects its dialog stylesheet once, tagged for inspection',
+        created.length === 1 && style?.dataset?.plugin === '@jedeiah/session-purge' && style?.dataset?.pluginCss === '@jedeiah/session-purge/client.css',
+        JSON.stringify(created.map((tag) => tag.dataset)),
+      );
+      check(
+        'the stylesheet caps the card and scrolls the content region',
+        /\.sessionPurge-dialog \{[^}]*max-height: min\(800px, 100%\)/.test(style?.textContent ?? '') && /\.sessionPurge-dialog-content \{[^}]*overflow-y: auto/.test(style?.textContent ?? ''),
+        JSON.stringify(style?.textContent ?? null),
+      );
+    } catch (error) {
+      check('the module injects its dialog stylesheet once, tagged for inspection', false, String(error));
+    }
+  }
   const settingsEntry = entries.find((entry) => entry.options.name === 'plugins.row.config');
   check('contributes the row configuration page keyed <package>#<row id>', settingsEntry?.options.key === '@jedeiah/session-purge#session-purge', JSON.stringify(settingsEntry?.options));
   const card = settingsEntry?.component({ t: (key) => key, view: 'summary', form: undefined });

@@ -28,6 +28,10 @@
  * every argument at the wire boundary, so this copy stays a declaration rather
  * than a second opinion about what is valid. The smoke test asserts the
  * field-for-field agreement so the two cannot drift.
+ *
+ * The same constraint applies to the dialog's stylesheet: it is a `<style>`
+ * element this module adds to the document (see `DIALOG_STYLE`), not a CSS file,
+ * because the module table would never serve one.
  */
 
 window.__ModuleLoader__.load({
@@ -57,6 +61,58 @@ window.__ModuleLoader__.load({
     const MENU_SLOT = 'sidebar.workspaces.session.menu.item';
     /** Full-shell overlay slot: dialogs and toasts. */
     const OVERLAY_SLOT = 'shell.overlay';
+
+    /**
+     * The confirmation dialog's geometry.
+     *
+     * The Modal primitive sizes its card to its content and exposes two hooks for
+     * a consumer to change that: `className` on the card and `contentClassName` on
+     * the region its own docs call "a scrollable content region"
+     * (`@deepseek-ai/dsh-client-ui-primitives`, `lib/types/Modal.js`). This bundle
+     * is buildless — a second source file could not be loaded as a CSS module — so
+     * the rules travel as a `<style>` element, exactly how dsh's own client plugins
+     * ship theirs (`dsh-client-ui-plugin-manager` caps its install dialog at
+     * `width: min(560px, 100%); max-height: min(800px, 100%)`, `dsh-client-ui-schedule`
+     * scrolls its delete dialog through `contentClassName`).
+     *
+     * The preview is one line per session and grows with the subagent count, so
+     * without a cap the card walks off the top and bottom of the window:
+     *
+     *   - the card gets a fixed width and `max-height: min(800px, 100%)` — a fixed
+     *     ceiling that still measures against the mask's padding box, which is what
+     *     `Modal.module.css` asks consumers to do ("consumers cap growth with
+     *     `max-height: 100%`, never their own viewport calc"): that box already
+     *     carries the frame's overlay inset, a hard-coded `100dvh - 48px` would not;
+     *   - the footer is pinned, so the buttons cannot be squeezed out of the card;
+     *   - the content region scrolls, wraps unbroken session ids, and rebinds the
+     *     scrollbar to the l2 pair because a dialog is an elevated surface
+     *     (`dsh-client-ui-theme/README.md`, "scrollbar.css").
+     */
+    const DIALOG_CLASS = 'sessionPurge-dialog';
+    const DIALOG_CONTENT_CLASS = 'sessionPurge-dialog-content';
+    const DIALOG_STYLE_ID = `${BUNDLE_NAME}/client.css`;
+    const DIALOG_STYLE = `
+.${DIALOG_CLASS} { width: min(560px, 100%); max-height: min(800px, 100%); }
+.${DIALOG_CLASS} > :last-child { flex-shrink: 0; }
+.${DIALOG_CONTENT_CLASS} { min-height: 0; overflow-y: auto; overscroll-behavior: contain; overflow-wrap: anywhere; --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2); --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2); }
+`;
+
+    /**
+     * Add the dialog stylesheet to this document once. Idempotent by the
+     * `pluginCss` attribute, which is also how the styles are found in a page
+     * inspector; the document is absent in the smoke test's VM.
+     */
+    function ensureDialogStyles() {
+      if (typeof document === 'undefined') return;
+      if (document.querySelector(`style[data-plugin-css=${JSON.stringify(DIALOG_STYLE_ID)}]`) !== null) return;
+      const tag = document.createElement('style');
+      tag.dataset.plugin = BUNDLE_NAME;
+      tag.dataset.pluginCss = DIALOG_STYLE_ID;
+      tag.textContent = DIALOG_STYLE;
+      document.head.appendChild(tag);
+    }
+
+    ensureDialogStyles();
 
     /**
      * A strict result codec factory. `create` must be a *function* returning the
@@ -435,6 +491,8 @@ window.__ModuleLoader__.load({
         open: true,
         onClose: () => purge.dismiss(),
         closeLabel: t('close'),
+        className: DIALOG_CLASS,
+        contentClassName: DIALOG_CONTENT_CLASS,
         title: t('dialogTitle'),
         description: t('dialogBody'),
         footer: h(React.Fragment, null, [

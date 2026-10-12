@@ -80,7 +80,7 @@ dsh plugin --profile desktop add "<本仓库绝对路径>/session-purge"
 | `index.js` | 宿主半边：Config、`sessionPurge` Remote 服务、存活守卫、Workspace/Schedule/广播接线 |
 | `engine.js` | 纯 Node 的存储引擎：会话索引、血缘、计划、删除、附件引用减法（不依赖 Cordis，可单独跑） |
 | `typert.js` | 手写的 Typert Host manifest（构建产物通常由生成器产出，本插件零构建） |
-| `client.js` | 浏览器半边：行按钮、菜单行、确认框、Toast、Local Storage 清理（含内联的 Client manifest） |
+| `client.js` | 浏览器半边：行按钮、菜单行、确认框、Toast、Local Storage 清理（含内联的 Client manifest 与对话框几何样式） |
 | `selftest.mjs` | 自检：合成存储上的引擎测试 + 真实 Cordis/网关上的宿主回归 |
 | `cordis.patch.yml` | 插入本插件的行 |
 
@@ -97,9 +97,12 @@ Part A 在临时目录里造两份合成存储（真·多帧 Zstandard 日志与
 - `sessionPurge.inspect` / `purge` 经网关调用成功，子会话随父会话一起删除，保留会话与它引用的附件完好；
 - 活会话被拒绝（`session-purge/session-live`）且文件原封不动，转冷后再删成功。
 
-本次记录：**91 项检查全部通过**（Part A 引擎 31 + Part A2 spill 发现 3 + Part C 客户端半边 29 + Part B 真实网关与 Typert 注册表 28）。计数会随测试增加而变化，以 `node selftest.mjs` 的实际输出为准。
+本次记录：**94 项检查全部通过**（Part A 引擎 31 + Part A2 spill 发现 3 + Part C 客户端半边 32 + Part B 真实网关与 Typert 注册表 28）。计数会随测试增加而变化，以 `node selftest.mjs` 的实际输出为准。
 
 ## 实现注记（踩过的坑）
+
+- **对话框的尺寸是自己划的，量的是遮罩的 padding box。** 预览是「一个会话一行」，子 agent 一多就没有上界：Modal 原语的卡片按内容定尺寸，只有 `className`（卡片）和 `contentClassName`（它自己文档里那个「可滚动内容区」）两个钩子，所以本插件注入一张 `<style>`（`data-plugin-css="@jedeiah/session-purge/client.css"`，与 dsh 自家客户端插件同一手法），给卡片 `width: min(560px, 100%)` + `max-height: min(800px, 100%)`，把 footer 钉住、让内容区滚动。
+  两个数字都不是随手写的：`100%` 相对的是遮罩的内边距盒，**它已经含了标题栏的 overlay inset**（`Modal.module.css` 的注释明确要求消费方按这个盒子来封顶，「不要自己算 viewport」），硬写 `100dvh - 48px` 在带框架的窗口上会漏出去；宽度沿用上游内容最长的安装对话框（`dsh-client-ui-plugin-manager`）的 560px。实测：80 条目标的预览在 828px 高的窗口里原本是 3657px 高的卡片，按钮落在屏幕外——现在卡片封顶、内容区滚动、footer 始终可见。
 
 - **装饰器语法在运行时不存在。** `@Remote` 是 TC39 装饰器，官方包是编译产物（`__esDecorate` 辅助函数）。零构建插件必须手写原型描述符：
 
