@@ -430,13 +430,22 @@ window.__ModuleLoader__.load({
        * namespace — reading it from the plugin's own context throws
        * "cannot get property ... without inject".
        */
-      const call = async (method, sessionId) => {
+      const call = async (method, argument) => {
         const namespace = await namespaceOf();
-        const result = await namespace[method](sessionId);
+        const result = await namespace[method](argument);
         if (result?.ok !== true) throw result?.error ?? new Error('session-purge: the Remote call failed');
         return result.value;
       };
       return {
+        /**
+         * The residue sweep. Same envelope handling as every other call: the
+         * namespace answers `{ ok, value }`, so the page must never read the
+         * report off the raw answer.
+         * @param apply - whether the Host should delete what it reports.
+         */
+        residue(apply) {
+          return call('sweepResidue', apply === true);
+        },
         /** Open the dialog for one session and load its preview. */
         open(sessionId, displayTitle) {
           store.setRequest({ sessionId, displayTitle, phase: 'loading', inspection: null, error: null, busy: false });
@@ -621,7 +630,7 @@ window.__ModuleLoader__.load({
      * composition that never mounts the plugin shows no page at all.
      */
     function PurgeSettingsCard(props) {
-      const { t, view, form, service } = props;
+      const { t, view, form, purge } = props;
       // The draft lives above every early return: a hook after a conditional
       // return would change the hook order between renders.
       const [draft, setDraft] = React.useState(null);
@@ -632,13 +641,13 @@ window.__ModuleLoader__.load({
       const [residueBusy, setResidueBusy] = React.useState(false);
       const [residueError, setResidueError] = React.useState(null);
       const runResidue = (apply) => {
-        if (typeof service?.sweepResidue !== 'function') {
+        if (typeof purge?.residue !== 'function') {
           setResidueError(t('residueUnavailable'));
           return;
         }
         setResidueBusy(true);
         setResidueError(null);
-        Promise.resolve(service.sweepResidue(apply))
+        Promise.resolve(purge.residue(apply))
           .then((report) => { setResidue(report); setResidueBusy(false); })
           .catch((error) => { setResidueError(String(error?.message ?? error)); setResidueBusy(false); });
       };
@@ -798,7 +807,7 @@ window.__ModuleLoader__.load({
               name: 'plugins.row.config',
               key: `${BUNDLE_NAME}#${ROW_ID}`,
               locale: LOCALE_NS,
-              inject: () => ({ service: child.get('remote.sessionPurge') }),
+              inject: () => ({ purge }),
           }, PurgeSettingsCard))), 'session-purge: settings page'));
           }
 

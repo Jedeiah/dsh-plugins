@@ -860,6 +860,12 @@ async function testClientHalf(app) {
     mounted[0].descriptors.length === 3
     && ['inspect', 'purge', 'sweepResidue'].every((method) => mounted[0].descriptors.some((descriptor) => descriptor.method === method)),
     JSON.stringify(mounted[0].descriptors.map((descriptor) => `${descriptor.namespace}/${descriptor.method}`)));
+  // The namespace answers `{ ok, value }`. Reading the report off the raw answer
+  // is the classic silent break — the page would show `undefined` and look empty —
+  // so the residue call must go through the same helper every other call uses.
+  check('the residue call routes through the envelope-unwrapping helper',
+    /residue\(apply\) \{\s*return call\('sweepResidue', apply === true\);/.test(source));
+
   // Mirrors the Client API's own admission checks: every declared field must carry
   // `mode: 'strict'`, a type symbol and a `create()` factory, or the namespace
   // mounts nothing and every call fails at runtime.
