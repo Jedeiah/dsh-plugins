@@ -156,6 +156,24 @@ window.__ModuleLoader__.load({
       };
     }
 
+    /**
+     * The Client mirror of `typert.js`'s run-id codec. Same shape rule as
+     * {@link sessionIdCodec}.
+     * @returns the codec.
+     */
+    function runIdCodec() {
+      return {
+        mode: 'strict',
+        typeSymbol: `${BUNDLE_NAME}#RunId`,
+        create: () => ({
+          parse(value) {
+            if (typeof value !== 'string' || value.length === 0) throw new Error('session-purge: runId must be a non-empty string');
+            return value;
+          },
+        }),
+      };
+    }
+
     /** Hand-written Client manifest, mirroring `typert.js`. */
     const TYPERT_REMOTE = {
       package: BUNDLE_NAME,
@@ -190,6 +208,24 @@ window.__ModuleLoader__.load({
           cancellation: { parameter: 'signal' },
           result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurgeResidue`, create: passthroughCodec },
         },
+        {
+          id: `${BUNDLE_NAME}#sessionPurge/pending`,
+          service: 'sessionPurge',
+          namespace: 'sessionPurge',
+          method: 'pending',
+          invocation: { kind: 'direct' },
+          parameters: [],
+          result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurgePending`, create: passthroughCodec },
+        },
+        ...['cancelPending', 'retryPending'].map((method) => ({
+          id: `${BUNDLE_NAME}#sessionPurge/${method}`,
+          service: 'sessionPurge',
+          namespace: 'sessionPurge',
+          method,
+          invocation: { kind: 'direct' },
+          parameters: [{ name: 'runId', wire: 'runId', source: 'json', codec: runIdCodec() }],
+          result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurge${method[0].toUpperCase()}${method.slice(1)}Result`, create: passthroughCodec },
+        })),
       ],
     };
 
@@ -256,8 +292,22 @@ window.__ModuleLoader__.load({
       statsAttachments: '清理无引用附件',
       attachmentsOn: '是（会扫描其余会话的引用）',
       attachmentsOff: '否（附件对象保留）',
-      liveWarning: '该会话仍驻留在当前进程里（本 App 运行期间打开过）。请先重启 App，再删除；现在删除会留下活着的写入方和可能重建的缓存记录。',
-      liveTargets: '仍在驻留：',
+      deferWarning: '下面这些会话正在使用中，没法立刻删除。确认后会先停止它们（正在跑的任务会被中断、它们的活跃提醒会被删除）并归档，内容在下次启动 dsh 时删除；在那之前可以到插件设置页取消。',
+      liveTargets: '正在使用：',
+      confirmDefer: '停止并在重启后删除',
+      alreadyPending: '这个会话已经在等待删除了，可以到插件设置页「待完成的删除」里立即重试或取消。',
+      toastDeferred: '已停止并归档 {count} 个会话，将在下次启动 dsh 时删除；可在插件设置页取消',
+      pendingTitle: '待完成的删除',
+      pendingHint: '这些会话在删除时还在使用中：已经停止并归档，等它们不再被占用（通常是下次启动 dsh）就会自动删除。取消会恢复归档与置顶，并尽量重建被停掉的提醒（重建的提醒是新的，投递历史不在了）。',
+      pendingEmpty: '没有等待中的删除。',
+      pendingInUse: '仍在使用中',
+      pendingWaiting: '等待中',
+      pendingStuck: '已卡住：{error}',
+      pendingRetry: '立即重试',
+      pendingCancel: '取消删除',
+      pendingDone: '已完成删除。',
+      pendingCancelled: '已取消；重建提醒 {recreated} 条，未能重建 {failed} 条。',
+      pendingFailed: '操作失败：{message}',
       confirm: '删除',
       confirmPending: '正在删除…',
       cancel: '取消',
@@ -312,8 +362,22 @@ window.__ModuleLoader__.load({
       statsAttachments: 'Purge unreferenced attachments',
       attachmentsOn: 'yes (scans the surviving sessions first)',
       attachmentsOff: 'no (attachment objects are kept)',
-      liveWarning: 'This session is still resident in the running app. Restart the app and delete it then; deleting now would leave a live writer behind the removed log and could rebuild its cached record.',
-      liveTargets: 'Still resident:',
+      deferWarning: 'These sessions are in use and cannot be deleted right away. Confirming stops them first (running work is interrupted and their active reminders are deleted) and archives them; their content is deleted the next time dsh starts. Until then you can cancel from the plugin settings page.',
+      liveTargets: 'In use:',
+      confirmDefer: 'Stop and delete on restart',
+      alreadyPending: 'This session is already waiting to be deleted; retry or cancel it under "Pending deletions" on the plugin settings page.',
+      toastDeferred: 'Stopped and archived {count} session(s); they will be deleted the next time dsh starts. You can cancel from the plugin settings page',
+      pendingTitle: 'Pending deletions',
+      pendingHint: 'These sessions were in use when you deleted them: they are stopped and archived, and are deleted automatically once nothing holds them (usually the next time dsh starts). Cancelling restores archive and pin state and rebuilds the stopped reminders where it can (rebuilt reminders are new; their delivery history is gone).',
+      pendingEmpty: 'No deletions are waiting.',
+      pendingInUse: 'still in use',
+      pendingWaiting: 'waiting',
+      pendingStuck: 'stuck: {error}',
+      pendingRetry: 'Retry now',
+      pendingCancel: 'Cancel deletion',
+      pendingDone: 'Deleted.',
+      pendingCancelled: 'Cancelled; rebuilt {recreated} reminder(s), {failed} could not be rebuilt.',
+      pendingFailed: 'That did not work: {message}',
       confirm: 'Delete',
       confirmPending: 'Deleting…',
       cancel: 'Cancel',
@@ -451,6 +515,18 @@ window.__ModuleLoader__.load({
         residue(apply) {
           return call('sweepResidue', apply === true);
         },
+        /** The deferred deletes still waiting. */
+        pending() {
+          return call('pending');
+        },
+        /** Cancel one deferred delete. */
+        cancelPending(runId) {
+          return call('cancelPending', runId);
+        },
+        /** Try one deferred delete now. */
+        retryPending(runId) {
+          return call('retryPending', runId);
+        },
         /** Open the dialog for one session and load its preview. */
         open(sessionId, displayTitle) {
           store.setRequest({ sessionId, displayTitle, phase: 'loading', inspection: null, error: null, busy: false });
@@ -484,8 +560,15 @@ window.__ModuleLoader__.load({
           store.setRequest({ ...current, busy: true, error: null });
           try {
             const report = await call('purge', current.sessionId);
-            clearBrowserState(report?.removedIds ?? report?.targets ?? [current.sessionId]);
+            // A deferred delete is still a delete the operator confirmed: the
+            // browser-local state goes now, and the shell must not reopen the
+            // session on the next start.
+            clearBrowserState(report?.deferred === true ? (report.pendingIds ?? []) : (report?.removedIds ?? report?.targets ?? [current.sessionId]));
             store.setRequest(null);
+            if (report?.deferred === true) {
+              store.setToast({ kind: 'deferred', tone: 'success', holdMs: ERROR_TOAST_HOLD_MS, count: report.pendingIds?.length ?? 1 });
+              return;
+            }
             store.setToast({
               kind: 'deleted',
               tone: 'success',
@@ -558,6 +641,7 @@ window.__ModuleLoader__.load({
       if (request === null) return null;
       const inspection = request.inspection;
       const blocked = inspection?.blocked ?? null;
+      const alreadyPending = typeof inspection?.pendingRunId === 'string';
       const rows = inspection === null ? [] : [
         h('li', { key: 'sessions' }, `${t('statsSessions')}: ${String(inspection.targets.length)}`),
         h('li', { key: 'size' }, `${t('statsSize')}: ${formatBytes(inspection.sizeBytes)}`),
@@ -577,17 +661,18 @@ window.__ModuleLoader__.load({
           h(primitives.Button, {
             key: 'confirm',
             variant: 'outline',
-            disabled: request.busy || request.phase !== 'ready' || blocked !== null,
+            disabled: request.busy || request.phase !== 'ready' || alreadyPending,
             onClick: () => {
               void purge.submit();
             },
-            style: blocked === null ? DESTRUCTIVE_STYLE : undefined,
-            children: request.busy ? t('confirmPending') : t('confirm'),
+            style: DESTRUCTIVE_STYLE,
+            children: request.busy ? t('confirmPending') : blocked === null ? t('confirm') : t('confirmDefer'),
           }),
         ]),
         children: [
+          alreadyPending ? h('div', { key: 'already', role: 'status', style: { lineHeight: 1.6, marginBottom: 8 } }, t('alreadyPending')) : null,
           blocked === null ? null : h('div', { key: 'live', role: 'alert', style: { color: 'var(--dsw-alias-state-warn-primary)', lineHeight: 1.6 } }, [
-            t('liveWarning'),
+            t('deferWarning'),
             h('br'),
             `${t('liveTargets')} ${blocked.sessionIds.join(', ')}`,
           ]),
@@ -615,7 +700,9 @@ window.__ModuleLoader__.load({
       if (toast === null) return null;
       const text = toast.kind === 'failed'
         ? t('toastFailed', { message: toast.message })
-        : `${t('toastDeleted', { count: toast.count, size: toast.size })}${toast.partial > 0 ? t('toastPartial', { count: toast.partial }) : ''}${toast.warnings > 0 ? t('toastWarned', { count: toast.warnings }) : ''}`;
+        : toast.kind === 'deferred'
+          ? t('toastDeferred', { count: toast.count })
+          : `${t('toastDeleted', { count: toast.count, size: toast.size })}${toast.partial > 0 ? t('toastPartial', { count: toast.partial }) : ''}${toast.warnings > 0 ? t('toastWarned', { count: toast.warnings }) : ''}`;
       return h(primitives.Toast, {
         text,
         tone: toast.tone,
@@ -655,6 +742,51 @@ window.__ModuleLoader__.load({
         Promise.resolve(purge.residue(apply))
           .then((report) => { setResidue(report); setResidueBusy(false); })
           .catch((error) => { setResidueError(String(error?.message ?? error)); setResidueBusy(false); });
+      };
+      // Deferred deletes. Every Host read is guarded: a Host without the method
+      // (version mismatch) throws synchronously inside the namespace call, and an
+      // uncaught throw here blanks the whole page — it must cost this section only.
+      const [pendingRuns, setPendingRuns] = React.useState(null);
+      const [pendingBusy, setPendingBusy] = React.useState(null);
+      const [pendingNote, setPendingNote] = React.useState(null);
+      const guarded = (operation) => {
+        try {
+          return Promise.resolve(operation());
+        } catch (error) {
+          return Promise.reject(error);
+        }
+      };
+      const loadPending = () => {
+        if (typeof purge?.pending !== 'function') {
+          setPendingRuns([]);
+          return;
+        }
+        guarded(() => purge.pending()).then(
+          (answer) => setPendingRuns(Array.isArray(answer?.runs) ? answer.runs : []),
+          () => setPendingRuns([]),
+        );
+      };
+      React.useEffect(() => {
+        if (view !== 'summary') loadPending();
+      }, [view]);
+      const actOnPending = (runId, action) => {
+        const method = action === 'cancel' ? purge?.cancelPending : purge?.retryPending;
+        if (typeof method !== 'function') return;
+        setPendingBusy(runId);
+        setPendingNote(null);
+        guarded(() => method(runId)).then(
+          (answer) => {
+            setPendingBusy(null);
+            if (action === 'cancel') setPendingNote(t('pendingCancelled', { recreated: answer?.reminders?.recreated ?? 0, failed: answer?.reminders?.failed?.length ?? 0 }));
+            else if (answer?.status === 'done') setPendingNote(t('pendingDone'));
+            loadPending();
+          },
+          (error) => {
+            setPendingBusy(null);
+            setPendingNote(t('pendingFailed', { message: String(error?.message ?? error) }));
+            loadPending();
+          },
+        );
       };
       if (view === 'summary') return t('settingsSummary');
       const state = form?.state;
@@ -763,6 +895,23 @@ window.__ModuleLoader__.load({
           residueError !== null
             ? h('div', { key: 'error', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, marginTop: 8 } }, residueError)
             : null,
+        ]),
+        h('div', { key: 'pending', style: { marginTop: 18, paddingTop: 12, borderTop: '1px solid var(--dsw-alias-border-l1)' } }, [
+          h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, t('pendingTitle')),
+          h('div', { key: 'hint', style: { opacity: 0.7, fontSize: 12, lineHeight: 1.5, marginBottom: 8 } }, t('pendingHint')),
+          pendingRuns === null
+            ? null
+            : pendingRuns.length === 0
+              ? h('div', { key: 'empty', style: { fontSize: 12, opacity: 0.7 } }, t('pendingEmpty'))
+              : h('ul', { key: 'runs', style: { margin: 0, paddingLeft: 18, fontSize: 12, lineHeight: 1.6 } }, pendingRuns.map((run) => h('li', { key: run.runId, style: { marginBottom: 8 } }, [
+                h('div', { key: 'names', style: { wordBreak: 'break-all' } }, run.targets.map((target) => (target.title === '' ? target.sessionId : target.title)).join(', ')),
+                h('div', { key: 'state', style: { opacity: 0.7 } }, run.state === 'STUCK' ? t('pendingStuck', { error: String(run.lastError ?? '') }) : run.inUse ? t('pendingInUse') : t('pendingWaiting')),
+                h('div', { key: 'actions', style: { display: 'flex', gap: 8, marginTop: 4 } }, [
+                  h(primitives.Button, { key: 'retry', variant: 'outline', disabled: pendingBusy !== null, onClick: () => actOnPending(run.runId, 'retry') }, t('pendingRetry')),
+                  h(primitives.Button, { key: 'cancel', variant: 'outline', disabled: pendingBusy !== null, onClick: () => actOnPending(run.runId, 'cancel') }, t('pendingCancel')),
+                ]),
+              ]))),
+          pendingNote === null ? null : h('div', { key: 'note', role: 'status', style: { fontSize: 12, marginTop: 8 } }, pendingNote),
         ]),
         saveFailed ? h('div', { key: 'save-failed', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12 } }, t('settingsSaveFailed')) : null,
       ]);

@@ -28,6 +28,7 @@ import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import {
   discoverSpillRoots,
+  indexStoredSessions,
   throwIfAborted,
   planPurge,
   readCachedTitle,
@@ -54,6 +55,18 @@ const RESIDUE_MIN_AGE_MS = 60_000;
 
 /** How long a finished run's manifest — and its tombstones — are kept (DESIGN.md §10.2). */
 const RETAIN_MANIFEST_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** After this many failed attempts a deferred delete stops retrying on its own (DESIGN.md §5.3). */
+const MAX_DEFERRED_ATTEMPTS = 3;
+
+/** How long to wait after an agent disposal before trying a deferred delete: its write handle drains first. */
+const DEFERRED_SETTLE_MS = 300;
+
+/** Retries of a deferred delete that found its session still owned, right after a disposal. */
+const DEFERRED_RETRIES = 10;
+
+/** A run id as `txn.newRunId()` mints it. */
+const RUN_ID_PATTERN = /^[0-9a-z]{1,16}-[0-9a-f]{12}$/;
 
 /** The projection checkpoint domain and table (`dsh-session-projection-cache:90`, `:100`). */
 const CHECKPOINT_DOMAIN = 'session_projcache';
@@ -199,8 +212,20 @@ class SessionPurgeService extends TypertRemoteService {
     this.tombstones = new Map();
     /** Logged once: the lease addon is missing, so the mutex and root probe are off. */
     this.warnedNoFlock = false;
+    /** Session ids a deferred delete is waiting on; an agent disposal for one of them wakes it. */
+    this.pendingIds = new Set();
+    /** Pending deferred-delete timers, cleared when the row unmounts. */
+    this.timers = new Set();
 
     this.ctx.on('domain/changed', (change) => this.onDomainChanged(change));
+    this.ctx.on('agent/disposed', (payload) => {
+      const id = payload?.agent?.id ?? payload?.agent?.session?.id;
+      if (typeof id === 'string' && this.pendingIds.has(id)) this.scheduleDeferred(DEFERRED_SETTLE_MS, DEFERRED_RETRIES);
+    });
+    this.ctx.effect(() => () => {
+      for (const timer of this.timers) clearTimeout(timer);
+      this.timers.clear();
+    }, 'session-purge: deferred timers');
     const delay = readConfigValue(this.config.recoveryDelayMs, 1500);
     if (typeof delay === 'number' && delay >= 0) {
       this.ctx.effect(() => {
@@ -272,10 +297,12 @@ class SessionPurgeService extends TypertRemoteService {
     }
     const live = plan.targetIds.filter((id) => this.isLive(id));
     const schedules = await this.scheduleTasks(plan.targetIds);
+    const pendingRun = await this.pendingCovering(plan.targetIds);
     this.previewed.set(sessionId, { ids: [...plan.targetIds], liveIds: [...live], at: Date.now() });
     return {
       sessionId,
       root,
+      pendingRunId: pendingRun?.runId ?? null,
       live: this.isLive(sessionId),
       forkIds: plan.forkIds,
       logBytes: plan.logBytes,
@@ -332,9 +359,6 @@ class SessionPurgeService extends TypertRemoteService {
       if (plan === undefined) {
         throw new RemoteError('session-purge/session-unknown', `no stored session "${sessionId}" exists under the configured session root`, { sessionId, root });
       }
-      const live = plan.targetIds.filter((id) => this.isLive(id));
-      if (live.length > 0) throw liveError(live);
-
       // The preview is the contract with the operator: if the set grew since the
       // dialog rendered (a child was created), stop and make them look again.
       if (previewed !== undefined) {
@@ -350,7 +374,32 @@ class SessionPurgeService extends TypertRemoteService {
           );
         }
       }
-      return this.runImmediate({ staging, plan, settings, signal });
+
+      // A delete already waiting for these sessions is not started twice.
+      const pendingRun = await this.pendingCovering(plan.targetIds, staging);
+      if (pendingRun !== undefined) {
+        throw new RemoteError('session-purge/already-pending', `a deletion of these sessions is already waiting (run "${pendingRun.runId}"); retry or cancel it from the plugin settings page`, { runId: pendingRun.runId });
+      }
+
+      // A live target defers the delete — but only when the operator saw that in
+      // the dialog. A session that came to life after a "cold" preview is not
+      // something they agreed to stop.
+      const consented = (previewed?.liveIds ?? []).length > 0;
+      const refuseLive = (ids) => {
+        throw previewed === undefined ? liveError(ids) : becameLiveError(ids);
+      };
+      const live = plan.targetIds.filter((id) => this.isLive(id));
+      if (live.length > 0) {
+        if (!consented) refuseLive(live);
+        return this.runDeferred({ staging, plan, settings });
+      }
+      try {
+        return await this.runImmediate({ staging, plan, settings, signal });
+      } catch (error) {
+        if (error?.code !== 'session-purge/session-live') throw error;
+        if (!consented) refuseLive(error.details?.sessionIds ?? []);
+        return this.runDeferred({ staging, plan, settings });
+      }
     });
   }
 
@@ -379,9 +428,13 @@ class SessionPurgeService extends TypertRemoteService {
    * @param params.plan - the purge plan.
    * @param params.settings - the settings snapshot.
    * @param params.signal - cancels up to the commit.
+   * @param params.resumeFrom - a deferred run being completed: its run id, path
+   *   and creation time carry over.
+   * @param params.vanished - ids of a deferred run whose directories are already
+   *   gone; their domains are still cleared.
    * @returns the report.
    */
-  async runImmediate({ staging, plan, settings, signal }) {
+  async runImmediate({ staging, plan, settings, signal, resumeFrom, vanished = [] }) {
     const warnings = [];
     const removed = emptyCounters();
     const records = plan.targets.flatMap((target) => [target, ...target.duplicates].map((record, index) => ({ target, record, primary: index === 0 })));
@@ -405,7 +458,7 @@ class SessionPurgeService extends TypertRemoteService {
       // The last cancellation point: past here the purge only moves forward.
       throwIfAborted(signal);
 
-      const runId = txn.newRunId();
+      const runId = resumeFrom?.runId ?? txn.newRunId();
       const entries = [];
       for (const { target, record, primary } of records) {
         const linked = record.linked === true;
@@ -425,11 +478,11 @@ class SessionPurgeService extends TypertRemoteService {
       manifest = {
         version: txn.MANIFEST_VERSION,
         runId,
-        path: 'immediate',
+        path: resumeFrom?.path ?? 'immediate',
         state: 'FENCED',
-        createdAt: new Date().toISOString(),
+        createdAt: resumeFrom?.createdAt ?? new Date().toISOString(),
         completedAt: null,
-        attempts: 0,
+        attempts: resumeFrom?.attempts ?? 0,
         lastError: null,
         settings: {
           removeEmptyProjectDirectory: settings.removeEmptyProjectDirectory,
@@ -437,14 +490,23 @@ class SessionPurgeService extends TypertRemoteService {
           purgeSpill: settings.purgeSpill,
           spillRoots: settings.spillRoots,
         },
-        targets: plan.targets.map((target) => ({
-          id: target.id,
-          state: 'FENCED',
-          sizeBytes: target.sizeBytes,
-          checkpoint: fence.tombstones.get(target.id) ?? tombstoneOf(target.header),
-        })),
+        targets: [
+          ...plan.targets.map((target) => ({
+            id: target.id,
+            state: 'FENCED',
+            sizeBytes: target.sizeBytes,
+            checkpoint: fence.tombstones.get(target.id) ?? tombstoneOf(target.header),
+          })),
+          ...vanished.map((id) => ({
+            id,
+            state: 'COMMITTED',
+            vanished: true,
+            sizeBytes: 0,
+            checkpoint: resumeFrom?.targets?.find((target) => target.id === id)?.checkpoint ?? null,
+          })),
+        ],
         entries,
-        steps: { fence: 'done', commit: 'pending', workspace: 'pending', cache: 'pending', schedules: 'pending', spill: 'pending', cleanup: 'pending', verify: 'pending' },
+        steps: { ...(resumeFrom === undefined ? {} : { quiesce: resumeFrom.steps?.quiesce ?? 'done' }), fence: 'done', commit: 'pending', workspace: 'pending', cache: 'pending', schedules: 'pending', spill: 'pending', cleanup: 'pending', verify: 'pending' },
         outcome: null,
         unverified: [],
       };
@@ -494,6 +556,347 @@ class SessionPurgeService extends TypertRemoteService {
     removed.sessionDirectories = manifest.entries.filter((entry) => entry.state === 'COMMITTED').length;
     await this.completeCommitted({ staging, manifest, digests, warnings, removed });
     return this.reportOf(plan.sessionId, plan, manifest, removed, warnings);
+  }
+
+  /**
+   * The deferred path (DESIGN.md §5.3): record the intent, stop and archive the
+   * live targets, and finish when they are cold — on an agent disposal or at the
+   * next start. The operator saw and confirmed this in the dialog.
+   * @param params.staging - the staging root.
+   * @param params.plan - the purge plan.
+   * @param params.settings - the settings snapshot.
+   * @returns the report.
+   */
+  async runDeferred({ staging, plan, settings }) {
+    const warnings = [];
+    const registry = this.ctx.get('workspaceRegistry');
+    const archived = new Set(Array.isArray(registry?.archivedSessionIds) ? registry.archivedSessionIds : []);
+    const pinned = new Set(Array.isArray(registry?.pinnedSessionIds) ? registry.pinnedSessionIds : []);
+    // Snapshot before stopping: the stop deletes every active reminder.
+    const reminders = await this.scheduleTasks(plan.targetIds);
+    const manifest = {
+      version: txn.MANIFEST_VERSION,
+      runId: txn.newRunId(),
+      path: 'deferred',
+      state: 'PENDING',
+      createdAt: new Date().toISOString(),
+      completedAt: null,
+      attempts: 0,
+      lastError: null,
+      lastAttemptAt: null,
+      settings: {
+        removeEmptyProjectDirectory: settings.removeEmptyProjectDirectory,
+        purgeSchedules: settings.purgeSchedules,
+        purgeSpill: settings.purgeSpill,
+        spillRoots: settings.spillRoots,
+      },
+      targets: await Promise.all(plan.targets.map(async (target) => ({
+        id: target.id,
+        state: 'PENDING',
+        sizeBytes: target.sizeBytes,
+        // Kept only while the delete is pending, for the settings page; stripped
+        // when the run completes.
+        title: await this.titleOf(target),
+        checkpoint: tombstoneOf(target.header),
+        prior: {
+          archived: archived.has(target.id),
+          pinned: pinned.has(target.id),
+          reminders: reminders.filter((row) => row.sessionId === target.id && row.status === 'active').map(reminderSnapshot),
+        },
+      }))),
+      entries: [],
+      steps: { quiesce: 'pending', fence: 'pending', commit: 'pending', workspace: 'pending', cache: 'pending', schedules: 'pending', spill: 'pending', cleanup: 'pending', verify: 'pending' },
+      outcome: null,
+      unverified: [],
+    };
+    await txn.writeManifest(staging, manifest);
+    manifest.steps.quiesce = await this.quiesce(manifest.targets, warnings);
+    await txn.writeManifest(staging, manifest);
+    for (const id of plan.targetIds) this.pendingIds.add(id);
+    return {
+      sessionId: plan.sessionId,
+      runId: manifest.runId,
+      path: 'deferred',
+      deferred: true,
+      pendingIds: [...plan.targetIds],
+      targets: plan.targetIds,
+      removedIds: [],
+      failedIds: [],
+      forkIds: plan.forkIds,
+      removed: emptyCounters(),
+      outcome: null,
+      unverified: [],
+      warnings,
+    };
+  }
+
+  /**
+   * Stop the targets' work and block their wakes: archive with `stopActivity`
+   * (the archive set is what a provider's `agent/pre-step` gate reads,
+   * `dsh-workspace:512-524`); an already archived id is not stopped by
+   * `archiveSession` (`:528`), so it gets the stop request directly.
+   * @param targets - the manifest targets (with `prior`).
+   * @param warnings - the warning sink.
+   * @returns the step state: `'done'`, or `'stop-only'` without a registry.
+   */
+  async quiesce(targets, warnings) {
+    const registry = this.ctx.get('workspaceRegistry');
+    for (const target of targets) {
+      try {
+        if (registry !== undefined && typeof registry.archiveSession === 'function' && target.prior?.archived !== true) {
+          await registry.archiveSession(target.id, { stopActivity: true });
+        } else {
+          await this.ctx.parallel('workspace/session-stop', { sessionId: target.id });
+        }
+      } catch (error) {
+        warnings.push(`could not stop "${target.id}": ${String(error?.message ?? error)}`);
+      }
+    }
+    return registry === undefined || typeof registry.archiveSession !== 'function' ? 'stop-only' : 'done';
+  }
+
+  /**
+   * Try to finish one deferred delete. Must run under the mutex.
+   * @param staging - the staging root.
+   * @param manifest - the deferred run's manifest.
+   * @returns `{ status: 'done' | 'in-use' | 'failed' | 'stuck', report?, error? }`.
+   */
+  async attemptDeferred(staging, manifest) {
+    if (manifest.state !== 'PENDING') return { status: String(manifest.state).toLowerCase() };
+    const warnings = [];
+    if (manifest.steps?.quiesce === 'pending') manifest.steps.quiesce = await this.quiesce(manifest.targets, warnings);
+    manifest.lastAttemptAt = new Date().toISOString();
+    const ids = manifest.targets.map((target) => target.id);
+    if (ids.some((id) => this.isLive(id))) {
+      await txn.writeManifest(staging, manifest);
+      return { status: 'in-use' };
+    }
+    const index = await indexStoredSessions(this.sessionsRoot());
+    const present = ids.map((id) => index.get(id)).filter((record) => record !== undefined);
+    const plan = { sessionId: ids[0], targets: present, targetIds: present.map((record) => record.id), forkIds: [], index };
+    try {
+      const report = await this.runImmediate({
+        staging,
+        plan,
+        settings: { ...manifest.settings, purgeAttachments: false },
+        resumeFrom: manifest,
+        vanished: ids.filter((id) => !index.has(id)),
+      });
+      for (const id of ids) this.pendingIds.delete(id);
+      for (const warning of warnings) report.warnings.push(warning);
+      return { status: 'done', report };
+    } catch (error) {
+      // If the completion got as far as its own manifest, the run belongs to
+      // recovery now: never write the pending manifest back over it.
+      const current = await txn.readManifest(txn.runDirectory(staging, manifest.runId));
+      if (current !== undefined && current.state !== 'PENDING' && current.state !== 'STUCK') {
+        this.warn(`deferred delete ${manifest.runId} stopped after its fence: ${String(error?.message ?? error)}; recovery finishes it`);
+        return { status: 'failed', error: String(error?.message ?? error) };
+      }
+      if (error?.code === 'session-purge/session-live') {
+        await txn.writeManifest(staging, manifest);
+        return { status: 'in-use' };
+      }
+      manifest.attempts = (manifest.attempts ?? 0) + 1;
+      manifest.lastError = String(error?.message ?? error);
+      if (manifest.attempts >= MAX_DEFERRED_ATTEMPTS) manifest.state = 'STUCK';
+      await txn.writeManifest(staging, manifest);
+      this.warn(`deferred delete ${manifest.runId} failed (attempt ${String(manifest.attempts)}): ${manifest.lastError}`);
+      return { status: manifest.state === 'STUCK' ? 'stuck' : 'failed', error: manifest.lastError };
+    }
+  }
+
+  /**
+   * Try every pending deferred delete soon, retrying while a session is still
+   * owned — a disposal releases its write handle only after the final drain.
+   * @param delayMs - when to try.
+   * @param retries - how many more tries an `in-use` answer earns.
+   */
+  scheduleDeferred(delayMs, retries) {
+    const timer = setTimeout(() => {
+      this.timers.delete(timer);
+      this.processDeferred()
+        .then((statuses) => {
+          if (retries > 0 && statuses.includes('in-use')) this.scheduleDeferred(delayMs * 2, retries - 1);
+        })
+        .catch((error) => this.warn(`deferred deletes could not run: ${String(error?.message ?? error)}`));
+    }, delayMs);
+    timer.unref?.();
+    this.timers.add(timer);
+  }
+
+  /**
+   * One pass over the pending deferred deletes.
+   * @returns the attempt statuses.
+   */
+  async processDeferred() {
+    let staging;
+    try {
+      staging = await txn.stagingRootFor(this.sessionsRoot());
+      await stat(staging);
+    } catch {
+      return [];
+    }
+    return this.exclusive(staging, async () => {
+      const statuses = [];
+      for (const run of await txn.listRuns(staging)) {
+        if (run.manifest?.outcome !== null || run.manifest?.state !== 'PENDING') continue;
+        statuses.push((await this.attemptDeferred(staging, run.manifest)).status);
+      }
+      return statuses;
+    });
+  }
+
+  /**
+   * The deferred deletes still waiting, for the settings page.
+   * @returns `{ runs }`, one entry per pending or stuck run.
+   */
+  async pending() {
+    let staging;
+    try {
+      staging = await txn.stagingRootFor(this.sessionsRoot());
+    } catch {
+      return { runs: [] };
+    }
+    const runs = [];
+    for (const run of await txn.listRuns(staging)) {
+      const manifest = run.manifest;
+      if (manifest === undefined || manifest.outcome !== null || (manifest.state !== 'PENDING' && manifest.state !== 'STUCK')) continue;
+      runs.push({
+        runId: manifest.runId,
+        state: manifest.state,
+        createdAt: manifest.createdAt,
+        lastAttemptAt: manifest.lastAttemptAt ?? null,
+        attempts: manifest.attempts ?? 0,
+        lastError: manifest.lastError ?? null,
+        inUse: manifest.targets.some((target) => this.isLive(target.id)),
+        targets: manifest.targets.map((target) => ({ sessionId: target.id, title: typeof target.title === 'string' ? target.title : '' })),
+      });
+    }
+    return { runs };
+  }
+
+  /**
+   * Cancel a deferred delete that has not committed: unarchive and re-pin what
+   * it changed, rebuild the reminders the stop deleted, and read it all back.
+   * @param runId - the run to cancel.
+   * @returns what was restored, and what could not be.
+   */
+  async cancelPending(runId) {
+    const { staging, manifest } = await this.pendingRun(runId);
+    return this.exclusive(staging, async () => {
+      const current = await txn.readManifest(txn.runDirectory(staging, runId));
+      if (current === undefined || current.outcome !== null || (current.state !== 'PENDING' && current.state !== 'STUCK')) {
+        throw new RemoteError('session-purge/not-pending', `run "${runId}" is no longer waiting; it cannot be cancelled`, { runId, state: current?.state ?? manifest.state });
+      }
+      const registry = this.ctx.get('workspaceRegistry');
+      const schedule = this.ctx.get('schedule');
+      const report = { runId, restored: [], reminders: { recreated: 0, failed: [] }, drift: [], warnings: [] };
+      for (const target of current.targets) {
+        const prior = target.prior ?? {};
+        try {
+          if (prior.archived !== true && typeof registry?.unarchiveSession === 'function') await registry.unarchiveSession(target.id);
+          // Pinning an archived id throws (`dsh-workspace:581`), so this follows the unarchive.
+          if (prior.pinned === true && typeof registry?.pinSession === 'function') await registry.pinSession(target.id);
+          report.restored.push(target.id);
+        } catch (error) {
+          report.warnings.push(`could not restore "${target.id}": ${String(error?.message ?? error)}`);
+        }
+        for (const snapshot of prior.reminders ?? []) {
+          const request = reminderRequest(snapshot);
+          if (request === undefined || typeof schedule?.create !== 'function') {
+            report.reminders.failed.push({ sessionId: target.id, title: String(snapshot.title ?? ''), reason: request === undefined ? 'cannot-recreate' : 'schedule-unavailable' });
+            continue;
+          }
+          try {
+            await schedule.create(target.id, request);
+            report.reminders.recreated += 1;
+          } catch (error) {
+            report.reminders.failed.push({ sessionId: target.id, title: String(snapshot.title ?? ''), reason: String(error?.message ?? error) });
+          }
+        }
+      }
+      // No CAS on the registry: read back and report what does not match.
+      const archived = Array.isArray(registry?.archivedSessionIds) ? registry.archivedSessionIds : undefined;
+      const pinned = Array.isArray(registry?.pinnedSessionIds) ? registry.pinnedSessionIds : undefined;
+      for (const target of current.targets) {
+        const prior = target.prior ?? {};
+        if (archived !== undefined && archived.includes(target.id) !== (prior.archived === true)) report.drift.push({ sessionId: target.id, field: 'archived' });
+        if (pinned !== undefined && pinned.includes(target.id) !== (prior.pinned === true)) report.drift.push({ sessionId: target.id, field: 'pinned' });
+        this.pendingIds.delete(target.id);
+      }
+      await txn.removeRun(staging, runId);
+      try {
+        await txn.appendAudit(staging, { runId, path: 'deferred', outcome: 'cancelled', targets: current.targets.map((target) => ({ id: target.id })), reminders: { recreated: report.reminders.recreated, failed: report.reminders.failed.length }, drift: report.drift.length });
+      } catch {
+        /* the audit is best effort */
+      }
+      return report;
+    });
+  }
+
+  /**
+   * Try a deferred delete now; a stuck one starts counting again.
+   * @param runId - the run to retry.
+   * @returns the attempt's status (and report when it finished).
+   */
+  async retryPending(runId) {
+    const { staging } = await this.pendingRun(runId);
+    return this.exclusive(staging, async () => {
+      const current = await txn.readManifest(txn.runDirectory(staging, runId));
+      if (current === undefined || current.outcome !== null || (current.state !== 'PENDING' && current.state !== 'STUCK')) {
+        throw new RemoteError('session-purge/not-pending', `run "${runId}" is no longer waiting`, { runId });
+      }
+      if (current.state === 'STUCK') {
+        current.state = 'PENDING';
+        current.attempts = 0;
+      }
+      return { runId, ...(await this.attemptDeferred(staging, current)) };
+    });
+  }
+
+  /**
+   * The waiting deferred delete that covers any of these sessions.
+   * @param ids - session ids.
+   * @param stagingRoot - the staging root, when already resolved.
+   * @returns its manifest, or `undefined`.
+   */
+  async pendingCovering(ids, stagingRoot) {
+    let staging = stagingRoot;
+    if (staging === undefined) {
+      try {
+        staging = await txn.stagingRootFor(this.sessionsRoot());
+      } catch {
+        return undefined;
+      }
+    }
+    const wanted = new Set(ids);
+    for (const run of await txn.listRuns(staging)) {
+      const manifest = run.manifest;
+      if (manifest === undefined || manifest.outcome !== null || (manifest.state !== 'PENDING' && manifest.state !== 'STUCK')) continue;
+      if (manifest.targets.some((target) => wanted.has(target.id))) return manifest;
+    }
+    return undefined;
+  }
+
+  /**
+   * Find a pending run by id.
+   * @param runId - the run id from the Client.
+   * @returns the staging root and the manifest.
+   */
+  async pendingRun(runId) {
+    if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) {
+      throw new RemoteError('session-purge/invalid-run-id', 'a run id must look like the ones pending() returns', { runId: String(runId) });
+    }
+    let staging;
+    try {
+      staging = await txn.stagingRootFor(this.sessionsRoot());
+    } catch {
+      throw new RemoteError('session-purge/run-unknown', `no run "${runId}" exists`, { runId });
+    }
+    const manifest = await txn.readManifest(txn.runDirectory(staging, runId));
+    if (manifest === undefined) throw new RemoteError('session-purge/run-unknown', `no run "${runId}" exists`, { runId });
+    return { staging, manifest };
   }
 
   /**
@@ -885,6 +1288,14 @@ class SessionPurgeService extends TypertRemoteService {
           this.armTombstones(manifest, completedAt + RETAIN_MANIFEST_MS);
           report.resurrections += await this.recheckCheckpoints(manifest);
           if (manifest.steps?.cleanup !== 'done') await this.retryCleanup(staging, manifest);
+          continue;
+        }
+        if (manifest.state === 'PENDING' || manifest.state === 'STUCK') {
+          for (const target of manifest.targets) this.pendingIds.add(target.id);
+          if (manifest.state === 'PENDING') {
+            const attempt = await this.attemptDeferred(staging, manifest);
+            (report.deferred ??= []).push({ runId: run.runId, status: attempt.status });
+          }
           continue;
         }
         const outcome = await this.resume(staging, manifest);
@@ -1314,7 +1725,7 @@ class SessionPurgeService extends TypertRemoteService {
   }
 }
 
-markRemoteMethods(SessionPurgeService.prototype, ['inspect', 'purge', 'sweepResidue']);
+markRemoteMethods(SessionPurgeService.prototype, ['inspect', 'purge', 'sweepResidue', 'pending', 'cancelPending', 'retryPending']);
 
 /**
  * The checkpoint identity a stored header witnesses, reduced to what tells two
@@ -1333,6 +1744,7 @@ function tombstoneOf(header) {
  */
 function settleTargetStates(manifest) {
   for (const target of manifest.targets) {
+    if (target.vanished === true) continue;
     const primary = manifest.entries.find((entry) => entry.id === target.id && entry.primary);
     target.state = primary !== undefined && (primary.state === 'COMMITTED' || primary.state === 'CLEANED') ? 'COMMITTED' : 'FAILED';
   }
@@ -1349,6 +1761,59 @@ function liveError(ids) {
     `session "${ids[0]}" is still resident in this harness process; it can only be deleted once it is cold`,
     { sessionIds: ids },
   );
+}
+
+/**
+ * The refusal for a target that came to life after a preview that showed it cold.
+ * @param ids - the session ids.
+ * @returns the Remote error.
+ */
+function becameLiveError(ids) {
+  return new RemoteError(
+    'session-purge/became-live',
+    `session "${String(ids[0])}" was opened after the dialog showed it as cold; reopen the dialog to confirm stopping it`,
+    { sessionIds: ids },
+  );
+}
+
+/**
+ * The minimal reminder record a cancelled deferred delete needs to rebuild a
+ * reminder that `stopActivity` deleted (DESIGN.md §5.3).
+ * @param row - a `schedule.catalog()` row.
+ * @returns the snapshot.
+ */
+function reminderSnapshot(row) {
+  const snapshot = {};
+  for (const field of ['id', 'kind', 'title', 'prompt', 'scheduledAt', 'afterSeconds', 'everySeconds', 'time', 'timeZone', 'weekdays', 'expression']) {
+    if (row?.[field] !== undefined) snapshot[field] = row[field];
+  }
+  return snapshot;
+}
+
+/**
+ * The `schedule.create` request that recreates a snapshot (`ScheduleCreateRequest`,
+ * `docs:reference/subsystems/schedule`; selectors read at `dsh-schedule:2084-2094`).
+ * A one-shot keeps its absolute target; a past one cannot be recreated.
+ * @param snapshot - a {@link reminderSnapshot}.
+ * @returns the request, or `undefined` when it cannot be recreated.
+ */
+function reminderRequest(snapshot) {
+  const base = { title: snapshot.title, prompt: snapshot.prompt };
+  switch (snapshot.kind) {
+    case 'at':
+    case 'after':
+      return Date.parse(snapshot.scheduledAt) > Date.now() ? { ...base, at: snapshot.scheduledAt } : undefined;
+    case 'every':
+      return typeof snapshot.everySeconds === 'number' ? { ...base, every_seconds: snapshot.everySeconds } : undefined;
+    case 'daily':
+      return { ...base, daily: { time: snapshot.time, time_zone: snapshot.timeZone } };
+    case 'weekly':
+      return { ...base, weekly: { time: snapshot.time, time_zone: snapshot.timeZone, weekdays: snapshot.weekdays } };
+    case 'cron':
+      return { ...base, cron: { expression: snapshot.expression, time_zone: snapshot.timeZone } };
+    default:
+      return undefined;
+  }
 }
 
 /**

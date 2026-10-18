@@ -63,6 +63,21 @@ function applyFlagCodec() {
   };
 }
 
+/**
+ * A strict codec for a deferred-delete run id, as `txn.newRunId()` mints it.
+ * @returns the codec.
+ */
+function runIdCodec() {
+  return {
+    parse(value) {
+      if (typeof value !== 'string' || !/^[0-9a-z]{1,16}-[0-9a-f]{12}$/.test(value)) {
+        throw new Error('session-purge: runId must be a run id returned by pending()');
+      }
+      return value;
+    },
+  };
+}
+
 /** Endpoint ids, spelled `<package>#<namespace>/<method>` like the generated ones. */
 const PACKAGE = '@jedeiah/session-purge';
 
@@ -147,6 +162,43 @@ export const TYPERT = {
         create: passthroughCodec,
       },
     },
+    {
+      id: `${PACKAGE}#sessionPurge/pending`,
+      service: 'sessionPurge',
+      namespace: 'sessionPurge',
+      method: 'pending',
+      invocation: { kind: 'direct' },
+      parameters: [],
+      result: {
+        mode: 'strict',
+        typeSymbol: `${PACKAGE}#SessionPurgePending`,
+        create: passthroughCodec,
+      },
+    },
+    ...['cancelPending', 'retryPending'].map((method) => ({
+      id: `${PACKAGE}#sessionPurge/${method}`,
+      service: 'sessionPurge',
+      namespace: 'sessionPurge',
+      method,
+      invocation: { kind: 'direct' },
+      parameters: [
+        {
+          name: 'runId',
+          wire: 'runId',
+          source: 'json',
+          codec: {
+            mode: 'strict',
+            typeSymbol: `${PACKAGE}#RunId`,
+            create: runIdCodec,
+          },
+        },
+      ],
+      result: {
+        mode: 'strict',
+        typeSymbol: `${PACKAGE}#SessionPurge${method[0].toUpperCase()}${method.slice(1)}Result`,
+        create: passthroughCodec,
+      },
+    })),
   ],
   model: {
     services: [],
