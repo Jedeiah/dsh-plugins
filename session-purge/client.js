@@ -39,7 +39,23 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
+    // The shell's controls, so these entries look like the rest of the session
+    // list instead of hand-rolled ones. They are *not* a plugin API: dsh's own
+    // authoring guide (`cordis-plugin-development/references/practices.md` in the
+    // agent preset) tells plugins to vendor them, and the 0.2.1 release dropped
+    // `projectUserText` from this package with no deprecation. Keeping the import
+    // is still worth the styling match, but a removed export must never take the
+    // whole surface down — hence the check below and the gate in `apply`.
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+
+    /** Every primitive this half renders with; checked before any entry registers. */
+    const REQUIRED_PRIMITIVES = ['Button', 'IconTrashOutlineRegular', 'MenuItemButton', 'Modal', 'Toast', 'Tooltip'];
+    /** Symbols the installed dsh no longer exports. Non-empty hides the entries only. */
+    const missingPrimitives = REQUIRED_PRIMITIVES.filter((name) => primitives?.[name] === undefined);
+    if (missingPrimitives.length > 0) {
+      console.error(`[session-purge] @deepseek-ai/dsh-client-ui-primitives no longer exports ${missingPrimitives.join(', ')}. `
+        + 'The session-row delete entries stay hidden; the Host half keeps running. See the repo README, "已知的 dsh 侧问题".');
+    }
 
     /** This bundle's package name: the browser module id and the Remote package id. */
     const BUNDLE_NAME = '@jedeiah/session-purge';
@@ -649,50 +665,55 @@ window.__ModuleLoader__.load({
 
         prune.push(child.effect(() => child.locale.register(LOCALE_NS, { zh, en }), 'session-purge: dictionaries'));
 
-        prune.push(child.slots.inject(ROW_SLOT, () => child.slots.register({
-          name: ROW_SLOT,
-          id: 'session-purge',
-          order: 300,
-          locale: LOCALE_NS,
-          inject: () => ({ purge }),
-        }, PurgeRowButton)));
-
-        prune.push(child.slots.inject(MENU_SLOT, () => child.slots.register({
-          name: MENU_SLOT,
-          id: 'session-purge',
-          order: 500,
-          locale: LOCALE_NS,
-          inject: () => ({ purge }),
-        }, PurgeMenuItem)));
-
-        // The row's configuration page: without it the Plugins page has nothing
-        // to render for this bundle — the generated settings model is data only.
-        // `configForms` is optional, so it is read defensively rather than
-        // injected: a composition without the settings UI must still get the
-        // delete button.
-        const forms = child.get('configForms');
-        if (forms !== undefined && typeof forms.whileServed === 'function') {
-          prune.push(child.effect(() => forms.whileServed([ROW_ID], () => child.slots.inject('plugins.row.config', () => child.slots.register({
-            name: 'plugins.row.config',
-            key: `${BUNDLE_NAME}#${ROW_ID}`,
+        // Every entry below renders with a shared primitive, and a throwing slot
+        // entry blanks the whole slot. With one missing, register none of them:
+        // the rows simply stay as dsh shipped them, and the console names why.
+        if (missingPrimitives.length === 0) {
+          prune.push(child.slots.inject(ROW_SLOT, () => child.slots.register({
+            name: ROW_SLOT,
+            id: 'session-purge',
+            order: 300,
             locale: LOCALE_NS,
-          }, PurgeSettingsCard))), 'session-purge: settings page'));
+            inject: () => ({ purge }),
+          }, PurgeRowButton)));
+
+          prune.push(child.slots.inject(MENU_SLOT, () => child.slots.register({
+            name: MENU_SLOT,
+            id: 'session-purge',
+            order: 500,
+            locale: LOCALE_NS,
+            inject: () => ({ purge }),
+          }, PurgeMenuItem)));
+
+          // The row's configuration page: without it the Plugins page has nothing
+          // to render for this bundle — the generated settings model is data only.
+          // `configForms` is optional, so it is read defensively rather than
+          // injected: a composition without the settings UI must still get the
+          // delete button.
+          const forms = child.get('configForms');
+          if (forms !== undefined && typeof forms.whileServed === 'function') {
+            prune.push(child.effect(() => forms.whileServed([ROW_ID], () => child.slots.inject('plugins.row.config', () => child.slots.register({
+              name: 'plugins.row.config',
+              key: `${BUNDLE_NAME}#${ROW_ID}`,
+              locale: LOCALE_NS,
+            }, PurgeSettingsCard))), 'session-purge: settings page'));
+          }
+
+          prune.push(child.slots.inject(OVERLAY_SLOT, function* () {
+            yield child.slots.register({
+              name: OVERLAY_SLOT,
+              id: 'session-purge-confirm',
+              locale: LOCALE_NS,
+              inject: () => ({ purge }),
+            }, PurgeConfirmDialog);
+            yield child.slots.register({
+              name: OVERLAY_SLOT,
+              id: 'session-purge-toast',
+              locale: LOCALE_NS,
+              inject: () => ({ purge }),
+            }, PurgeToast);
+          }));
         }
-
-        prune.push(child.slots.inject(OVERLAY_SLOT, function* () {
-          yield child.slots.register({
-            name: OVERLAY_SLOT,
-            id: 'session-purge-confirm',
-            locale: LOCALE_NS,
-            inject: () => ({ purge }),
-          }, PurgeConfirmDialog);
-          yield child.slots.register({
-            name: OVERLAY_SLOT,
-            id: 'session-purge-toast',
-            locale: LOCALE_NS,
-            inject: () => ({ purge }),
-          }, PurgeToast);
-        }));
 
         return () => {
           for (const dispose of prune.reverse()) {

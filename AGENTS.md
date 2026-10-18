@@ -140,4 +140,26 @@ open "/Applications/DeepSeek Harness.app"
   另外 `disabled` 是 patch 的合法字段，按 id 覆盖（`cordis-plugin-include` 的 `applyEntryPatches`
   把 `{id, insert, name, ...overrides}` 里的 overrides 盖到目标 entry），所以 profile 层能覆盖 bundle 层。
 
+- **共用控件（`@deepseek-ai/dsh-client-ui-primitives`）不是插件 API，用了就必须配一道降级门。**（2026-10，0.2.1 审计）
+  dsh 自己的插件开发指南写在 `dsh-agent-preset/skills/cordis-plugin-development/references/practices.md`：
+  "Do not `require('@deepseek-ai/dsh-client-ui-primitives')`… They change without notice… a throwing component
+  blanks your slot entry"。0.2.1 就删掉了 `projectUserText`（本仓库没用，纯属运气）。
+  本仓库为了外观一致仍然用它，但每个客户端半边都有 `REQUIRED_PRIMITIVES` + `missingPrimitives`：
+  **缺任何一个 → 只隐藏依赖它的界面条目，并在 console 里点名缺哪个；Host 半边照常工作**。
+  `Button`/`Switch`/`Modal`/`Toast`/… 这些符号在界面上用到哪些，那个数组就得列哪些 —— 漏列一个，
+  就又回到"缺一个、炸整片 slot"的老样子（React 报 `Element type is invalid`，页面一片白）。
+- **进程内直调 `gateway.invoke` 必须显式带 `peer`。**（2026-10，0.2.1）
+  0.2.0 是 `request.peer ?? this.operatorPeer()`；0.2.1 去掉了默认值，`prepareInvocation` 先 `assertPeerLive(request.peer)`
+  再读 `request.peer.principal.kind`，不带 peer 是 `TypeError: Cannot read properties of undefined (reading 'signal')`，
+  连 `gateway/peer-disposed` 都轮不到。`session-purge` 的 Part B 因此用 `dsh-client-connection` 导出的 `Peer`
+  （`new Peer(ctx, { principal: { kind: 'owner' } })`）为每次调用命名 Peer。浏览器端不受影响。
+- **桌面运行时的路径会跟着 dsh 版本挪。**（2026-10，0.2.1）
+  0.2.1 把 payload 收进了 `Resources/runtime/primary-runtime/dependencies/{node,pnpm}`，0.2.0 是
+  `Resources/runtime/{node,pnpm}`。**两处都探**，别写死一处；`rea-dsh` 的"自带 node + 自带 pnpm"那一级
+  就因为只认旧路径而静默退化成 `npx`——在没装 node 的机器上等于起不来。`rea-dsh/selftest.mjs` Part D 守这条。
+- **显示资源要从 `exports` 里导出。**（2026-10，0.2.1）
+  dsh 读 `meta.title`/`meta.description` 走 `exports["./locale/*.json"]`，图标走 `exports["./icon"]`；
+  顶层 `icon` 字段仍然优先、仍然能用，但已是旧写法。五个包的 `selftest.mjs` Part 0 都断言了这两条导出、
+  图标是 SVG 且在 256 KiB 内、`files` 里带上了它们。
+
 本机特定的事项（node 从哪来、dsh 路径、重启命令等）在 `AGENTS.local.md`（不入 git）。

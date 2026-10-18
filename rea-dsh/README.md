@@ -67,7 +67,7 @@ REA 官方支持 dsh，但要求手工往 `cordis.patch.yml` 追加 `dsh-mcp-cli
 |---|---|---|
 | 1 `global` | PATH 上有全局 `rea`（npm i -g） | `绝对 node` + `scripts/rea.mjs mcp`（realpath 解析 bin，不问 npm 全局根在哪） |
 | 2 `npx` | 找到了 node，且找到了 `npx` | `绝对 node` + `npx-cli.js -y rea-agents@<版本> mcp`（走 JS 入口，绕开 shebang 对 PATH 的二次依赖） |
-| 3 `bundled` | 找到了 node，且找到了 dsh 自带的 pnpm | `dsh自带node` + `runtime/pnpm/bin/pnpm.mjs dlx rea-agents@<版本> mcp` |
+| 3 `bundled` | 找到了 node，且找到了 dsh 自带的 pnpm | `dsh自带node` + `…/dependencies/pnpm/bin/pnpm.mjs dlx rea-agents@<版本> mcp` |
 | 4 `bare` | 什么都没有 | 字面 `npx`（= 改动前的行为） |
 
 **为什么 `npx` 排在 `bundled` 前面**：两者都能起来，但 `npx` **复用你已有的 npm 缓存**，
@@ -78,11 +78,19 @@ REA 官方支持 dsh，但要求手工往 `cordis.patch.yml` 追加 `dsh-mcp-cli
 不用重启），并负责：把 PATH 补宽给子进程、按**进程组**转发 SIGTERM/SIGINT/SIGHUP（先给 5 秒宽限再 SIGKILL）、
 把本次实际用的命令写进 `cache/status.json`、失败时往 stderr 打一行可读诊断。
 
-> ⚠️ **一条容易写错的地方**：`launcher.mjs` 是被 **dsh 自带运行时那个 node** 启动的，而它是**普通 Node**，
-> 那里**没有 `process.resourcesPath`**。如果只用这个属性去找自带运行时，`bundled` 这一级就永远不会被选中
-> （表现为"明明自带运行时在，却总是走 npx/裸 npx"）。所以这里改为**从解释器自身路径向上推**
-> `resources` 根（找 `runtime/pnpm/bin/pnpm.mjs`），`process.resourcesPath` 只是额外来源之一。
-> `selftest.mjs` Part D 守住这条（含"PATH 里没有任何包管理器时仍能给出真实可执行的命令"）。
+> ⚠️ **两条容易写错的地方**：
+>
+> 1. `launcher.mjs` 是被 **dsh 自带运行时那个 node** 启动的，而它是**普通 Node**，那里**没有
+>    `process.resourcesPath`**。如果只用这个属性去找自带运行时，`bundled` 这一级就永远不会被选中
+>    （表现为"明明自带运行时在，却总是走 npx/裸 npx"）。所以这里改为**从解释器自身路径向上推**
+>    `resources` 根，`process.resourcesPath` 只是额外来源之一。
+> 2. **自带 pnpm 的位置跟着 dsh 版本挪过。** 0.2.0 是 `runtime/pnpm/bin/pnpm.mjs`；0.2.1 收进了
+>    `runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs`（node 也一起搬到了旁边的
+>    `dependencies/node/bin/node`）。只认旧路径的后果是**静默**的：`bundled` 一级失效，退到 `bare` 的
+>    字面 `npx`——在没装 node 的机器上等于起不来。现在 `bundledPnpmIn()` 两种布局都探。
+>
+> `selftest.mjs` Part D 守住这两条（含"PATH 里没有任何包管理器时仍能给出真实可执行的命令"，以及
+> "从运行时 node 反推出的 resources 根下确实找得到 pnpm"）。
 
 实测（本机，解释器 = dsh 自带 node v24.21.0）：
 
@@ -93,7 +101,7 @@ A) PATH 正常（宿主有 node/npm）            → mode=npx
 
 B) PATH 被剥光（模拟没有 node/npm / GUI 拿不到 PATH） → mode=bundled
    command = …/runtime/primary-runtime/dependencies/node/bin/node
-   args    = […/runtime/pnpm/bin/pnpm.mjs, dlx, rea-agents@6.4.0, mcp]
+   args    = […/primary-runtime/dependencies/pnpm/bin/pnpm.mjs, dlx, rea-agents@6.4.0, mcp]
 
 C) 连自带运行时都没有                      → mode=bare（保持旧行为，并在 notes 里说明）
 ```

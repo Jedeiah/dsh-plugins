@@ -10,11 +10,11 @@
 
 | 插件 | 作用 | 版本 | 直接安装（免 clone） |
 |---|---|---|---|
-| **[turn-notifier](turn-notifier/README.md)** | **提示铃**：智能体需要你注意时响铃提醒（答完一轮 / 停下来等你操作），不理会就按间隔重复，一动鼠标键盘就停。点组件行的箭头可设置提示音、波形、音量与重复次数 | 1.7.1 | `github:Jedeiah/dsh-plugins#path:turn-notifier` |
-| **[session-purge](session-purge/README.md)** | **删除会话**：在会话行的悬停按钮 / 「…」菜单里加「删除会话」，把会话连同子 agent 会话真正从磁盘上删掉。点组件行的箭头可设置清理范围 | 1.0.1 | `github:Jedeiah/dsh-plugins#path:session-purge` |
-| **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **浏览器调试**：接入 chrome-devtools-mcp，给模型浏览器调试工具（页面、快照、截图、DOM/JS 求值、控制台、网络、性能），工具名形如 `mcp__chrome-devtools__<tool>`；并附带随包分发的 7 个调试技能，点组件行的箭头可设置技能开关，以及让智能体操作哪个浏览器（自己拉起一个，或接管你正在用的） | 1.3.0 | `github:Jedeiah/dsh-plugins#path:chrome-devtools-mcp` |
-| **[rea-dsh](rea-dsh/README.md)** | **逆向工程**：接入 REA 的 MCP 服务器，给模型逆向工程工具（原生二进制、Electron/JS 应用、.NET 程序集、APK、固件、网页），工具名形如 `mcp__rea__<tool>`；并分发 `reverse-engineer-anything` 技能、让它自动跟随 REA 的版本走；点组件行的箭头可看状态、自检、设置技能开关与版本 | 1.5.0 | `github:Jedeiah/dsh-plugins#path:rea-dsh` |
-| **[web-fetch-fakeip](web-fetch-fakeip/README.md)** | **代理抓取**：让 `web_fetch` 在 TUN + fake-ip 代理（Clash / Shadowrocket）下也能正常工作 | 5.1.1 | `github:Jedeiah/dsh-plugins#path:web-fetch-fakeip` |
+| **[turn-notifier](turn-notifier/README.md)** | **提示铃**：智能体需要你注意时响铃提醒（答完一轮 / 停下来等你操作），不理会就按间隔重复，一动鼠标键盘就停。点组件行的箭头可设置提示音、波形、音量与重复次数 | 1.7.2 | `github:Jedeiah/dsh-plugins#path:turn-notifier` |
+| **[session-purge](session-purge/README.md)** | **删除会话**：在会话行的悬停按钮 / 「…」菜单里加「删除会话」，把会话连同子 agent 会话真正从磁盘上删掉。点组件行的箭头可设置清理范围 | 1.0.2 | `github:Jedeiah/dsh-plugins#path:session-purge` |
+| **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **浏览器调试**：接入 chrome-devtools-mcp，给模型浏览器调试工具（页面、快照、截图、DOM/JS 求值、控制台、网络、性能），工具名形如 `mcp__chrome-devtools__<tool>`；并附带随包分发的 7 个调试技能，点组件行的箭头可设置技能开关，以及让智能体操作哪个浏览器（自己拉起一个，或接管你正在用的） | 1.3.1 | `github:Jedeiah/dsh-plugins#path:chrome-devtools-mcp` |
+| **[rea-dsh](rea-dsh/README.md)** | **逆向工程**：接入 REA 的 MCP 服务器，给模型逆向工程工具（原生二进制、Electron/JS 应用、.NET 程序集、APK、固件、网页），工具名形如 `mcp__rea__<tool>`；并分发 `reverse-engineer-anything` 技能、让它自动跟随 REA 的版本走；点组件行的箭头可看状态、自检、设置技能开关与版本 | 1.5.1 | `github:Jedeiah/dsh-plugins#path:rea-dsh` |
+| **[web-fetch-fakeip](web-fetch-fakeip/README.md)** | **代理抓取**：让 `web_fetch` 在 TUN + fake-ip 代理（Clash / Shadowrocket）下也能正常工作 | 5.1.2 | `github:Jedeiah/dsh-plugins#path:web-fetch-fakeip` |
 
 最后一列是 **pnpm 安装 spec**，直接喂给 `dsh plugin --profile <名字> add`，或填进 Plugins 页的安装框即可（见[安装](#安装)）。
 
@@ -24,7 +24,7 @@
 
 | 项 | 说明 |
 |---|---|
-| dsh 版本 | **0.2.0-rc.2**（桌面端）实测通过；更早版本未验证 |
+| dsh 版本 | **0.2.1-rc.2**（桌面端）实测通过；0.2.0-rc.2 上同样验证过；更早版本未验证 |
 | 构建步骤 | **不需要** —— 五个插件都是**零构建**（没有 `src/`、没有 tsdown、没有 install 脚本）；除 `web-fetch-fakeip`（纯 Host 插件）外都含 Host/Client 半边；`!!js` 只在确实需要时用 —— 目前 `chrome-devtools-mcp` 一处（算出 `skills-live/` 的绝对路径），`rea-dsh` 三处（技能目录 + 桥的 `command`/`args`，见其 README《怎么拉起 REA》） |
 | 依赖安装 | **不需要手动装** —— 对 dsh 自带包的依赖写在 `peerDependencies` 里，由 dsh 的模块解析器路由到安装里的副本 |
 | 平台 | 插件本身与平台无关；`chrome-devtools-mcp` 需要宿主有 `node`/`npm`（首次运行由 `npx` 拉取 MCP 服务器）；`rea-dsh` **不需要** —— 宿主有 node/npm 就复用（复用其 npm 缓存），没有或 GUI 启动拿不到 PATH 时改用 dsh 自带运行时（自带 node + pnpm），桌面端不装 node/npm 也能起 |
@@ -140,6 +140,17 @@ dsh plugin --profile <你的profile> add "github:Jedeiah/dsh-plugins#path:turn-n
   隐形条目（响铃、按钮等）不走这道门，其恢复情况未逐项验证；**若发现某行界面消失，重载界面（⌘R）即可恢复**，不必重启 App。
 
 - **静态 `import` dsh 自带包**：作者在 0.2.0-rc.2 上遇到过一次「条目建不起来、诊断只报 `failed to import`」（当时 specifier 就是同一个）；后续复核里，把该包写进 `peerDependencies` 之后静态导入可以正常组合（`schemastery`、`dsh-web-fetch-http` 都是静态导入）。因此本仓库仍统一用模块作用域的 `await import(...)` 兜底，见 `web-fetch-fakeip` 的 README《实现注记》。
+
+### 0.2.0-rc.2 → 0.2.1-rc.2：逐项审计结果
+
+对着 npm 上两个版本的 tarball 与安装目录逐个包比对过（`dsh-typert-*`、`dsh-api-gateway`、`dsh-client-*`、`dsh-skill*`、`dsh-app-boot`、`dsh-package-manifest`），再用 dsh 自带的 `cordis-plugin-development` 技能文档核对写法。结论：**五个插件都能在 0.2.1 上跑，但有三处必须适配**（下面三条都已修）。
+
+- **`ctx.remote.$mount` 与手写的 Typert 清单没变**，`TypertRemoteService` / `RemoteError` / `dsh-typert-loader` 的校验规则只是放宽（`input`/`invoke` 可选），手写清单照样过。`dsh-client-ui-primitives` 里本仓库用到的 11 个符号（`Button`、`Switch`、`Menu`、`MenuItemButton`、`Modal`、`Toast`、`Tooltip`、`SegmentedControl`、`Input`、两个图标）全部保留，props 类型声明逐字未变。
+- **但它是"会变的东西"**：0.2.1 删掉了 `projectUserText`（本仓库没用），dsh 自己的插件开发指南 `references/practices.md` 也明说**不要 import 任何 Harness Client 包**（"They change without notice… a throwing component blanks your slot entry"）。四个客户端半边因此加了一道**降级门**：缺任何一个用到的符号，就只隐藏该插件的界面条目并在控制台点名缺哪个，**不再让整个 slot 炸成空白**；Host 半边（MCP 服务器、Remote 服务）照常工作。
+- **`./icon` 要单独导出**：0.2.1 的显示元数据改成从**导出的资源**读（`meta.title` / `meta.description` 来自 `./locale/*.json`，图标来自 `<包名>/icon`），顶层 `icon` 字段虽然仍优先、仍能用，但已是旧写法。五个 `package.json` 都补了 `"./icon": "./icon.svg"`，自测里也加了这条断言。
+- **`gateway.invoke` 现在必须带 `peer`**：0.2.0 里是 `request.peer ?? this.operatorPeer()`，0.2.1 去掉了默认值，`prepareInvocation` 直接读 `request.peer.signal` 与 `.principal`——不带就是 `TypeError`，连 `gateway/peer-disposed` 都轮不到。`session-purge` 的自测是进程内直调 Gateway 的，因此改用它自己的 `Peer`（`dsh-client-connection` 导出）为每个调用命名 Peer；**浏览器端不受影响**（客户端总是带着自己的 Peer）。
+- **桌面运行时布局换了**：pnpm 从 `Resources/runtime/pnpm/` 挪到 `Resources/runtime/primary-runtime/dependencies/pnpm/`（node 在旁边的 `dependencies/node/bin/node`）。`rea-dsh` 的「自带 node + 自带 pnpm」那一级因此失效、静默退到 `npx`——**在没装 node 的机器上等于起不来**。现在两种布局都探，0.2.0 与 0.2.1 共用一份代码。
+- 顺带核对过、**不需要动**的：`cordis.patch.yml` 方言与 `applyEntryPatches` 语义、`ctx.slots.register` 签名、`configForms.whileServed` + `plugins.row.config` 插槽、`locale.register`、`ctx.skills.invalidateCache`、`mcp-client` 的 `serverName is already in use` 文案、会话行菜单的 `order`（dsh 新增的 `session-id` 在 450，本仓库占 500，不撞）。
 
 ## 反馈
 

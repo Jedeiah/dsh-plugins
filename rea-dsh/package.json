@@ -1,6 +1,6 @@
 {
   "name": "@jedeiah/rea-dsh",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "type": "module",
   "description": "逆向工程（Reverse Engineering）：把 REA 的 MCP 服务器（stdio 桥接）接进本 dsh profile，让模型能逆向分析二进制、应用与网页；随包附带它的技能，可在 Plugins 页面开关。",
@@ -15,6 +15,7 @@
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
     "./profile-override.js": "./profile-override.js"
   },
   "files": [

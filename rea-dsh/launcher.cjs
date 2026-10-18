@@ -127,6 +127,35 @@ function resolveSpec(explicit) {
 }
 
 /**
+ * Bundled `pnpm.mjs` locations inside one resources root, best first.
+ *
+ * dsh 0.2.1 moved the desktop payload out of a flat `runtime/` into a versioned
+ * `runtime/primary-runtime/dependencies/`; 0.2.0 and earlier used the flat path.
+ * Both are probed, so one bundle serves either installation. The node candidate
+ * list below already carried both shapes — only pnpm's was left behind.
+ * @param root - a candidate `…/Contents/Resources`.
+ * @returns candidate absolute paths, newest layout first.
+ */
+function bundledPnpmCandidates(root) {
+  return [
+    join(root, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'),
+    join(root, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'),
+  ];
+}
+
+/**
+ * Locate the bundled pnpm under one resources root.
+ * @param root - a candidate `…/Contents/Resources`.
+ * @returns the absolute path to `pnpm.mjs`, or null.
+ */
+function bundledPnpmIn(root) {
+  for (const candidate of bundledPnpmCandidates(root)) {
+    if (isFile(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
  * Candidate harness resources roots (`…/Contents/Resources` on macOS).
  *
  * `process.resourcesPath` only exists inside Electron's own process. The launcher
@@ -143,7 +172,7 @@ function resourcesFromExecutable(executable) {
   for (let depth = 0; depth < 8; depth += 1) {
     directory = dirname(directory);
     if (directory === '' || directory === '.' || directory === '/') return null;
-    if (isFile(join(directory, 'runtime', 'pnpm', 'bin', 'pnpm.mjs'))) return directory;
+    if (bundledPnpmIn(directory) !== null) return directory;
   }
   return null;
 }
@@ -172,8 +201,8 @@ function resourcesRoots() {
  */
 function findBundledPnpm() {
   for (const root of resourcesRoots()) {
-    const candidate = join(root, 'runtime', 'pnpm', 'bin', 'pnpm.mjs');
-    if (isFile(candidate)) return candidate;
+    const candidate = bundledPnpmIn(root);
+    if (candidate !== null) return candidate;
   }
   return null;
 }
@@ -388,6 +417,7 @@ module.exports = {
   resolveSpawnPlan,
   resourcesRoots,
   resourcesFromExecutable,
+  bundledPnpmIn,
   findBundledPnpm,
   childEnvironment,
 };

@@ -82,9 +82,23 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
-    // Official primitives are a platform seed shared by every client bundle, so
-    // the page gets the shell's control styling instead of hand-rolled buttons.
+    // The shell's controls, so this page looks like the rest of the interface
+    // instead of hand-rolled buttons. They are *not* a plugin API: dsh's own
+    // authoring guide (`cordis-plugin-development/references/practices.md` in the
+    // agent preset) tells plugins to vendor them, and the 0.2.1 release dropped
+    // `projectUserText` from this package with no deprecation. Keeping the import
+    // is still worth the styling match, but a removed export must never take the
+    // whole surface down — hence the check below and the gate at the page.
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+
+    /** Every primitive this half renders with; checked before the page registers. */
+    const REQUIRED_PRIMITIVES = ['Button', 'IconChevronDownOutlineRegular', 'Menu', 'SegmentedControl', 'Switch'];
+    /** Symbols the installed dsh no longer exports. Non-empty hides the page only. */
+    const missingPrimitives = REQUIRED_PRIMITIVES.filter((name) => primitives?.[name] === undefined);
+    if (missingPrimitives.length > 0) {
+      console.error(`[turn-notifier] @deepseek-ai/dsh-client-ui-primitives no longer exports ${missingPrimitives.join(', ')}. `
+        + 'The settings page stays hidden; the chime itself keeps working. See the repo README, "已知的 dsh 侧问题".');
+    }
 
     /** Clamp a value into an integer range, falling back when unusable. */
     function clampInteger(value, min, max, fallback) {
@@ -1050,7 +1064,9 @@ const STYLE = Object.freeze({
           const prune = [];
           prune.push(child.effect(() => child.locale.register(SETTINGS_LOCALE_NS, { zh, en }), 'turn-notifier: settings dictionaries'));
           const childForms = child.get('configForms');
-          if (childForms?.whileServed !== undefined) {
+          // A missing primitive would throw inside render, and a throwing slot
+          // entry blanks the whole slot. Skipping the page keeps the row usable.
+          if (childForms?.whileServed !== undefined && missingPrimitives.length === 0) {
             prune.push(child.effect(() => childForms.whileServed([ENTRY_ID], () => child.slots.inject('plugins.row.config', () => child.slots.register({
               name: 'plugins.row.config',
               key: `${BUNDLE_NAME}#${ENTRY_ID}`,

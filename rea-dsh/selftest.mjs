@@ -70,6 +70,38 @@ function check(label, condition, detail = '') {
   console.log(`  FAIL ${label}${detail === '' ? '' : ` — ${detail}`}`);
 }
 
+console.log('\nPart 0 — the package manifest\'s display resources');
+{
+  const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'));
+  const exported = manifest.exports ?? {};
+  // dsh 0.2.1 reads display text from the exported locale JSON and the icon from
+  // an exported resource (`<package>/icon`), without activating the plugin. The
+  // top-level `icon` field still wins, but it is the legacy spelling.
+  check('exports the locale dictionaries', exported['./locale/*.json'] === './locale/*.json');
+  check('exports the icon at ./icon', exported['./icon'] === './icon.svg', String(exported['./icon']));
+
+  const icon = readFileSync(join(here, 'icon.svg'));
+  check('the icon is an SVG under the 256 KiB display limit',
+    icon.byteLength < 256 * 1024 && /^\s*<svg[\s>]/.test(icon.subarray(0, 64).toString('utf8')),
+    `${String(icon.byteLength)} bytes`);
+
+  const shipped = manifest.files ?? [];
+  check('files ships the icon and the dictionaries',
+    shipped.includes('icon.svg') && shipped.includes('locale/*.json'), shipped.join(','));
+
+  const languages = readdirSync(join(here, 'locale'))
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => name.slice(0, -5));
+  check('the locale directory ships en and zh', languages.includes('en') && languages.includes('zh'), languages.join(','));
+  for (const language of languages) {
+    const dictionary = JSON.parse(readFileSync(join(here, 'locale', `${language}.json`), 'utf8'));
+    check(`locale/${language}.json titles the plugin`,
+      typeof dictionary?.meta?.title === 'string' && dictionary.meta.title.trim() !== '');
+    check(`locale/${language}.json describes the plugin`,
+      typeof dictionary?.meta?.description === 'string' && dictionary.meta.description.trim() !== '');
+  }
+}
+
 const app = appDirectory();
 if (!existsSync(app)) {
   console.log(`\nskip — no dsh installation at ${app} (pass --app <path>)`);
@@ -436,7 +468,10 @@ console.log('\nPart D — one spec source, one launch plan');
     check('a resources root is derived from the runtime interpreter',
       typeof derived === 'string' && derived.endsWith(join('Contents', 'Resources')), String(derived));
     check('the bundled pnpm is found under the derived root',
-      existsSync(join(derived ?? '', 'runtime', 'pnpm', 'bin', 'pnpm.mjs')));
+      typeof launcher.bundledPnpmIn(derived ?? '') === 'string',
+      // 0.2.1 moved it into runtime/primary-runtime/dependencies/pnpm; the probe
+      // accepts either layout, so assert on the resolved path, not one shape.
+      String(launcher.bundledPnpmIn(derived ?? '')));
     const withPath = launcher.resolveSpawnPlan({ spec: '6.4.0' });
     const savedPath = process.env.PATH;
     process.env.PATH = '/nonexistent';

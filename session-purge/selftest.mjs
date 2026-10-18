@@ -22,7 +22,7 @@
  */
 import { createHash } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -74,6 +74,38 @@ function storedRaw(header, events) {
  * @param root - the temporary directory to fill.
  * @returns the paths a purge configuration needs.
  */
+console.log('\nPart 0 — the package manifest\'s display resources');
+{
+  const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'));
+  const exported = manifest.exports ?? {};
+  // dsh 0.2.1 reads display text from the exported locale JSON and the icon from
+  // an exported resource (`<package>/icon`), without activating the plugin. The
+  // top-level `icon` field still wins, but it is the legacy spelling.
+  check('exports the locale dictionaries', exported['./locale/*.json'] === './locale/*.json');
+  check('exports the icon at ./icon', exported['./icon'] === './icon.svg', String(exported['./icon']));
+
+  const icon = readFileSync(join(here, 'icon.svg'));
+  check('the icon is an SVG under the 256 KiB display limit',
+    icon.byteLength < 256 * 1024 && /^\s*<svg[\s>]/.test(icon.subarray(0, 64).toString('utf8')),
+    `${String(icon.byteLength)} bytes`);
+
+  const shipped = manifest.files ?? [];
+  check('files ships the icon and the dictionaries',
+    shipped.includes('icon.svg') && shipped.includes('locale/*.json'), shipped.join(','));
+
+  const languages = readdirSync(join(here, 'locale'))
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => name.slice(0, -5));
+  check('the locale directory ships en and zh', languages.includes('en') && languages.includes('zh'), languages.join(','));
+  for (const language of languages) {
+    const dictionary = JSON.parse(readFileSync(join(here, 'locale', `${language}.json`), 'utf8'));
+    check(`locale/${language}.json titles the plugin`,
+      typeof dictionary?.meta?.title === 'string' && dictionary.meta.title.trim() !== '');
+    check(`locale/${language}.json describes the plugin`,
+      typeof dictionary?.meta?.description === 'string' && dictionary.meta.description.trim() !== '');
+  }
+}
+
 async function buildStore(root, options = {}) {
   const raw = options.raw === true;
   const write = raw ? storedRaw : storedLog;
@@ -291,6 +323,10 @@ async function testGateway(app, workroot) {
   const { Context } = await import(join(app, 'cordis', 'lib', 'index.js'));
   const { TypertRegistry } = await import(join(app, 'dsh-typert-registry', 'lib', 'index.js'));
   const { TypertGatewayService } = await import(join(app, 'dsh-api-gateway', 'lib', 'index.js'));
+  // 0.2.1 made every Remote call name its Peer: `prepareInvocation` reads
+  // `request.peer.signal` and `.principal`, and the Gateway no longer falls back
+  // to an operator peer (0.2.0 called `request.peer ?? this.operatorPeer()`).
+  const { Peer } = await import(join(app, 'dsh-client-connection', 'lib', 'index.js'));
   const { validateTypertManifest } = await import(join(app, 'dsh-typert-loader', 'lib', 'index.js'));
   const host = await import(join(bundle, 'index.js'));
   const manifest = await import(join(bundle, 'typert.js'));
@@ -323,18 +359,18 @@ async function testGateway(app, workroot) {
     ctx.typert.register(manifest.TYPERT);
     const gateway = new TypertGatewayService(ctx, {});
     host.apply(ctx, settings);
-    return { ctx, gateway };
+    return { ctx, gateway, peer: new Peer(ctx, { principal: { kind: 'owner' } }) };
   };
-  const { gateway } = boot(config.value);
+  const { gateway, peer } = boot(config.value);
 
-  const inspect = await gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: store.parentId }, signal: new AbortController().signal });
+  const inspect = await gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: store.parentId }, signal: new AbortController().signal, peer });
   check('inspect returns every lineage target with titles', inspect.targets.length === 3 && inspect.targets[0].title === 'Synthetic parent' && inspect.targets.some((target) => target.sessionId === store.grandId && target.title === 'Synthetic grandchild'), JSON.stringify(inspect.targets.map((target) => [target.sessionId, target.title])));
   check('inspect reports the fork that will be kept', (inspect.forkIds ?? []).includes(store.forkId), JSON.stringify(inspect.forkIds));
   check('inspect reports no blocking liveness', inspect.blocked === null);
   check('inspect counts the spilled directory', inspect.spillDirectoryCount === 1, String(inspect.spillDirectoryCount));
   check('inspect totals the disk size', inspect.sizeBytes > 0, String(inspect.sizeBytes));
 
-  const report = await gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: store.parentId }, signal: new AbortController().signal });
+  const report = await gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: store.parentId }, signal: new AbortController().signal, peer });
   check('purge deletes the session, its child and its grandchild', report.targets.length === 3 && report.removedIds.length === 3, report.targets.join(','));
   check('purge reports every removed artifact', report.removed.sessionDirectories === 3 && report.removed.projectionRecords === 5 && report.removed.spillDirectories === 1, JSON.stringify(report.removed));
   check('purge leaves the survivor readable', await exists(join(store.survivorProject, store.keptId, 'session.v4.jsonl.zstd')));
@@ -348,7 +384,7 @@ async function testGateway(app, workroot) {
   liveHost.ctx.provide('agents', { get: (id) => (live.sessionId === id ? { id } : undefined) });
   let refusal;
   try {
-    await liveHost.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: second.parentId }, signal: new AbortController().signal });
+    await liveHost.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: second.parentId }, signal: new AbortController().signal, peer: liveHost.peer });
   } catch (error) {
     refusal = error;
   }
@@ -356,7 +392,7 @@ async function testGateway(app, workroot) {
   check('the refusal names the live session', Array.isArray(refusal?.details?.sessionIds) && refusal.details.sessionIds.includes(second.parentId), JSON.stringify(refusal?.details));
   check('the live session survives the refusal', await exists(join(second.project, second.parentId)));
   live.sessionId = null;
-  const retry = await liveHost.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: second.parentId }, signal: new AbortController().signal });
+  const retry = await liveHost.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: second.parentId }, signal: new AbortController().signal, peer: liveHost.peer });
   check('once cold, the same purge succeeds and clears the unreferenced attachment', retry.removed.attachmentObjects === 1, JSON.stringify(retry.removed));
 
   // ── Live guard, error codes, and the Host-side reference bookkeeping ──────
@@ -386,18 +422,18 @@ async function testGateway(app, workroot) {
       delete: async ({ id, sessionId }) => { calls.push(`schedule:${sessionId}/${id}`); return { deleted: true }; },
     });
 
-    const blockedInspection = await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: third.parentId }, signal: new AbortController().signal });
+    const blockedInspection = await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: third.parentId }, signal: new AbortController().signal, peer: host3.peer });
     check('a live *child* is reported as blocking the preview', blockedInspection.blocked?.sessionIds?.includes(third.childId) === true, JSON.stringify(blockedInspection.blocked));
     let childRefusal;
     try {
-      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: third.parentId }, signal: new AbortController().signal });
+      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: third.parentId }, signal: new AbortController().signal, peer: host3.peer });
     } catch (error) {
       childRefusal = error;
     }
     check('a live child refuses the purge with the stable code', childRefusal?.code === 'session-purge/session-live', String(childRefusal?.code));
 
     live.sessionId = null;
-    const bookkeeping = await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: third.parentId }, signal: new AbortController().signal });
+    const bookkeeping = await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: third.parentId }, signal: new AbortController().signal, peer: host3.peer });
     check('the purge drops the Workspace slot before the log disappears', calls.includes(`detach:${third.parentId}:log-present`), calls.join(' | '));
     check('archive and pin entries are cleared through the registry', calls.includes(`unarchive:${third.parentId}`) && calls.includes(`unpin:${third.parentId}`), calls.join(' | '));
     check('only reminders bound to the targets are deleted', calls.includes(`schedule:${third.parentId}/task-1`) && !calls.some((entry) => entry.includes('task-2')), calls.join(' | '));
@@ -406,14 +442,14 @@ async function testGateway(app, workroot) {
 
     let unknownRefusal;
     try {
-      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: 'session-does-not-exist' }, signal: new AbortController().signal });
+      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: 'session-does-not-exist' }, signal: new AbortController().signal, peer: host3.peer });
     } catch (error) {
       unknownRefusal = error;
     }
     check('an unknown session is refused with its own code', unknownRefusal?.code === 'session-purge/session-unknown', String(unknownRefusal?.code));
     let invalidRefusal;
     try {
-      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: '../evil' }, signal: new AbortController().signal });
+      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: '../evil' }, signal: new AbortController().signal, peer: host3.peer });
     } catch (error) {
       invalidRefusal = error;
     }
@@ -426,7 +462,7 @@ async function testGateway(app, workroot) {
     // not silently deleted.
     const fourth = await buildStore(join(workroot, 'gateway-store-drift'));
     const host4 = boot({ ...config.value, sessionsRoot: fourth.sessionsRoot, storagesRoot: fourth.storagesRoot, attachmentsRoot: fourth.attachmentsRoot, spillRoots: [fourth.spillRoot] });
-    await host4.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: fourth.parentId }, signal: new AbortController().signal });
+    await host4.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: fourth.parentId }, signal: new AbortController().signal, peer: host4.peer });
     await mkdir(join(fourth.project, '99999999-8888-7777-6666-555555555555'), { recursive: true });
     await writeFile(join(fourth.project, '99999999-8888-7777-6666-555555555555', 'session.v4.jsonl.zstd'), storedLog(
       { type: 'session', version: 4, id: '99999999-8888-7777-6666-555555555555', createdAt: 9, cwd: '/Users/example/projects/demo', parentSession: fourth.parentId, isSeeded: false, origin: 'subagent', delegationDepth: 1 },
@@ -434,7 +470,7 @@ async function testGateway(app, workroot) {
     ));
     let driftRefusal;
     try {
-      await host4.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: fourth.parentId }, signal: new AbortController().signal });
+      await host4.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: fourth.parentId }, signal: new AbortController().signal, peer: host4.peer });
     } catch (error) {
       driftRefusal = error;
     }
