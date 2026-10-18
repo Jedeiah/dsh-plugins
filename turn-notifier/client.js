@@ -3,9 +3,11 @@
  *
  * Two contributions live on the row whose specifier is this package name:
  *
- *  - An invisible entry in `conversation.composer.dock` (id
- *    `turn-notifier-alert`) that rings when the viewed session finished a turn
- *    or is waiting for the user.
+ *  - An invisible entry in `shell.overlay` (id `turn-notifier-alert`) that
+ *    rings when any session in this window finished a turn or is waiting for
+ *    the user — not only the one on screen. The slot is a root-scoped list the
+ *    app frame always renders, so the entry outlives session switches and pages
+ *    that show no conversation at all.
  *  - The row's settings page in `plugins.row.config`, registered inside a gate
  *    that depends on this bundle's own Host service (`remote.turnNotifier`).
  *    The gate is what makes the page survive an off→on toggle of this row: dsh
@@ -14,9 +16,10 @@
  *
  * Tunables come from the Host row's `Config` (see ../index.js) through
  * `ctx.configForms`. They are read in the browser, so changing them takes effect
- * without reloading the module. Status signals come from the slot's
- * `useSessionStatus` standard prop, whose entries are
- * `{ running, pendingInteraction, completionUnread }`.
+ * without reloading the module. Status signals come from the root
+ * `useSessionStatus` standard prop: one map from every session id this window
+ * knows to `{ running, pendingInteraction, completionUnread }`. The root
+ * `useSessions` prop tells subagent runs apart, whose finished turns stay silent.
  */
 
 // These client.js files are loaded as plain scripts into one shared scope, so a
@@ -31,8 +34,16 @@ const BUNDLE_NAME = '@jedeiah/turn-notifier';
 /** Profile row id; also the Host settings namespace the settings bundle edits. */
 const ENTRY_ID = 'turn-notifier';
 
-/** Slot this plugin's notification entry occupies. */
-const SLOT_NAME = 'conversation.composer.dock';
+/**
+ * Slot this plugin's notification entry occupies.
+ *
+ * Not `conversation.composer.dock`, where it used to live: that slot has
+ * `session` scope and is rendered only inside the composer of the conversation
+ * on screen, so the entry saw one session, remounted on every switch and did
+ * not exist on pages without a conversation. `shell.overlay` is declared by the
+ * app frame with `root` scope and rendered unconditionally.
+ */
+const SLOT_NAME = 'shell.overlay';
 
 /** Fallbacks, mirroring the Host schema defaults. */
 const DEFAULTS = Object.freeze({
@@ -63,6 +74,19 @@ const UNLOCK_EVENTS = Object.freeze(['pointerdown', 'keydown']);
  * would only duplicate `pointermove`/`pointerdown` on the same gesture.
  */
 const ACTIVITY_EVENTS = Object.freeze(['pointerdown', 'pointermove', 'keydown', 'wheel']);
+
+/**
+ * How urgent each reason is. One alert plays at a time; a more urgent trigger
+ * takes over a quieter alert, anything else folds into the one playing.
+ */
+const URGENCY = Object.freeze({ finished: 1, interaction: 2 });
+
+/**
+ * Triggers this close to the previous ring are "the same moment" and add no
+ * ring of their own. Sessions report separately, so two that settle together
+ * arrive a few frames apart and would otherwise stack two chimes.
+ */
+const COALESCE_MS = 2000;
 
 /** Built-in chimes, used when the configured pattern is missing or unparsable. */
 const PATTERNS = Object.freeze({
@@ -282,17 +306,82 @@ window.__ModuleLoader__.load({
       for (const type of ACTIVITY_EVENTS) window.removeEventListener(type, current.onActivity);
     }
 
-    /** Ring once now, then repeat until the count is used up or the user returns. */
-    function startAlert(alertRef, audio, settings, reason) {
+    /**
+     * Ring once now, then repeat until the count is used up or the user returns.
+     * @param alertRef - holder of the one alert that may play.
+     * @param audio - the chime synthesizer.
+     * @param settings - projected settings, captured for every ring of this alert.
+     * @param reason - which chime plays: `finished` or `interaction`.
+     * @param causes - ids of the sessions this alert rings for, all for `reason`;
+     *   the alert stops once none of them still needs the user.
+     */
+    function startAlert(alertRef, audio, settings, reason, causes) {
       stopAlert(alertRef);
-      audio.ring(reason, settings);
-      const timers = [];
+      const alert = {
+        reason,
+        causes,
+        timers: [],
+        /** Repeats still scheduled after the ring in progress. */
+        pendingRings: settings.repeatCount - 1,
+        /** Whether a ring sounded within the last {@link COALESCE_MS}. */
+        recent: false,
+        onActivity: () => stopAlert(alertRef),
+      };
+      const ring = () => {
+        audio.ring(reason, settings);
+        alert.recent = true;
+        alert.timers.push(window.setTimeout(() => { alert.recent = false; }, COALESCE_MS));
+      };
+      ring();
       for (let index = 1; index < settings.repeatCount; index += 1) {
-        timers.push(window.setTimeout(() => audio.ring(reason, settings), settings.intervalMs * index));
+        alert.timers.push(window.setTimeout(() => {
+          alert.pendingRings -= 1;
+          ring();
+        }, settings.intervalMs * index));
       }
-      const onActivity = () => stopAlert(alertRef);
-      for (const type of ACTIVITY_EVENTS) window.addEventListener(type, onActivity, { passive: true });
-      alertRef.current = { timers, onActivity };
+      for (const type of ACTIVITY_EVENTS) window.addEventListener(type, alert.onActivity, { passive: true });
+      alertRef.current = alert;
+    }
+
+    /**
+     * Which sessions newly need the user between two status snapshots.
+     *
+     * Only a change seen on both sides counts: a session entering the map (first
+     * paint, a new session, a reconnect baseline) has no "before", and one leaving
+     * it (deleted, list refresh) did not finish a turn.
+     * @param before - the previous status map; `undefined` on the first render.
+     * @param after - the current status map.
+     * @param isSubagent - whether a session id names a subagent run. Its finished
+     *   turns are steps of its parent's turn and stay silent; its questions and
+     *   approvals still need the user and still ring.
+     * @param wanted - which reasons the settings let ring.
+     * @returns session id → reason, the more urgent reason when one session has both.
+     */
+    function triggersBetween(before, after, isSubagent, wanted) {
+      const triggers = new Map();
+      if (before === undefined || before === after) return triggers;
+      for (const [sessionId, status] of after) {
+        const previous = before.get(sessionId);
+        if (previous === undefined) continue;
+        const waiting = wanted.interaction
+          && status.pendingInteraction !== undefined && previous.pendingInteraction === undefined;
+        const finished = wanted.finished
+          && previous.running === true && status.running !== true && !isSubagent(sessionId);
+        if (waiting) triggers.set(sessionId, 'interaction');
+        else if (finished) triggers.set(sessionId, 'finished');
+      }
+      return triggers;
+    }
+
+    /**
+     * Whether the reason one session was chimed for still holds.
+     * @param status - that session's current status, or `undefined` once it left the map.
+     * @param reason - why it was chimed for.
+     * @returns false once a finished session runs again or a waiting one stops waiting.
+     */
+    function causeHolds(status, reason) {
+      if (status === undefined) return false;
+      return reason === 'interaction' ? status.pendingInteraction !== undefined : status.running !== true;
     }
 
     /** Stand-in status map for slots that expose no `useSessionStatus` prop. */
@@ -318,7 +407,33 @@ window.__ModuleLoader__.load({
       return selector(EMPTY_STATUS);
     }
 
-    /** The invisible entry that owns the notification behavior. */
+    /** Stand-in session list for slots that expose no `useSessions` prop. */
+    const EMPTY_SESSIONS = Object.freeze({ ids: Object.freeze([]), byId: Object.freeze({}) });
+
+    /** Reported once, like the status hook above. */
+    let sessionsHookReported = false;
+
+    /**
+     * Selector over an empty session list, used when the slot provides no hook.
+     *
+     * The list is only how subagent runs are told apart, so without it the chime
+     * still works but every subagent's finished turn rings as well — a bell that
+     * suddenly rings far too often. Say so once instead of leaving that unexplained.
+     */
+    function readNoSessions(selector) {
+      if (!sessionsHookReported) {
+        sessionsHookReported = true;
+        console.error('[turn-notifier] the slot supplies no useSessions prop, so subagent runs cannot be told apart '
+          + 'and their finished turns chime too. dsh likely renamed it; see the repo README, "已知的 dsh 侧问题".');
+      }
+      return selector(EMPTY_SESSIONS);
+    }
+
+    /** Select the whole status map: the chime watches every session, not one. */
+    const selectStatusMap = (snapshot) => snapshot;
+
+    /** Select the session rows by id; a row's `origin` marks a subagent run. */
+    const selectSessionRows = (list) => list?.byId;
 
     /** Browser-side mirror of `typert.js`; the Gateway reads these descriptors. */
     const TYPERT_REMOTE = {
@@ -336,56 +451,69 @@ window.__ModuleLoader__.load({
       ],
     };
 
+    /**
+     * The invisible entry that owns the notification behavior.
+     *
+     * It watches the whole status map, so a session in the background — or every
+     * session, while a page without a conversation is open — rings exactly like
+     * the one on screen. One alert plays at a time: triggers that land while it
+     * still has rings to play, or within {@link COALESCE_MS} of its last ring,
+     * fold into it, unless they are more urgent ("waiting for you" over
+     * "finished"), in which case the urgent chime takes over.
+     * @param audio - the chime synthesizer.
+     * @param store - the settings store.
+     * @returns the slot component.
+     */
     function createNotifier(audio, store) {
       return function TurnNotifier(props) {
-        const { sessionId, useSessionStatus } = props;
+        const { useSessionStatus, useSessions } = props;
         const settings = useStoreValue(store);
-        // A slot may not supply the hook; fall back instead of throwing, which
+        // A slot may not supply a hook; fall back instead of throwing, which
         // would blank the whole slot entry ("slot entry crashed in ...").
         const useStatus = typeof useSessionStatus === 'function' ? useSessionStatus : readEmptyStatus;
-        const selectRunning = React.useCallback(
-          (snapshot) => (sessionId === undefined ? undefined : snapshot.get(sessionId)?.running),
-          [sessionId],
-        );
-        const selectPending = React.useCallback(
-          (snapshot) => (sessionId === undefined ? undefined : snapshot.get(sessionId)?.pendingInteraction),
-          [sessionId],
-        );
-        const selectKnown = React.useCallback(
-          (snapshot) => (sessionId === undefined ? undefined : snapshot.has(sessionId)),
-          [sessionId],
-        );
-        const running = useStatus(selectRunning);
-        const pending = useStatus(selectPending);
-        const known = useStatus(selectKnown);
+        const useRows = typeof useSessions === 'function' ? useSessions : readNoSessions;
+        const status = useStatus(selectStatusMap);
+        const rows = useRows(selectSessionRows);
 
-        const previous = React.useRef({ sessionId: undefined, running: undefined, pending: undefined, known: undefined });
+        const previous = React.useRef(undefined);
         const alertRef = React.useRef(null);
 
         React.useEffect(() => {
           const before = previous.current;
-          previous.current = { sessionId, running, pending, known };
+          previous.current = status;
 
-          // First render, or a switch to another session: record the baseline
-          // without chiming, so a session that is already idle or already
-          // waiting does not ring merely because it became visible.
-          if (before.sessionId !== sessionId) {
+          if (settings.muted === true) {
             stopAlert(alertRef);
             return;
           }
 
-          // A session that leaves the status map (reconnect, list refresh) is not
-          // a finished turn: both sides of a transition must be observed.
-          const watched = before.known === true && known === true;
-          const finishedTurn = watched && before.running === true && running !== true;
-          const needsUser = watched && pending !== undefined && before.pending === undefined;
-          if (settings.muted === true) stopAlert(alertRef);
-          else if (needsUser && settings.notifyOnWaiting !== false) startAlert(alertRef, audio, settings, 'interaction');
-          else if (finishedTurn && settings.notifyOnTurnEnd !== false) startAlert(alertRef, audio, settings, 'finished');
-          // The reason to chime is gone — a new turn started, or the pending
-          // interaction was answered — so stop the remaining repeats at once.
-          else if (running === true || before.pending !== undefined) stopAlert(alertRef);
-        }, [sessionId, running, pending, known, settings]);
+          // The reason to chime is gone for a session — a new turn started, or
+          // the pending interaction was answered — so it no longer holds the
+          // alert; once no session does, the remaining repeats stop at once.
+          const playing = alertRef.current;
+          if (playing !== null) {
+            for (const sessionId of playing.causes) {
+              if (!causeHolds(status.get(sessionId), playing.reason)) playing.causes.delete(sessionId);
+            }
+            if (playing.causes.size === 0) stopAlert(alertRef);
+          }
+
+          const triggers = triggersBetween(before, status, (sessionId) => rows?.[sessionId]?.origin === 'subagent', {
+            interaction: settings.notifyOnWaiting !== false,
+            finished: settings.notifyOnTurnEnd !== false,
+          });
+          if (triggers.size === 0) return;
+          const reason = [...triggers.values()].includes('interaction') ? 'interaction' : 'finished';
+          const sessions = [...triggers].filter(([, why]) => why === reason).map(([sessionId]) => sessionId);
+          const current = alertRef.current;
+          if (current !== null && URGENCY[reason] <= URGENCY[current.reason] && (current.pendingRings > 0 || current.recent)) {
+            // The chime already playing covers these; only same-reason sessions
+            // join it, since only they can keep that chime meaningful.
+            if (reason === current.reason) for (const sessionId of sessions) current.causes.add(sessionId);
+            return;
+          }
+          startAlert(alertRef, audio, settings, reason, new Set(sessions));
+        }, [status, rows, settings]);
 
         React.useEffect(() => () => stopAlert(alertRef), []);
 
@@ -1058,10 +1186,10 @@ const STYLE = Object.freeze({
           };
         }, 'turn-notifier: audio unlock');
 
-        // The ringing contribution, an invisible entry: it needs the session
-        // status hook only, and must keep observing whether or not a settings
-        // surface is open. The settings page registers on this same row from the
-        // gate below.
+        // The ringing contribution, an invisible entry: it needs the root session
+        // hooks only, and must keep observing every session whatever the main
+        // panel shows and whether or not a settings surface is open. The
+        // settings page registers on this same row from the gate below.
         ctx.slots.inject(SLOT_NAME, () =>
           ctx.slots.register({ name: SLOT_NAME, id: `${ENTRY_ID}-alert`, order: 91 }, createNotifier(audio, store)),
         );

@@ -12,10 +12,21 @@
 
 | 触发 | 条件 |
 |---|---|
-| **答完一轮** | 当前会话的 `running` 由 `true` 变 `false` |
-| **需要你操作** | `pendingInteraction` 由"没有"变成"有"——审批提示或提问 |
+| **答完一轮** | **任一会话**的 `running` 由 `true` 变 `false`（子 agent 的除外：它答完只是父会话这一轮里的一步） |
+| **需要你操作** | **任一会话**（含子 agent）的 `pendingInteraction` 由"没有"变成"有"——审批提示或提问 |
 
-每次提醒**立刻响一声**，然后按间隔重复，直到响满设定的次数。任何鼠标移动、点击、按键、滚轮都会取消剩余次数。
+**不只是你正在看的那个会话**：切到别的会话、或者打开 Plugins / 设置页时，后台会话答完或停下来等你，照样会响。范围是"本窗口知道的所有会话"（dsh 的会话状态表，见下文《工作原理》）。
+
+每次提醒**立刻响一声**，然后按间隔重复，直到响满设定的次数。任何鼠标移动、点击、按键、滚轮都会取消剩余次数。响铃的理由没了也会停：答完的那个会话又开始了新一轮，或者那个提问 / 审批已经被回答。
+
+### 几个会话一起需要你
+
+同一时刻只有**一个**提醒在响，不会叠着轰炸：
+
+- 提醒**还有没响完的次数**，或者**上一声在 2 秒内**时，又来一个**同样急或没那么急**的触发（比如又有会话答完）→ **并进**正在响的这一个，不另起一声（2 秒内算"同一时刻"：各会话是分别上报的，同时结束的两个会话会相差几帧到达）。
+- "需要你操作"比"答完一轮"更急：正在响"答完"时有会话停下来等你 → **立刻改响**"需要你操作"那套音并重新计次；反过来则并进去。
+- 一个提醒已经响满次数、最后一声也过了 2 秒，你还没回来，这时又有会话答完 → 当作新的提醒，再响一轮。
+- 提醒为哪些会话而响，就等这些会话**全部**不再需要你（或你一动鼠标键盘）才停；别的会话开始干活不会把它掐掉。
 
 ## 两种声音
 
@@ -104,7 +115,25 @@ dsh 的解析器专门处理了这种情况：对 **linked 包**，只要导入�
 
 ### 响铃是独立的隐形条目
 
-同一个 `conversation.composer.dock` 槽位上还有一条 id 为 `turn-notifier-alert` 的条目，它渲染 `null`：只订阅 `useSessionStatus`，与配置页互不影响。设置数据来自 `ctx.configForms`，在浏览器里读取，所以改完立即生效。
+响铃是 `shell.overlay` 槽位上一条 id 为 `turn-notifier-alert` 的条目，它渲染 `null`，与配置页互不影响。它读两个**根级标准 prop**：
+
+- `useSessionStatus`：**一张表**，键是本窗口知道的每个会话 id，值是 `{ running, pendingInteraction, completionUnread }`。条目拿整张表、和上一张逐个会话比较。
+- `useSessions`：会话行；行上 `origin === 'subagent'` 的是子 agent，它"答完一轮"不响。
+
+设置数据来自 `ctx.configForms`，在浏览器里读取，所以改完立即生效。
+
+**为什么是 `shell.overlay`。** 1.7.x 把条目挂在 `conversation.composer.dock`，并且只取 `snapshot.get(sessionId)`——于是**只有正在看的那个会话会响**。依据（行号对应 dsh 0.2.1-rc.2）：
+
+| 事实 | 出处 |
+|---|---|
+| `useSessionStatus` 是**每个 scope 都有**的标准 prop，由 ui-session 提供 | 文档 reference/subsystems/slots《Framework-provided hooks》表 |
+| 它背后是**一张覆盖所有会话**的表：会话列表里的每个 id，加上 `api-session/status` 事件报来的任何 id | `dsh-client-ui-session/lib/client.js` 的 `sessionStatus` / `observeRunning` / `publishStatus`（约 782–990 行） |
+| 后台会话的审批同样进这张表：Gateway 对任何 `agentId` 都 `retainAgentScope`，审批插件据此按会话发布 `pendingInteraction` | `dsh-api-session-controller/lib/client.js` 约 4297 行；`dsh-client-ui-approval/lib/client.js` 约 284–356 行 |
+| `conversation.composer.dock` 是 `scope: "session"`，而且只在**屏幕上那个会话的输入框**里、`sessionId !== undefined` 时才渲染 | `dsh-client-ui-conversation/lib/client.js` 约 19221、19973 行；文档 slots 的层级图里它在 `Factory: conversation.content` 之下 |
+| `shell.overlay` 是 `root` 范围的 list 槽位，`AppFrame` 无条件渲染 | `dsh-client-ui-layout/lib/client.js` 约 313、352、643 行；dsh 自己的重命名/归档对话框、快捷键面板也挂在这里 |
+| 子 agent 的运行状态也会进表（`agent/status` 对每个 agent 都发），会话行用 `origin: 'subagent'` 标出它 | `dsh-api-session-controller/lib/index.js` 约 2990 行；同包 `client.js` 的 `projectList` |
+
+换槽位后，切换会话不会让条目重挂、丢掉基线，打开不显示会话的页面时它也还在。`useSessionStatus` / `useSessions` 缺席时条目不崩，各在控制台点名一次：前者意味着铃永远不响，后者意味着子 agent 答完也会响。
 
 设置页的开关、波形选择、试听按钮走官方 `@deepseek-ai/dsh-client-ui-primitives`（`Switch`、`SegmentedControl`、`Button`），滑杆和数字框是原生 `input`（官方没有对应控件），配色统一取 `--dsw-alias-*` 令牌，因此随主题自动适配。
 

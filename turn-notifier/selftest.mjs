@@ -23,6 +23,15 @@
  * Part B validates the hand-written Host manifest with the installation's own
  * `validateTypertManifest`.
  *
+ * Part C needs no installation: it materialises the Client half in a `vm`
+ * sandbox the way a page does (register, build the module, call `apply`), then
+ * renders the registered chime entry with a minimal hook runtime, fake timers,
+ * fake activity listeners and a fake `AudioContext` that records every chime.
+ * It pins the fix for "only the session on screen rings": the entry lives in the
+ * root `shell.overlay` slot and a session other than the one on screen rings
+ * too, while subagent turns stay silent and near-simultaneous triggers fold into
+ * one alert instead of stacking chimes.
+ *
  * Nothing outside a temporary directory is written, and nothing in the bundle is
  * touched.
  *
@@ -33,6 +42,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { register } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PACKAGE = '@jedeiah/turn-notifier';
@@ -92,10 +102,494 @@ console.log('\nPart 0 — the package manifest\'s display resources');
   }
 }
 
+/**
+ * A React stand-in just large enough for this bundle's hooks: state, refs, memo
+ * and effects with dependency arrays, committed synchronously after each render.
+ * @returns `{ React, mount }`; `mount(component, props)` renders once and returns
+ *   `{ render(props), unmount() }`.
+ */
+function createHookRuntime() {
+  let frame = null;
+  const slotOf = (create) => {
+    const index = frame.cursor;
+    frame.cursor += 1;
+    if (!(index in frame.slots)) frame.slots[index] = create();
+    return frame.slots[index];
+  };
+  const changed = (previous, next) => previous === undefined || next === undefined
+    || previous.length !== next.length || next.some((value, index) => !Object.is(value, previous[index]));
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    Fragment: Symbol('Fragment'),
+    useState(initial) {
+      const owner = frame;
+      const slot = slotOf(() => ({ value: typeof initial === 'function' ? initial() : initial }));
+      return [slot.value, (next) => {
+        const value = typeof next === 'function' ? next(slot.value) : next;
+        if (Object.is(value, slot.value)) return;
+        slot.value = value;
+        owner.dirty = true;
+      }];
+    },
+    useRef: (initial) => slotOf(() => ({ current: initial })),
+    useMemo(factory, deps) {
+      const slot = slotOf(() => ({ deps: undefined, value: undefined }));
+      if (changed(slot.deps, deps)) {
+        slot.value = factory();
+        slot.deps = deps;
+      }
+      return slot.value;
+    },
+    useCallback: (callback, deps) => React.useMemo(() => callback, deps),
+    useEffect(effect, deps) {
+      const slot = slotOf(() => ({ deps: undefined, cleanup: undefined, effect: true }));
+      if (changed(slot.deps, deps)) frame.effects.push({ slot, effect, deps });
+    },
+  };
+  function mount(component, initialProps) {
+    const instance = { slots: [], cursor: 0, effects: [], dirty: false, props: initialProps };
+    const render = (props = instance.props) => {
+      instance.props = props;
+      do {
+        instance.dirty = false;
+        instance.cursor = 0;
+        instance.effects = [];
+        frame = instance;
+        try {
+          component(props);
+        } finally {
+          frame = null;
+        }
+        for (const { slot, effect, deps } of instance.effects) {
+          if (typeof slot.cleanup === 'function') slot.cleanup();
+          slot.cleanup = effect();
+          slot.deps = deps;
+        }
+      } while (instance.dirty);
+    };
+    const unmount = () => {
+      for (const slot of instance.slots) if (slot?.effect === true && typeof slot.cleanup === 'function') slot.cleanup();
+    };
+    render();
+    return { render, unmount };
+  }
+  return { React, mount };
+}
+
+/**
+ * Load `client.js` into a fresh sandbox and activate it against a stub runtime.
+ *
+ * Every call is a new page: module-level state (the once-only console reports,
+ * the audio context) starts clean.
+ * @returns the materialised module, its slot entries and gates, the fake
+ *   browser's controls, and the record of every chime that played.
+ */
+async function bootClient() {
+  const source = readFileSync(join(here, 'client.js'), 'utf8');
+  let now = 0;
+  let nextTimer = 1;
+  const timers = new Map();
+  const listeners = new Map();
+  /** One record per chime: when it started and the frequencies of its tones. */
+  const rings = [];
+  const errors = [];
+  const registered = [];
+
+  class FakeAudioContext {
+    state = 'running';
+    destination = {};
+    /** Read exactly once per chime (its start time), so it marks where one begins. */
+    get currentTime() {
+      rings.push({ at: now, frequencies: [] });
+      return now / 1000;
+    }
+    resume() { return Promise.resolve(); }
+    createDynamicsCompressor() {
+      const param = () => ({ value: 0 });
+      return { threshold: param(), knee: param(), ratio: param(), attack: param(), release: param(), connect() {} };
+    }
+    createOscillator() {
+      return {
+        type: '',
+        frequency: { setValueAtTime: (hz) => { rings.at(-1)?.frequencies.push(hz); } },
+        connect() {},
+        start() {},
+        stop() {},
+      };
+    }
+    createGain() {
+      return { gain: { setValueAtTime() {}, linearRampToValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} };
+    }
+  }
+
+  const window = {
+    AudioContext: FakeAudioContext,
+    setTimeout: (callback, ms) => {
+      const id = nextTimer;
+      nextTimer += 1;
+      timers.set(id, { at: now + ms, callback });
+      return id;
+    },
+    clearTimeout: (id) => { timers.delete(id); },
+    addEventListener: (type, listener) => {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(listener);
+    },
+    removeEventListener: (type, listener) => { listeners.get(type)?.delete(listener); },
+    __ModuleLoader__: { load: (spec) => registered.push(spec) },
+  };
+  const sandbox = {
+    window,
+    console: { log() {}, warn() {}, error: (...parts) => errors.push(parts.join(' ')) },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox, { filename: 'client.js' });
+
+  const { React, mount } = createHookRuntime();
+  const required = [];
+  const primitives = new Proxy({}, { get: (_target, key) => (props) => ({ type: String(key), props }) });
+  const plugin = registered[0]?.factory((specifier) => {
+    required.push(specifier);
+    if (specifier === 'react') return React;
+    if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return primitives;
+    throw new Error(`client half required an unexpected specifier: ${specifier}`);
+  });
+
+  let formValue = {};
+  const formListeners = new Set();
+  const form = {
+    getSnapshot: () => ({ status: 'ready', writable: true, value: formValue, user: {} }),
+    subscribe: (listener) => {
+      formListeners.add(listener);
+      return () => formListeners.delete(listener);
+    },
+    set: () => true,
+    unset: () => true,
+  };
+  const entries = [];
+  const injected = [];
+  const gates = [];
+  const ctx = {
+    get: (name) => (name === 'configForms'
+      ? { get: (id) => (id === 'turn-notifier' ? form : undefined), whileServed: (_ids, callback) => callback() }
+      : undefined),
+    effect: (body) => {
+      const dispose = body();
+      return () => dispose?.();
+    },
+    slots: {
+      inject: (name, callback) => {
+        injected.push(name);
+        return callback();
+      },
+      register: (options, component) => {
+        entries.push({ options, component });
+        return () => undefined;
+      },
+    },
+    locale: { register: () => () => undefined },
+    remote: { $mount: async () => async () => undefined },
+    inject: (deps, callback) => {
+      gates.push({ deps, callback });
+      return Object.assign(Promise.resolve(), { dispose: async () => undefined });
+    },
+  };
+  await plugin?.apply(ctx);
+
+  return {
+    registered,
+    plugin,
+    required,
+    entries,
+    injected,
+    gates,
+    ctx,
+    rings,
+    errors,
+    mount,
+    /** Run every timer due within the next `ms` milliseconds, in order. */
+    advance(ms) {
+      const until = now + ms;
+      for (;;) {
+        let due;
+        for (const [id, timer] of timers) {
+          if (timer.at <= until && (due === undefined || timer.at < due.timer.at)) due = { id, timer };
+        }
+        if (due === undefined) break;
+        timers.delete(due.id);
+        now = due.timer.at;
+        due.timer.callback();
+      }
+      now = until;
+    },
+    /** Dispatch one window event, as user activity would. */
+    fire(type) {
+      for (const listener of [...(listeners.get(type) ?? [])]) listener({ type });
+    },
+    /** Replace the row's settings and notify the form's subscribers. */
+    setForm(value) {
+      formValue = value;
+      for (const listener of [...formListeners]) listener();
+    },
+  };
+}
+
+/** A session's status entry, shaped like `useSessionStatus` publishes it. */
+const idle = () => ({ running: false, pendingInteraction: undefined, completionUnread: false });
+const busy = () => ({ running: true, pendingInteraction: undefined, completionUnread: false });
+const asking = (interaction = { kind: 'approval' }) => ({ running: true, pendingInteraction: interaction, completionUnread: false });
+
+/** Session rows as `useSessions` publishes them; `S` is a subagent run of `A`. */
+const SESSION_LIST = Object.freeze({
+  ids: ['A', 'B', 'C', 'D'],
+  byId: {
+    A: { id: 'A' },
+    B: { id: 'B' },
+    C: { id: 'C' },
+    D: { id: 'D' },
+    S: { id: 'S', origin: 'subagent', parentId: 'A' },
+  },
+  phase: 'ready',
+});
+
+/** Frequencies that open each built-in chime, to tell which one played. */
+const FINISHED_HZ = 880;
+const WAITING_HZ = 1046.5;
+
+/**
+ * Boot the Client half, mount its chime entry and return a driver for it.
+ *
+ * Props carry `sessionId: 'A'` on purpose: that is what the old composer slot
+ * handed the entry, so a component that still filtered by it would stay deaf to
+ * every other session and fail the checks below.
+ * @param initial - session id → status for the first render.
+ * @param options - `hooks: false` drops `useSessionStatus`, `sessions: false` drops `useSessions`.
+ * @returns the booted client plus `publish(statuses)` and `unmount()`.
+ */
+async function chimeStory(initial, options = {}) {
+  const client = await bootClient();
+  const chime = client.entries.find((entry) => entry.options.id === 'turn-notifier-alert');
+  let status = new Map(Object.entries(initial));
+  const props = () => ({
+    sessionId: 'A',
+    ...(options.hooks === false ? {} : { useSessionStatus: (selector) => selector(status) }),
+    ...(options.sessions === false ? {} : { useSessions: (selector) => selector(SESSION_LIST) }),
+  });
+  const view = client.mount(chime.component, props());
+  return {
+    ...client,
+    /** Publish a new status map (a new identity, as ui-session does) and re-render. */
+    publish(next) {
+      status = new Map(Object.entries(next));
+      view.render(props());
+    },
+    rerender: () => view.render(props()),
+    unmount: () => view.unmount(),
+  };
+}
+
+console.log('\nPart C — the client half watches every session');
+{
+  const client = await bootClient();
+  check('the module registers itself once', client.registered.length === 1, String(client.registered.length));
+  check('the module id is the package name', client.registered[0]?.id === PACKAGE, String(client.registered[0]?.id));
+  check('the factory exports { inject, apply }',
+    Array.isArray(client.plugin?.inject) && typeof client.plugin?.apply === 'function');
+  check('it requires only platform seeds',
+    client.required.every((specifier) => specifier === 'react' || specifier === '@deepseek-ai/dsh-client-ui-primitives'),
+    client.required.join(', '));
+
+  const chime = client.entries.find((entry) => entry.options.id === 'turn-notifier-alert');
+  check('the chime registers in shell.overlay, the root slot the app frame always renders',
+    chime?.options.name === 'shell.overlay', String(chime?.options.name));
+  check('nothing registers in the per-conversation composer dock any more',
+    client.entries.every((entry) => entry.options.name !== 'conversation.composer.dock')
+      && !client.injected.includes('conversation.composer.dock'),
+    client.injected.join(','));
+
+  // The settings page still hangs off the gate on this bundle's own service.
+  check('the settings page is gated on remote.turnNotifier', client.gates[0]?.deps?.[0] === 'remote.turnNotifier',
+    JSON.stringify(client.gates.map((gate) => gate.deps)));
+  client.gates[0]?.callback(client.ctx);
+  const page = client.entries.find((entry) => entry.options.name === 'plugins.row.config');
+  check('the gate registers the row page keyed <package>#<row id>',
+    page?.options.key === `${PACKAGE}#turn-notifier`, String(page?.options.key));
+  check('no fallback was reported on a complete composition', client.errors.length === 0, client.errors.join(' | '));
+}
+{
+  const story = await chimeStory({ A: idle(), B: asking() });
+  check('a session already idle or already waiting at mount does not ring', story.rings.length === 0, String(story.rings.length));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.publish({ A: idle(), B: busy() });
+  check('the session on screen finishing a turn still rings the finished chime',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === FINISHED_HZ, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.publish({ A: busy(), B: idle() });
+  check('a session other than the one on screen finishing a turn rings the finished chime',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === FINISHED_HZ, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), C: busy() });
+  story.publish({ A: busy(), C: asking() });
+  check('a session other than the one on screen waiting for the user rings the waiting chime',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === WAITING_HZ, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), S: busy() });
+  story.publish({ A: busy(), S: idle() });
+  check('a subagent finishing its turn stays silent (it is a step of its parent\'s turn)',
+    story.rings.length === 0, JSON.stringify(story.rings));
+  story.publish({ A: busy(), S: asking() });
+  check('a subagent waiting for the user still rings',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === WAITING_HZ, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.publish({ B: busy() });
+  check('a running session leaving the map is not a finished turn', story.rings.length === 0, JSON.stringify(story.rings));
+  story.publish({ A: idle(), B: busy() });
+  check('…and one re-entering it idle has no "before" to compare', story.rings.length === 0, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy(), D: busy() });
+  story.publish({ A: busy(), B: idle(), D: idle() });
+  check('two sessions finishing in the same update ring once', story.rings.length === 1, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy(), D: busy() });
+  story.publish({ A: busy(), B: idle(), D: busy() });
+  story.advance(500);
+  story.publish({ A: busy(), B: idle(), D: idle() });
+  check('a second session finishing moments later folds into the alert instead of stacking a chime',
+    story.rings.length === 1, JSON.stringify(story.rings));
+  story.advance(20000);
+  check('…and the alert still plays its configured repeats (3 by default, 5 s apart)',
+    story.rings.length === 3 && story.rings[1].at === 5000 && story.rings[2].at === 10000,
+    JSON.stringify(story.rings.map((ring) => ring.at)));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy(), D: busy() });
+  story.publish({ A: busy(), B: idle(), D: busy() });
+  story.advance(13000);
+  story.publish({ A: busy(), B: idle(), D: idle() });
+  check('once an alert has used up its rings, another session finishing rings again',
+    story.rings.length === 4 && story.rings[3].at === 13000, JSON.stringify(story.rings.map((ring) => ring.at)));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy(), C: busy() });
+  story.publish({ A: busy(), B: idle(), C: busy() });
+  story.advance(300);
+  story.publish({ A: busy(), B: idle(), C: asking() });
+  check('a waiting session takes over a finished alert with its own chime at once',
+    story.rings.length === 2 && story.rings[1].frequencies[0] === WAITING_HZ, JSON.stringify(story.rings));
+  story.advance(20000);
+  check('…and the waiting chime is what repeats',
+    story.rings.length === 4 && story.rings.slice(1).every((ring) => ring.frequencies[0] === WAITING_HZ),
+    JSON.stringify(story.rings.map((ring) => ring.frequencies[0])));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy(), C: busy() });
+  story.publish({ A: busy(), B: busy(), C: asking() });
+  story.advance(300);
+  story.publish({ A: busy(), B: idle(), C: asking() });
+  check('a finished session during a waiting alert folds in (the urgent chime keeps playing)',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === WAITING_HZ, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.publish({ A: busy(), B: idle() });
+  story.advance(5000);
+  story.fire('pointermove');
+  story.advance(20000);
+  check('pointer or key activity cancels the remaining repeats', story.rings.length === 2, JSON.stringify(story.rings.map((ring) => ring.at)));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.publish({ A: busy(), B: idle() });
+  story.publish({ A: busy(), B: busy() });
+  story.advance(20000);
+  check('the repeats stop once the session that rang starts a new turn', story.rings.length === 1, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: idle(), B: busy() });
+  story.publish({ A: idle(), B: idle() });
+  story.publish({ A: busy(), B: idle() });
+  story.advance(20000);
+  check('another session starting a turn does not cancel the alert', story.rings.length === 3, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), C: asking() });
+  story.publish({ A: busy(), C: busy() });
+  story.publish({ A: busy(), C: asking() });
+  story.publish({ A: busy(), C: busy() });
+  story.advance(20000);
+  check('an answered question stops its repeats', story.rings.length === 1, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.setForm({ muted: true });
+  story.rerender();
+  story.publish({ A: busy(), B: idle() });
+  check('muted: nothing rings', story.rings.length === 0, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.publish({ A: busy(), B: idle() });
+  story.setForm({ muted: true });
+  story.rerender();
+  story.advance(20000);
+  check('muting stops an alert in progress', story.rings.length === 1, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy(), C: busy() });
+  story.setForm({ notifyOnTurnEnd: false });
+  story.rerender();
+  story.publish({ A: busy(), B: idle(), C: busy() });
+  story.publish({ A: busy(), B: idle(), C: asking() });
+  check('notifyOnTurnEnd off silences finished turns but not waiting',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === WAITING_HZ, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.setForm({ repeatCount: 2, intervalMs: 3000 });
+  story.rerender();
+  story.publish({ A: busy(), B: idle() });
+  story.advance(20000);
+  check('repeat count and interval come from the settings',
+    story.rings.length === 2 && story.rings[1].at === 3000, JSON.stringify(story.rings.map((ring) => ring.at)));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.publish({ A: busy(), B: idle() });
+  story.unmount();
+  story.advance(20000);
+  check('unmounting the entry stops a playing alert', story.rings.length === 1, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy() }, { hooks: false });
+  story.publish({ A: idle() });
+  story.publish({ A: busy() });
+  check('without useSessionStatus the entry renders, stays silent and reports it once',
+    story.rings.length === 0 && story.errors.filter((line) => line.includes('useSessionStatus')).length === 1,
+    story.errors.join(' | '));
+}
+{
+  const story = await chimeStory({ A: busy(), S: busy() }, { sessions: false });
+  story.publish({ A: busy(), S: idle() });
+  check('without useSessions subagent turns ring too, and the console says why once',
+    story.rings.length === 1 && story.errors.filter((line) => line.includes('useSessions')).length === 1,
+    story.errors.join(' | '));
+}
+
 const app = appDirectory();
 if (!existsSync(app)) {
   console.log(`\nskip — no dsh installation at ${app} (pass --app <path>)`);
-  process.exit(0);
+  // Parts 0 and C need no installation; their failures must not be skipped away.
+  process.exit(failures === 0 ? 0 : 1);
 }
 
 // Anchor this bundle's bare `@deepseek-ai/*` imports at the installation: a clone

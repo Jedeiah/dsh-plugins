@@ -10,7 +10,7 @@
 
 | 插件 | 作用 | 版本 | 直接安装（免 clone） |
 |---|---|---|---|
-| **[turn-notifier](turn-notifier/README.md)** | **提示铃**：智能体需要你注意时响铃提醒（答完一轮 / 停下来等你操作），不理会就按间隔重复，一动鼠标键盘就停。点组件行的箭头可设置提示音、波形、音量与重复次数 | 1.7.3 | `github:Jedeiah/dsh-plugins#path:turn-notifier` |
+| **[turn-notifier](turn-notifier/README.md)** | **提示铃**：智能体需要你注意时响铃提醒（答完一轮 / 停下来等你操作），不理会就按间隔重复，一动鼠标键盘就停。点组件行的箭头可设置提示音、波形、音量与重复次数 | 1.8.0 | `github:Jedeiah/dsh-plugins#path:turn-notifier` |
 | **[session-purge](session-purge/README.md)** | **删除会话**：在会话行的悬停按钮 / 「…」菜单里加「删除会话」，把会话连同子 agent 会话真正从磁盘上删掉。点组件行的箭头可设置清理范围 | 1.1.1 | `github:Jedeiah/dsh-plugins#path:session-purge` |
 | **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **浏览器调试**：接入 chrome-devtools-mcp，给模型浏览器调试工具（页面、快照、截图、DOM/JS 求值、控制台、网络、性能），工具名形如 `mcp__chrome-devtools__<tool>`；并附带随包分发的 7 个调试技能，点组件行的箭头可设置技能开关，以及让智能体操作哪个浏览器（自己拉起一个，或接管你正在用的） | 1.3.1 | `github:Jedeiah/dsh-plugins#path:chrome-devtools-mcp` |
 | **[rea-dsh](rea-dsh/README.md)** | **逆向工程**：接入 REA 的 MCP 服务器，给模型逆向工程工具（原生二进制、Electron/JS 应用、.NET 程序集、APK、固件、网页），工具名形如 `mcp__rea__<tool>`；并分发 `reverse-engineer-anything` 技能、让它自动跟随 REA 的版本走；点组件行的箭头可看状态、自检、设置技能开关与版本 | 1.5.1 | `github:Jedeiah/dsh-plugins#path:rea-dsh` |
