@@ -565,36 +565,48 @@ async function testGateway(app, workroot) {
     // — so it can never be selected in the interface and its bytes stay forever.
     // The residue sweep is the only way back, so it is tested end to end.
     const seventh = await buildStore(join(workroot, 'gateway-store-residue'));
-    const brokenDirectory = join(seventh.project, 'session-broken-0000');
+    const brokenDirectory = join(seventh.project, 'session-b1b1b1b1-0000-4000-8000-000000000001');
     await mkdir(brokenDirectory, { recursive: true });
     // A truncated Zstandard frame: the magic is there, the frame is not.
     await writeFile(join(brokenDirectory, 'session.v4.jsonl.zstd'), Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x00, 0x00]));
-    const emptyDirectory = join(seventh.project, 'session-empty-0000');
+    const emptyDirectory = join(seventh.project, 'session-e1e1e1e1-0000-4000-8000-000000000002');
     await mkdir(emptyDirectory, { recursive: true });
-    const freshDirectory = join(seventh.project, 'session-fresh-0000');
+    // A directory whose name says nothing, but which still holds a stored log: a
+    // damaged session renamed by hand is still a session.
+    const renamedDirectory = join(seventh.project, 'moved-here');
+    await mkdir(renamedDirectory, { recursive: true });
+    await writeFile(join(renamedDirectory, 'session.v4.jsonl.zstd'), Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x00, 0x00]));
+    const freshDirectory = join(seventh.project, 'session-f1f1f1f1-0000-4000-8000-000000000003');
     await mkdir(freshDirectory, { recursive: true });
-    // Backdate the two real leftovers: a directory younger than the age guard is
+    // Neither a session id nor a stored log: someone's own folder under a project
+    // directory. Unreadable, but never this sweep's business.
+    const foreignDirectory = join(seventh.project, 'notes');
+    await mkdir(foreignDirectory, { recursive: true });
+    await writeFile(join(foreignDirectory, 'todo.md'), 'not a session\n');
+    // Backdate the real leftovers: a directory younger than the age guard is
     // treated as a session being created and must be left alone.
     const old = new Date(Date.now() - 3_600_000);
-    await utimes(brokenDirectory, old, old);
-    await utimes(emptyDirectory, old, old);
+    for (const directory of [brokenDirectory, emptyDirectory, renamedDirectory, foreignDirectory]) await utimes(directory, old, old);
 
     const { scanResidue } = await import(join(here, 'engine.js'));
     const unfiltered = await scanResidue({ root: seventh.sessionsRoot });
-    check('the residue scan finds every headerless directory',
-      unfiltered.directories.length === 3, JSON.stringify(unfiltered.directories.map((entry) => entry.directory.split('/').pop())));
+    check('the residue scan finds every headerless session directory',
+      unfiltered.directories.length === 4, JSON.stringify(unfiltered.directories.map((entry) => entry.directory.split('/').pop())));
+    check('a folder that is neither a session id nor a stored log is never reported',
+      !unfiltered.directories.some((entry) => entry.directory === foreignDirectory),
+      JSON.stringify(unfiltered.directories.map((entry) => entry.directory.split('/').pop())));
     const aged = await scanResidue({ root: seventh.sessionsRoot, minimumAgeMs: 60_000 });
     check('the age guard spares a directory that was just created',
-      aged.directories.length === 2 && !aged.directories.some((entry) => entry.directory === freshDirectory),
+      aged.directories.length === 3 && !aged.directories.some((entry) => entry.directory === freshDirectory),
       JSON.stringify(aged.directories.map((entry) => entry.directory.split('/').pop())));
-    check('the scan reports the bytes it would reclaim', aged.bytes === 8, String(aged.bytes));
+    check('the scan reports the bytes it would reclaim', aged.bytes === 16, String(aged.bytes));
 
     const host7 = boot({ ...config.value, sessionsRoot: seventh.sessionsRoot, storagesRoot: seventh.storagesRoot, attachmentsRoot: seventh.attachmentsRoot, spillRoots: [seventh.spillRoot] });
     const preview = await host7.gateway.invoke({ namespace: 'sessionPurge', method: 'sweepResidue', args: { apply: false }, signal: new AbortController().signal, peer: host7.peer });
     check('the preview lists the leftovers and removes nothing',
-      preview.directories.length === 2 && preview.removed === 0 && preview.bytes === 8, JSON.stringify([preview.directories.length, preview.removed]));
+      preview.directories.length === 3 && preview.removed === 0 && preview.bytes === 16, JSON.stringify([preview.directories.length, preview.removed]));
     check('the preview really does not touch the disk',
-      existsSync(brokenDirectory) && existsSync(emptyDirectory));
+      existsSync(brokenDirectory) && existsSync(emptyDirectory) && existsSync(renamedDirectory));
 
     let rejectedFlag;
     try {
@@ -608,8 +620,9 @@ async function testGateway(app, workroot) {
 
     const swept = await host7.gateway.invoke({ namespace: 'sessionPurge', method: 'sweepResidue', args: { apply: true }, signal: new AbortController().signal, peer: host7.peer });
     check('the sweep removes exactly what the preview listed',
-      swept.removed === 2 && !existsSync(brokenDirectory) && !existsSync(emptyDirectory), JSON.stringify(swept.removed));
+      swept.removed === 3 && !existsSync(brokenDirectory) && !existsSync(emptyDirectory) && !existsSync(renamedDirectory), JSON.stringify(swept.removed));
     check('the fresh directory survives the sweep', existsSync(freshDirectory));
+    check('the foreign folder survives the sweep', existsSync(join(foreignDirectory, 'todo.md')));
     check('healthy sessions are untouched by the sweep', existsSync(join(seventh.project, seventh.parentId)));
 
   }

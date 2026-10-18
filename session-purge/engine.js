@@ -36,6 +36,12 @@ const DIGEST_PATTERN = /sha256:([0-9a-f]{64})/g;
 /** A backend-generated default spill root name: `dsh-spill-` plus six characters. */
 export const SPILL_ROOT_PATTERN = /^dsh-spill-[A-Za-z0-9]{6}$/;
 
+/** A backend-generated session id: `session-<uuid>`, or a bare uuid for a subagent. */
+const SESSION_ID_PATTERN = /^(?:session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A stored log file of any generation, compressed or raw. */
+const STORED_LOG_PATTERN = /^session(?:\.v[1-9]\d*)?\.jsonl(?:\.zstd)?$/;
+
 /** A backend-generated per-session spill directory: `session-` plus 12 lowercase hex. */
 export const SPILL_SESSION_PATTERN = /^session-[0-9a-f]{12}$/;
 
@@ -365,6 +371,17 @@ export async function scanResidue({ root, minimumAgeMs = 0, signal }) {
       const directory = join(projectDirectory, entry.name);
       // A readable header means a real session; the index already covers those.
       if (await readSessionHeader(directory) !== undefined) continue;
+      let entries2;
+      try {
+        entries2 = await readdir(directory);
+      } catch {
+        continue;
+      }
+      // Only a directory that is recognisably a session may be deleted: named after
+      // a session id, or still holding a stored log. Anything else under a project
+      // directory (a `notes/` folder someone dropped there, a stray export) is not
+      // this sweep's business, however unreadable it is.
+      if (!SESSION_ID_PATTERN.test(entry.name) && !entries2.some((name) => STORED_LOG_PATTERN.test(name))) continue;
       let info;
       try {
         info = await stat(directory);

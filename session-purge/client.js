@@ -197,6 +197,9 @@ window.__ModuleLoader__.load({
     const UI_STATE_PREFIXES = ['dsh.conversation.', 'dsh.sidebar-right.v1.', 'dsh.user-questions.drafts.v1.'];
     /** The key naming the session the shell last had open. */
     const CURRENT_SESSION_KEY = 'dsh.sessions.current';
+    /** How many residue paths the settings page lists before collapsing the rest. */
+    const RESIDUE_PATHS_SHOWN = 5;
+
     /** How long a success toast stays up. */
     const TOAST_HOLD_MS = 6000;
     /** How long an error toast stays up. */
@@ -244,6 +247,7 @@ window.__ModuleLoader__.load({
       residueRescan: '重新扫描',
       residueClean: '删除这些目录',
       residueCount: '{count} 个目录，共 {size}',
+      residueMore: '……还有 {count} 个（完整清单见宿主报告）',
       residueDone: '已删除 {count} 个目录，回收 {size}',
       residueFailed: '{count} 个目录删不掉，详情见宿主日志',
       residueUnavailable: '宿主没有提供清理接口（版本不匹配？）',
@@ -299,6 +303,7 @@ window.__ModuleLoader__.load({
       residueRescan: 'Scan again',
       residueClean: 'Delete these directories',
       residueCount: '{count} directories, {size} in total',
+      residueMore: '…and {count} more (the full list is in the host report)',
       residueDone: 'Removed {count} directories, freeing {size}',
       residueFailed: '{count} directories could not be removed; see the host log',
       residueUnavailable: 'The host exposes no cleanup method (version mismatch?)',
@@ -722,6 +727,19 @@ window.__ModuleLoader__.load({
                 residue.removed > 0
                   ? t('residueDone').replace('{count}', String(residue.removed)).replace('{size}', formatBytes(residue.bytes))
                   : t('residueCount').replace('{count}', String(residue.directories.length)).replace('{size}', formatBytes(residue.bytes))),
+              // The paths themselves, so "delete" is never a blind click: the
+              // report is the only place the operator can see what would go.
+              residue.removed === 0 && residue.directories.length > 0
+                ? h('ul', { key: 'paths', style: { margin: '0 0 8px', paddingLeft: 18, fontSize: 12, opacity: 0.8, lineHeight: 1.6 } },
+                  residue.directories.slice(0, RESIDUE_PATHS_SHOWN).map((entry) => h('li', {
+                    key: entry.directory,
+                    style: { wordBreak: 'break-all' },
+                  }, `${entry.directory} — ${formatBytes(entry.sizeBytes)}`)))
+                : null,
+              residue.removed === 0 && residue.directories.length > RESIDUE_PATHS_SHOWN
+                ? h('div', { key: 'more', style: { fontSize: 12, opacity: 0.7, marginBottom: 8 } },
+                  t('residueMore').replace('{count}', String(residue.directories.length - RESIDUE_PATHS_SHOWN)))
+                : null,
               residue.failed > 0
                 ? h('div', { key: 'failed', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, marginBottom: 8 } }, t('residueFailed').replace('{count}', String(residue.failed)))
                 : null,
