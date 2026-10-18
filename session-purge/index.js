@@ -23,12 +23,15 @@
  *
  * @module @jedeiah/session-purge
  */
-import { open as openFile, readdir, realpath, rm, rmdir, stat } from 'node:fs/promises';
+import { mkdir, open as openFile, readFile, readdir, realpath, rm, rmdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import {
   discoverSpillRoots,
+  digestsIn,
   indexStoredSessions,
+  listAttachmentObjects,
+  markAttachmentRoots,
   throwIfAborted,
   planPurge,
   readCachedTitle,
@@ -37,7 +40,6 @@ import {
   removeProjectionRecords,
   removeSpillDirectories,
   scanResidue,
-  unreferencedDigests,
 } from './engine.js';
 import * as txn from './txn.js';
 
@@ -64,6 +66,12 @@ const DEFERRED_SETTLE_MS = 300;
 
 /** Retries of a deferred delete that found its session still owned, right after a disposal. */
 const DEFERRED_RETRIES = 10;
+
+/** An unreferenced attachment object must be at least this old to be a gc candidate (DESIGN.md §11). */
+const GC_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The second gc round runs no sooner than this after the first. */
+const GC_ROUND_GAP_MS = 24 * 60 * 60 * 1000;
 
 /** A run id as `txn.newRunId()` mints it. */
 const RUN_ID_PATTERN = /^[0-9a-z]{1,16}-[0-9a-f]{12}$/;
@@ -116,6 +124,8 @@ export const Config = z.object({
   attachmentsRoot: z.string().default(''),
   /** Delay before the startup recovery pass; negative disables it (tests drive it by hand). */
   recoveryDelayMs: z.number().default(1500),
+  /** The DeepSeek adapter's upload manifest, an attachment gc root; empty resolves `$DSH_HOME/llm-deepseek/files-v3.json`. */
+  llmFilesPath: z.string().default(''),
   /** Extra spill roots to sweep besides the `dsh-spill-*` roots under the OS temp directory. */
   spillRoots: z.array(z.string()).default([]).volatile(),
   /** Delete subagent descendants of a deleted session in the same operation. */
@@ -127,11 +137,11 @@ export const Config = z.object({
   /** Delete spilled tool output owned by the deleted sessions. */
   purgeSpill: z.boolean().default(true).volatile(),
   /**
-   * Delete attachment objects no surviving session references. Off by default:
-   * attachment bytes are de-duplicated across sessions, so this is a corpus-wide
-   * reference scan rather than a per-session delete.
+   * Retired. A delete no longer touches attachment bytes (DESIGN.md §6.1); the
+   * separate two-round gc on the settings page reclaims them. Kept in the schema
+   * so an existing configuration still validates, and named in the report when on.
    */
-  purgeAttachments: z.boolean().default(false).volatile(),
+  purgeAttachments: z.boolean().default(false),
 });
 
 /** Prototype key the Typert Remote markers live under. */
@@ -267,6 +277,7 @@ class SessionPurgeService extends TypertRemoteService {
       storagesRoot: this.setting('storagesRoot', ''),
       attachmentsRoot: this.setting('attachmentsRoot', ''),
       spillRoots: Array.isArray(this.setting('spillRoots', [])) ? this.setting('spillRoots', []) : [],
+      llmFilesPath: this.setting('llmFilesPath', ''),
       includeDescendants: this.setting('includeDescendants', true) !== false,
       removeEmptyProjectDirectory: this.setting('removeEmptyProjectDirectory', true) !== false,
       purgeSchedules: this.setting('purgeSchedules', true) !== false,
@@ -312,7 +323,6 @@ class SessionPurgeService extends TypertRemoteService {
       scheduleCount: schedules.length,
       spillDirectoryCount: plan.spillDirectories.length,
       includeDescendants: settings.includeDescendants,
-      purgeAttachments: settings.purgeAttachments,
       targets: await Promise.all(plan.targets.map(async (target) => ({
         sessionId: target.id,
         title: await this.titleOf(target),
@@ -448,9 +458,11 @@ class SessionPurgeService extends TypertRemoteService {
     }
     throwIfAborted(signal);
 
+    if (settings.purgeAttachments) {
+      warnings.push('purgeAttachments is retired: a delete no longer removes attachment bytes; use "attachment reclaim" on the plugin settings page');
+    }
     const fence = await this.fence(plan.targets);
     let manifest;
-    let digests;
     try {
       if (fence.owned.length > 0) throw liveError(fence.owned);
       const liveNow = plan.targetIds.filter((id) => this.isLive(id));
@@ -515,21 +527,6 @@ class SessionPurgeService extends TypertRemoteService {
       // checkpoint delete must already meet the watcher.
       this.armTombstones(manifest, Date.now() + RETAIN_MANIFEST_MS);
 
-      if (settings.purgeAttachments) {
-        try {
-          digests = await unreferencedDigests({
-            doomed: plan.targets.map((target) => target.directory),
-            survivors: [...plan.index.values()].filter((record) => !plan.targetIds.includes(record.id)).map((record) => record.directory),
-          });
-        } catch (error) {
-          // Nothing has moved yet: the sessions survive, so their tombstones must
-          // not outlive this attempt, and the run is not worth recovering.
-          this.disarmTombstones(manifest.targets.map((target) => target.id));
-          await txn.removeRun(staging, manifest.runId).catch(() => undefined);
-          throw error;
-        }
-      }
-
       for (const entry of manifest.entries) {
         try {
           await txn.commitEntry(entry.source, entry.staged);
@@ -554,7 +551,7 @@ class SessionPurgeService extends TypertRemoteService {
       if (target.state === 'COMMITTED') removed.bytesFreed += target.sizeBytes;
     }
     removed.sessionDirectories = manifest.entries.filter((entry) => entry.state === 'COMMITTED').length;
-    await this.completeCommitted({ staging, manifest, digests, warnings, removed });
+    await this.completeCommitted({ staging, manifest, warnings, removed });
     return this.reportOf(plan.sessionId, plan, manifest, removed, warnings);
   }
 
@@ -1053,11 +1050,10 @@ class SessionPurgeService extends TypertRemoteService {
    * verify, and record the outcome. Idempotent step by step.
    * @param params.staging - the staging root.
    * @param params.manifest - the run's manifest (mutated and persisted).
-   * @param params.digests - attachment digests to collect, when computed this run.
    * @param params.warnings - the warning sink.
    * @param params.removed - removal counters.
    */
-  async completeCommitted({ staging, manifest, digests, warnings, removed }) {
+  async completeCommitted({ staging, manifest, warnings, removed }) {
     const committedIds = manifest.targets.filter((target) => target.state === 'COMMITTED').map((target) => target.id);
     const settings = manifest.settings ?? {};
 
@@ -1098,17 +1094,6 @@ class SessionPurgeService extends TypertRemoteService {
       } else {
         removed.spillDirectories += await removeSpillDirectories({ ids: committedIds, roots: await discoverSpillRoots(settings.spillRoots ?? []), warnings });
         manifest.steps.spill = 'done';
-      }
-    }
-    if (digests !== undefined) {
-      if (manifest.targets.some((target) => target.state !== 'COMMITTED')) {
-        // The surviving logs still reference their attachments, and the digests
-        // were computed for the whole target set, so nothing is collected here.
-        warnings.push('attachment objects were kept: the removal was incomplete, so a surviving log may still reference them');
-      } else {
-        const attachments = await removeAttachments({ root: this.attachmentsRoot(), digests, warnings });
-        removed.attachmentObjects += attachments.objects;
-        removed.attachmentLinks += attachments.links;
       }
     }
     await txn.writeManifest(staging, manifest);
@@ -1380,7 +1365,7 @@ class SessionPurgeService extends TypertRemoteService {
     manifest.state = 'COMMITTED';
     this.armTombstones(manifest, Date.now() + RETAIN_MANIFEST_MS);
     await txn.writeManifest(staging, manifest);
-    await this.completeCommitted({ staging, manifest, digests: undefined, warnings, removed });
+    await this.completeCommitted({ staging, manifest, warnings, removed });
     for (const warning of warnings) this.warn(`recovery of ${manifest.runId}: ${warning}`);
     return 'resumed';
   }
@@ -1572,6 +1557,120 @@ class SessionPurgeService extends TypertRemoteService {
     return report;
   }
 
+  /**
+   * The attachment gc (DESIGN.md §11), separate from any delete and never run on
+   * its own. Attachment bytes are content-addressed and shared, and a client's
+   * unsent draft can point at one no log mentions yet, so reclaiming is slow on
+   * purpose:
+   *
+   *   status   what round one recorded, and when round two may run;
+   *   scan     round one — record unreferenced objects older than the grace
+   *            period as candidates; nothing is deleted;
+   *   collect  round two, at least a day later — mark again and delete only
+   *            candidates that are still unreferenced, while an insertion
+   *            barrier on `session/event` withdraws any digest a new event names.
+   *
+   * Any log that cannot be read in full, or any session-shaped directory whose
+   * header cannot be read, stops the whole pass: a hidden reference would make a
+   * delete irreversible damage.
+   * @param mode - `'status'`, `'scan'` or `'collect'`.
+   * @param signal - aborts the marking.
+   * @returns what the pass found or did.
+   */
+  async attachmentGc(mode, signal) {
+    // The barrier goes up before anything awaits: from here to the last unlink,
+    // a reference written anywhere in this process withdraws its digest.
+    const withdrawn = new Set();
+    const lowerBarrier = mode === 'collect'
+      ? this.ctx.on('session/event', (_session, event) => { for (const digest of digestsIn(event)) withdrawn.add(digest); })
+      : () => undefined;
+    try {
+      if (mode !== 'status' && mode !== 'scan' && mode !== 'collect') {
+        throw new RemoteError('session-purge/invalid-gc-mode', 'mode must be status, scan or collect', { mode: String(mode) });
+      }
+      const root = this.sessionsRoot();
+      let staging;
+      try {
+        staging = await txn.stagingRootFor(root);
+      } catch {
+        throw new RemoteError('session-purge/session-unknown', `the session root "${root}" does not exist`, { root });
+      }
+      const candidatesPath = join(staging, 'gc', 'candidates.json');
+      const readCandidates = async () => {
+        try {
+          const value = JSON.parse(await readFile(candidatesPath, 'utf8'));
+          return value?.version === 1 && Array.isArray(value.digests) && typeof value.markedAt === 'number' ? value : undefined;
+        } catch {
+          return undefined;
+        }
+      };
+      if (mode === 'status') {
+        const candidates = await readCandidates();
+        return {
+          mode,
+          candidates: candidates?.digests.length ?? 0,
+          markedAt: candidates?.markedAt ?? null,
+          eligibleAt: candidates === undefined ? null : candidates.markedAt + GC_ROUND_GAP_MS,
+          bytes: candidates?.bytes ?? 0,
+        };
+      }
+      return await this.exclusive(staging, async () => {
+        const manifestFiles = [this.llmFilesPath()];
+        const now = Date.now();
+        if (mode === 'scan') {
+          const mark = await markAttachmentRoots({ sessionsRoot: root, manifestFiles, signal });
+          if (!mark.complete) return { mode, aborted: true, reason: mark.reason, candidates: 0, bytes: 0 };
+          const objects = (await listAttachmentObjects(this.attachmentsRoot()))
+            .filter((object) => !mark.referenced.has(object.digest) && now - object.modifiedAt >= GC_GRACE_MS);
+          const digests = [...new Set(objects.map((object) => object.digest))];
+          const bytes = objects.reduce((total, object) => total + object.sizeBytes, 0);
+          await mkdir(join(staging, 'gc'), { recursive: true, mode: 0o700 });
+          await txn.writeJsonDurable(candidatesPath, { version: 1, markedAt: now, digests, bytes });
+          return { mode, aborted: false, candidates: digests.length, bytes, eligibleAt: now + GC_ROUND_GAP_MS };
+        }
+        const candidates = await readCandidates();
+        if (candidates === undefined) {
+          throw new RemoteError('session-purge/gc-no-candidates', 'run the first round (scan) before collecting', {});
+        }
+        if (now - candidates.markedAt < GC_ROUND_GAP_MS) {
+          throw new RemoteError('session-purge/gc-too-early', 'the second round runs at least a day after the first, so references created in between are seen', { eligibleAt: candidates.markedAt + GC_ROUND_GAP_MS });
+        }
+        const mark = await markAttachmentRoots({ sessionsRoot: root, manifestFiles, signal });
+        if (!mark.complete) return { mode, aborted: true, reason: mark.reason, removed: 0, links: 0, bytes: 0, kept: candidates.digests.length };
+        const present = new Map((await listAttachmentObjects(this.attachmentsRoot())).map((object) => [object.digest, object]));
+        const warnings = [];
+        const report = { mode, aborted: false, removed: 0, links: 0, bytes: 0, kept: 0, warnings };
+        for (const digest of candidates.digests) {
+          const object = present.get(digest);
+          // Withdrawn by the barrier, referenced again, or touched since round one.
+          if (object === undefined || withdrawn.has(digest) || mark.referenced.has(digest) || now - object.modifiedAt < GC_GRACE_MS) {
+            report.kept += 1;
+            continue;
+          }
+          const removed = await removeAttachments({ root: this.attachmentsRoot(), digests: [digest], warnings });
+          report.removed += removed.objects;
+          report.links += removed.links;
+          if (removed.objects > 0) report.bytes += object.sizeBytes;
+        }
+        await rm(candidatesPath, { force: true });
+        try {
+          await txn.appendAudit(staging, { gc: 'collect', removed: report.removed, kept: report.kept, bytes: report.bytes });
+        } catch {
+          /* the audit is best effort */
+        }
+        return report;
+      });
+    } finally {
+      lowerBarrier();
+    }
+  }
+
+  /** Resolve the DeepSeek adapter's upload manifest, an attachment gc root. */
+  llmFilesPath() {
+    const configured = this.setting('llmFilesPath', '');
+    return configured !== '' ? configured : join(resolveDshHome(), 'llm-deepseek', 'files-v3.json');
+  }
+
   /** Resolve the configured session log root, defaulting to the shipped layout. */
   sessionsRoot() {
     const configured = this.setting('sessionsRoot', '');
@@ -1725,7 +1824,7 @@ class SessionPurgeService extends TypertRemoteService {
   }
 }
 
-markRemoteMethods(SessionPurgeService.prototype, ['inspect', 'purge', 'sweepResidue', 'pending', 'cancelPending', 'retryPending']);
+markRemoteMethods(SessionPurgeService.prototype, ['inspect', 'purge', 'sweepResidue', 'pending', 'cancelPending', 'retryPending', 'attachmentGc']);
 
 /**
  * The checkpoint identity a stored header witnesses, reduced to what tells two

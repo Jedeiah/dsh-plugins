@@ -78,6 +78,19 @@ function runIdCodec() {
   };
 }
 
+/**
+ * A strict codec for the attachment gc's mode.
+ * @returns the codec.
+ */
+function gcModeCodec() {
+  return {
+    parse(value) {
+      if (value !== 'status' && value !== 'scan' && value !== 'collect') throw new Error('session-purge: mode must be status, scan or collect');
+      return value;
+    },
+  };
+}
+
 /** Endpoint ids, spelled `<package>#<namespace>/<method>` like the generated ones. */
 const PACKAGE = '@jedeiah/session-purge';
 
@@ -199,6 +212,31 @@ export const TYPERT = {
         create: passthroughCodec,
       },
     })),
+    {
+      id: `${PACKAGE}#sessionPurge/attachmentGc`,
+      service: 'sessionPurge',
+      namespace: 'sessionPurge',
+      method: 'attachmentGc',
+      invocation: { kind: 'direct' },
+      parameters: [
+        {
+          name: 'mode',
+          wire: 'mode',
+          source: 'json',
+          codec: {
+            mode: 'strict',
+            typeSymbol: `${PACKAGE}#AttachmentGcMode`,
+            create: gcModeCodec,
+          },
+        },
+      ],
+      cancellation: { parameter: 'signal' },
+      result: {
+        mode: 'strict',
+        typeSymbol: `${PACKAGE}#SessionPurgeAttachmentGc`,
+        create: passthroughCodec,
+      },
+    },
   ],
   model: {
     services: [],

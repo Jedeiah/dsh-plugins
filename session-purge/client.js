@@ -67,7 +67,6 @@ window.__ModuleLoader__.load({
       ['removeEmptyProjectDirectory', true],
       ['purgeSchedules', true],
       ['purgeSpill', true],
-      ['purgeAttachments', false],
     ];
     /** Dictionary namespace owned by this plugin. */
     const LOCALE_NS = 'plugin.sessionPurge';
@@ -174,6 +173,23 @@ window.__ModuleLoader__.load({
       };
     }
 
+    /**
+     * The Client mirror of `typert.js`'s gc-mode codec.
+     * @returns the codec.
+     */
+    function gcModeCodec() {
+      return {
+        mode: 'strict',
+        typeSymbol: `${BUNDLE_NAME}#AttachmentGcMode`,
+        create: () => ({
+          parse(value) {
+            if (typeof value !== 'string') throw new Error('session-purge: mode must be a string');
+            return value;
+          },
+        }),
+      };
+    }
+
     /** Hand-written Client manifest, mirroring `typert.js`. */
     const TYPERT_REMOTE = {
       package: BUNDLE_NAME,
@@ -226,6 +242,16 @@ window.__ModuleLoader__.load({
           parameters: [{ name: 'runId', wire: 'runId', source: 'json', codec: runIdCodec() }],
           result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurge${method[0].toUpperCase()}${method.slice(1)}Result`, create: passthroughCodec },
         })),
+        {
+          id: `${BUNDLE_NAME}#sessionPurge/attachmentGc`,
+          service: 'sessionPurge',
+          namespace: 'sessionPurge',
+          method: 'attachmentGc',
+          invocation: { kind: 'direct' },
+          parameters: [{ name: 'mode', wire: 'mode', source: 'json', codec: gcModeCodec() }],
+          cancellation: { parameter: 'signal' },
+          result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurgeAttachmentGc`, create: passthroughCodec },
+        },
       ],
     };
 
@@ -289,9 +315,6 @@ window.__ModuleLoader__.load({
       residueUnavailable: '宿主没有提供清理接口（版本不匹配？）',
       settingsSaveFailed: '这次改动没有被宿主接受（可能被另一个窗口改过），请重试。',
       statsSchedules: '绑定的提醒',
-      statsAttachments: '清理无引用附件',
-      attachmentsOn: '是（会扫描其余会话的引用）',
-      attachmentsOff: '否（附件对象保留）',
       deferWarning: '下面这些会话正在使用中，没法立刻删除。确认后会先停止它们（正在跑的任务会被中断、它们的活跃提醒会被删除）并归档，内容在下次启动 dsh 时删除；在那之前可以到插件设置页取消。',
       liveTargets: '正在使用：',
       confirmDefer: '停止并在重启后删除',
@@ -312,8 +335,8 @@ window.__ModuleLoader__.load({
       confirmPending: '正在删除…',
       cancel: '取消',
       close: '关闭',
-      settingsSummary: '删除会话的清扫范围：子会话、空项目目录、绑定的提醒、工具落盘文件、无引用附件。',
-      settingsIntro: '这些开关决定「删除会话」会清掉哪些痕迹。改动立即生效，不需要重启。附件默认保留：字节是跨会话共享去重的。',
+      settingsSummary: '删除会话的清扫范围：子会话、空项目目录、绑定的提醒、工具落盘文件；另有待完成的删除与附件回收。',
+      settingsIntro: '这些开关决定「删除会话」会清掉哪些痕迹。改动立即生效，不需要重启。',
       settingsLoading: '正在读取配置…',
       settingsUnavailable: '当前不可写（远端页面或未连接本机）。',
       optIncludeDescendants: '一并删除子 agent 会话',
@@ -326,8 +349,16 @@ window.__ModuleLoader__.load({
       hintPurgeSpill: '工具大输出的落盘文件，按会话 id 的哈希定位。',
       optSpillRoots: '额外要扫的 spill 根（逗号分隔）',
       hintSpillRoots: '留空即可：默认扫系统临时目录下的 dsh-spill-*。',
-      optPurgeAttachments: '清理无引用附件',
-      hintPurgeAttachments: '先扫描其余会话的引用，只删除没有任何保留会话再引用的附件对象（图片/文件字节）。',
+      gcTitle: '附件回收',
+      gcHint: '附件字节是跨会话共享去重的，删除会话时不会动它们。这里可以回收没有任何会话再引用的附件，分两步、至少隔一天：第一步只登记候选（未被引用、且超过 7 天没动过的），第二步重新扫描，只删两次都没人引用的。有读不出来的会话时整次中止。注意：还没发送的草稿里引用的图片无法被看到。',
+      gcScan: '第一步：登记候选',
+      gcCollect: '第二步：回收',
+      gcNone: '还没有登记候选。',
+      gcStatus: '已登记 {count} 个候选，共 {size}；{when} 之后可以执行第二步。',
+      gcScanned: '登记了 {count} 个候选，共 {size}。',
+      gcCollected: '已回收 {count} 个附件，释放 {size}；{kept} 个因重新被引用等原因保留。',
+      gcAborted: '已中止，一个字节都没删：{reason}',
+      gcFailed: '操作失败：{message}',
       toastDeleted: '已删除 {count} 个会话，释放 {size}',
       toastWarned: '；有 {count} 条警告，详见日志',
       toastFailed: '删除失败：{message}',
@@ -359,9 +390,6 @@ window.__ModuleLoader__.load({
       residueUnavailable: 'The host exposes no cleanup method (version mismatch?)',
       settingsSaveFailed: 'The host rejected this change (another window may have edited it). Try again.',
       statsSchedules: 'Bound reminders',
-      statsAttachments: 'Purge unreferenced attachments',
-      attachmentsOn: 'yes (scans the surviving sessions first)',
-      attachmentsOff: 'no (attachment objects are kept)',
       deferWarning: 'These sessions are in use and cannot be deleted right away. Confirming stops them first (running work is interrupted and their active reminders are deleted) and archives them; their content is deleted the next time dsh starts. Until then you can cancel from the plugin settings page.',
       liveTargets: 'In use:',
       confirmDefer: 'Stop and delete on restart',
@@ -382,8 +410,8 @@ window.__ModuleLoader__.load({
       confirmPending: 'Deleting…',
       cancel: 'Cancel',
       close: 'Close',
-      settingsSummary: 'What a delete sweeps: subagent sessions, emptied project directories, bound reminders, spilled tool output and unreferenced attachments.',
-      settingsIntro: 'These switches decide what "Delete session" removes. Changes apply immediately; no restart needed. Attachments stay by default because their bytes are de-duplicated across sessions.',
+      settingsSummary: 'What a delete sweeps: subagent sessions, emptied project directories, bound reminders and spilled tool output; plus pending deletions and attachment reclaim.',
+      settingsIntro: 'These switches decide what "Delete session" removes. Changes apply immediately; no restart needed.',
       settingsLoading: 'Loading configuration…',
       settingsUnavailable: 'Not writable from here (remote page or no local connection).',
       optIncludeDescendants: 'Delete subagent sessions too',
@@ -396,8 +424,16 @@ window.__ModuleLoader__.load({
       hintPurgeSpill: 'Large tool output spilled to disk, addressed by the hash of the session id.',
       optSpillRoots: 'Extra spill roots (comma separated)',
       hintSpillRoots: 'Leave empty for the default: every dsh-spill-* root under the OS temp directory.',
-      optPurgeAttachments: 'Purge unreferenced attachments',
-      hintPurgeAttachments: 'Scans the surviving sessions first and removes only attachment objects no session references any more.',
+      gcTitle: 'Attachment reclaim',
+      gcHint: 'Attachment bytes are shared and de-duplicated across sessions, so deleting a session never touches them. This reclaims attachments no session references any more, in two steps at least a day apart: step one only records candidates (unreferenced and untouched for 7 days), step two scans again and deletes only what was unreferenced both times. Any unreadable session stops the whole pass. An image referenced only by an unsent draft cannot be seen.',
+      gcScan: 'Step 1: record candidates',
+      gcCollect: 'Step 2: reclaim',
+      gcNone: 'No candidates recorded yet.',
+      gcStatus: '{count} candidate(s) recorded ({size}). Step two is possible after {when}.',
+      gcScanned: 'Recorded {count} candidate(s), {size}.',
+      gcCollected: 'Reclaimed {count} attachment(s), freeing {size}. Kept {kept} that were referenced again or changed.',
+      gcAborted: 'Stopped without deleting anything: {reason}',
+      gcFailed: 'That did not work: {message}',
       toastDeleted: 'Deleted {count} session(s), freed {size}',
       toastWarned: '; {count} warning(s) logged',
       toastFailed: 'Delete failed: {message}',
@@ -514,6 +550,10 @@ window.__ModuleLoader__.load({
          */
         residue(apply) {
           return call('sweepResidue', apply === true);
+        },
+        /** One step of the attachment gc. */
+        attachmentGc(mode) {
+          return call('attachmentGc', mode);
         },
         /** The deferred deletes still waiting. */
         pending() {
@@ -646,7 +686,6 @@ window.__ModuleLoader__.load({
         h('li', { key: 'sessions' }, `${t('statsSessions')}: ${String(inspection.targets.length)}`),
         h('li', { key: 'size' }, `${t('statsSize')}: ${formatBytes(inspection.sizeBytes)}`),
         h('li', { key: 'schedules' }, `${t('statsSchedules')}: ${String(inspection.scheduleCount)}`),
-        h('li', { key: 'attachments' }, `${t('statsAttachments')}: ${inspection.purgeAttachments ? t('attachmentsOn') : t('attachmentsOff')}`),
       ];
       return h(primitives.Modal, {
         open: true,
@@ -766,8 +805,36 @@ window.__ModuleLoader__.load({
           () => setPendingRuns([]),
         );
       };
+      // Attachment reclaim: same guard, same reason.
+      const [gcStatus, setGcStatus] = React.useState(null);
+      const [gcBusy, setGcBusy] = React.useState(false);
+      const [gcNote, setGcNote] = React.useState(null);
+      const runGc = (mode) => {
+        if (typeof purge?.attachmentGc !== 'function') return;
+        if (mode !== 'status') {
+          setGcBusy(true);
+          setGcNote(null);
+        }
+        guarded(() => purge.attachmentGc(mode)).then(
+          (answer) => {
+            setGcBusy(false);
+            if (mode === 'status') setGcStatus(answer);
+            else if (answer?.aborted === true) setGcNote(t('gcAborted', { reason: String(answer.reason ?? '') }));
+            else if (mode === 'scan') setGcNote(t('gcScanned', { count: answer?.candidates ?? 0, size: formatBytes(answer?.bytes ?? 0) }));
+            else setGcNote(t('gcCollected', { count: answer?.removed ?? 0, size: formatBytes(answer?.bytes ?? 0), kept: answer?.kept ?? 0 }));
+            if (mode !== 'status') runGc('status');
+          },
+          (error) => {
+            setGcBusy(false);
+            if (mode !== 'status') setGcNote(t('gcFailed', { message: String(error?.message ?? error) }));
+          },
+        );
+      };
       React.useEffect(() => {
-        if (view !== 'summary') loadPending();
+        if (view !== 'summary') {
+          loadPending();
+          runGc('status');
+        }
       }, [view]);
       const actOnPending = (runId, action) => {
         const method = action === 'cancel' ? purge?.cancelPending : purge?.retryPending;
@@ -912,6 +979,26 @@ window.__ModuleLoader__.load({
                 ]),
               ]))),
           pendingNote === null ? null : h('div', { key: 'note', role: 'status', style: { fontSize: 12, marginTop: 8 } }, pendingNote),
+        ]),
+        h('div', { key: 'gc', style: { marginTop: 18, paddingTop: 12, borderTop: '1px solid var(--dsw-alias-border-l1)' } }, [
+          h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, t('gcTitle')),
+          h('div', { key: 'hint', style: { opacity: 0.7, fontSize: 12, lineHeight: 1.5, marginBottom: 8 } }, t('gcHint')),
+          gcStatus === null
+            ? null
+            : h('div', { key: 'status', style: { fontSize: 12, marginBottom: 8 } }, gcStatus.candidates > 0
+              ? t('gcStatus', { count: gcStatus.candidates, size: formatBytes(gcStatus.bytes ?? 0), when: new Date(gcStatus.eligibleAt).toLocaleString() })
+              : t('gcNone')),
+          h('div', { key: 'actions', style: { display: 'flex', gap: 8 } }, [
+            h(primitives.Button, { key: 'scan', variant: 'outline', disabled: gcBusy, onClick: () => runGc('scan') }, t('gcScan')),
+            h(primitives.Button, {
+              key: 'collect',
+              variant: 'outline',
+              disabled: gcBusy || gcStatus === null || !(gcStatus.candidates > 0) || Date.now() < (gcStatus.eligibleAt ?? Infinity),
+              onClick: () => runGc('collect'),
+              style: DESTRUCTIVE_STYLE,
+            }, t('gcCollect')),
+          ]),
+          gcNote === null ? null : h('div', { key: 'note', role: 'status', style: { fontSize: 12, marginTop: 8 } }, gcNote),
         ]),
         saveFailed ? h('div', { key: 'save-failed', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12 } }, t('settingsSaveFailed')) : null,
       ]);

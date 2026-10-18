@@ -581,6 +581,100 @@ export async function unreferencedDigests({ doomed, survivors, signal }) {
 }
 
 /**
+ * Every attachment object under the root, with what the gc decides on.
+ * @param root - the attachment root.
+ * @returns `{ digest, path, sizeBytes, modifiedAt }` per object file.
+ */
+export async function listAttachmentObjects(root) {
+  const objects = [];
+  for (const tree of ['objects', 'file-objects']) {
+    const base = join(root, 'v1', tree);
+    let prefixes;
+    try {
+      prefixes = await readdir(base, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const prefix of prefixes) {
+      if (!prefix.isDirectory() || !/^[0-9a-f]{2}$/.test(prefix.name)) continue;
+      let names;
+      try {
+        names = await readdir(join(base, prefix.name), { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        if (!name.isFile() || !/^[0-9a-f]{64}$/.test(name.name) || !name.name.startsWith(prefix.name)) continue;
+        const path = join(base, prefix.name, name.name);
+        try {
+          const info = await stat(path);
+          objects.push({ digest: name.name, path, sizeBytes: info.size, modifiedAt: info.mtimeMs });
+        } catch {
+          /* vanished mid-scan */
+        }
+      }
+    }
+  }
+  return objects;
+}
+
+/**
+ * The attachment gc's root set (DESIGN.md §11): every digest a readable session
+ * log references, plus every digest the DeepSeek adapter's upload manifest
+ * (`files-v3.json`) still names. The answer is only usable when it is complete:
+ * one log that cannot be read in full, or one session-shaped directory whose
+ * header cannot be read, may hide a reference — and deleting an object someone
+ * still points at is irreversible. So either is reported, and the gc stops.
+ * @param params.sessionsRoot - the session log root.
+ * @param params.manifestFiles - extra files whose `sha256:` references are roots.
+ * @param params.signal - aborts between logs.
+ * @returns `{ referenced, complete, reason }`.
+ */
+export async function markAttachmentRoots({ sessionsRoot, manifestFiles = [], signal }) {
+  const referenced = new Set();
+  const residue = await scanResidue({ root: sessionsRoot, signal });
+  if (residue.directories.length > 0) {
+    return { referenced, complete: false, reason: `undecidable-holder: ${residue.directories[0].directory}` };
+  }
+  const index = await indexStoredSessions(sessionsRoot);
+  for (const record of index.values()) {
+    for (const entry of [record, ...record.duplicates]) {
+      throwIfAborted(signal);
+      if (!(await collectDigestsReport(entry.directory, referenced))) {
+        return { referenced, complete: false, reason: `unreadable-log: ${entry.directory}` };
+      }
+    }
+  }
+  for (const file of manifestFiles) {
+    let text;
+    try {
+      text = await readFile(file, 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      return { referenced, complete: false, reason: `unreadable-manifest: ${file}` };
+    }
+    for (const match of text.matchAll(DIGEST_PATTERN)) referenced.add(match[1]);
+  }
+  return { referenced, complete: true, reason: null };
+}
+
+/**
+ * Every digest a value mentions — the gc's insertion barrier reads appended
+ * session events through this.
+ * @param value - any JSON-serializable value.
+ * @returns the digests.
+ */
+export function digestsIn(value) {
+  let text;
+  try {
+    text = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    return [];
+  }
+  return [...(text ?? '').matchAll(DIGEST_PATTERN)].map((match) => match[1]);
+}
+
+/**
  * Remove the objects and reference links behind a digest set.
  * @param params.root - the attachment root.
  * @param params.digests - digests nothing references any more.

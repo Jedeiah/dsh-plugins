@@ -577,7 +577,10 @@ async function testGateway(app, workroot) {
     }
     seam.owned.clear();
     const retry = await liveHost.invoke('purge', { sessionId: second.parentId });
-    check('once nobody owns it, the same purge succeeds and clears the unreferenced attachment', retry.removedIds.length === 3 && retry.removed.attachmentObjects === 1, JSON.stringify(retry.removed));
+    check('once nobody owns it, the same purge succeeds', retry.removedIds.length === 3, JSON.stringify(retry.removedIds));
+    // purgeAttachments is retired: a delete never touches attachment bytes, and
+    // the report says so instead of silently doing nothing.
+    check('the retired purgeAttachments leaves attachments alone and says so', retry.removed.attachmentObjects === 0 && existsSync(join(second.attachmentsRoot, 'v1', 'objects', second.doomedDigest.slice(0, 2), second.doomedDigest)) && retry.warnings.some((line) => line.includes('purgeAttachments is retired')), JSON.stringify(retry.warnings));
   }
 
   // ── Bookkeeping through the owners' services ───────────────────────────────
@@ -882,6 +885,69 @@ async function testGateway(app, workroot) {
     services(restart, afterRestart.ctx);
     const startup = await afterRestart.service().recover();
     check('the next start completes a deferred delete', startup.deferred?.[0]?.status === 'done' && !allThere(restart) && !existsSync(join(restart.project, restart.childId)), JSON.stringify(startup));
+  }
+
+  // ── Attachment gc: two rounds, a barrier, and a stop on anything undecidable ──
+  {
+    const gcStore = await buildStore(join(workroot, 'gateway-store-gc'));
+    const filesManifest = join(gcStore.root, 'llm-deepseek', 'files-v3.json');
+    const gcHost = boot({ ...rooted(gcStore), llmFilesPath: filesManifest });
+    // The doomed object is referenced by the parent alone: once the parent is
+    // deleted, nothing references it.
+    await gcHost.invoke('purge', { sessionId: gcStore.parentId });
+    const objectPath = (digest) => join(gcStore.attachmentsRoot, 'v1', 'objects', digest.slice(0, 2), digest);
+    const orphan = 'd'.repeat(64); // never referenced; gains a reference between the rounds
+    const barrierDigest = '9'.repeat(64); // never referenced; gains one during round two
+    const uploaded = 'e'.repeat(64); // named only by the upload manifest
+    const fresh = 'f'.repeat(64); // unreferenced but inside the grace period
+    for (const digest of [orphan, barrierDigest, uploaded, fresh]) {
+      await mkdir(dirname(objectPath(digest)), { recursive: true });
+      await writeFile(objectPath(digest), `${digest.slice(0, 8)} bytes`);
+    }
+    await mkdir(dirname(filesManifest), { recursive: true });
+    await writeFile(filesManifest, JSON.stringify({ formatVersion: 3, records: [{ attachmentId: `sha256:${uploaded}` }] }));
+    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    for (const digest of [gcStore.doomedDigest, gcStore.keptDigest, gcStore.sharedDigest, orphan, barrierDigest, uploaded]) await utimes(objectPath(digest), old, old);
+
+    const status0 = await gcHost.invoke('attachmentGc', { mode: 'status' });
+    check('gc status starts with no candidates', status0.candidates === 0 && status0.eligibleAt === null, JSON.stringify(status0));
+    const noScan = await gcHost.attempt('attachmentGc', { mode: 'collect' });
+    check('collecting without a first round is refused', noScan.error?.code === 'session-purge/gc-no-candidates', String(noScan.error?.code));
+    const scan = await gcHost.invoke('attachmentGc', { mode: 'scan' });
+    const candidates = JSON.parse(await readFile(join(await txn.stagingRootFor(gcStore.sessionsRoot), 'gc', 'candidates.json'), 'utf8'));
+    check('round one records exactly the old, unreferenced objects', scan.candidates === 3 && [gcStore.doomedDigest, orphan, barrierDigest].every((digest) => candidates.digests.includes(digest)), JSON.stringify(candidates.digests.map((digest) => digest.slice(0, 4))));
+    check('referenced, manifest-named and fresh objects are never candidates', ![gcStore.keptDigest, gcStore.sharedDigest, uploaded, fresh].some((digest) => candidates.digests.includes(digest)));
+    check('round one deletes nothing', [gcStore.doomedDigest, orphan, barrierDigest].every((digest) => existsSync(objectPath(digest))));
+    const tooEarly = await gcHost.attempt('attachmentGc', { mode: 'collect' });
+    check('round two within a day of round one is refused', tooEarly.error?.code === 'session-purge/gc-too-early', String(tooEarly.error?.code));
+
+    // Between the rounds a new session starts referencing `orphan`.
+    const lateId = 'session-late-ref-0000';
+    await mkdir(join(gcStore.survivorProject, lateId), { recursive: true });
+    await writeFile(join(gcStore.survivorProject, lateId, 'session.v4.jsonl.zstd'), storedLog(
+      { type: 'session', version: 4, id: lateId, createdAt: 50, cwd: '/Users/example/projects/demo', isSeeded: false, delegationDepth: 0 },
+      [{ type: 'user/message', seq: 1, time: 51, data: { content: [{ type: 'image', source: `sha256:${orphan}` }] } }],
+    ));
+    candidates.markedAt -= 25 * 60 * 60 * 1000;
+    await writeFile(join(await txn.stagingRootFor(gcStore.sessionsRoot), 'gc', 'candidates.json'), JSON.stringify(candidates));
+    // And while round two runs, an event in this process references another one.
+    const collecting = gcHost.service().attachmentGc('collect');
+    gcHost.ctx.emit('session/event', { id: 'session-somewhere' }, { type: 'user/message', data: { content: [{ type: 'image', source: `sha256:${barrierDigest}` }] } });
+    const collected = await collecting;
+    check('round two deletes the candidate that stayed unreferenced', !existsSync(objectPath(gcStore.doomedDigest)) && !existsSync(join(gcStore.attachmentsRoot, 'v1', 'files', gcStore.doomedDigest.slice(0, 2), gcStore.doomedDigest)) && collected.removed === 1, JSON.stringify(collected));
+    check('a reference created between the rounds withdraws its candidate', existsSync(objectPath(orphan)));
+    check('a reference written during round two is caught by the barrier', existsSync(objectPath(barrierDigest)) && collected.kept === 2, JSON.stringify(collected));
+    check('nothing referenced is ever touched', [gcStore.keptDigest, gcStore.sharedDigest, uploaded, fresh].every((digest) => existsSync(objectPath(digest))));
+    check('round two consumes the candidate list', (await gcHost.invoke('attachmentGc', { mode: 'status' })).candidates === 0);
+
+    // A session-shaped directory nobody can read might hold a reference: stop.
+    const unreadable = join(gcStore.survivorProject, 'session-c0c0c0c0-0000-4000-8000-000000000009');
+    await mkdir(unreadable, { recursive: true });
+    await writeFile(join(unreadable, 'session.v4.jsonl.zstd'), Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x00, 0x00]));
+    const blocked = await gcHost.invoke('attachmentGc', { mode: 'scan' });
+    check('an unreadable session stops the gc before it records anything', blocked.aborted === true && String(blocked.reason).startsWith('undecidable-holder') && (await gcHost.invoke('attachmentGc', { mode: 'status' })).candidates === 0, JSON.stringify(blocked));
+    const badMode = await gcHost.attempt('attachmentGc', { mode: 'everything' });
+    check('an unknown gc mode is refused before any path use', badMode.error?.code === 'gateway/input-invalid' || badMode.error?.code === 'session-purge/invalid-gc-mode', String(badMode.error?.code));
   }
 
   // ── The fence proves it guards these directories ────────────────────────────
@@ -1650,12 +1716,14 @@ async function testClientHalf(app) {
     t: (key) => key,
     view: 'page',
     form: {
-      state: { status: 'ready', writable: true, revision: 3, value: { purgeAttachments: true, purgeSpill: false } },
+      state: { status: 'ready', writable: true, revision: 3, value: { purgeSchedules: true, purgeSpill: false } },
       mutate: (ops, revision) => { writes.push({ ops, revision }); return Promise.resolve(true); },
     },
   });
   const flat = JSON.stringify(page, (key, value) => (typeof value === 'function' ? '[fn]' : value));
-  check('the settings page renders every switch with the stored values', flat.includes('optPurgeAttachments') && flat.includes('"checked":true') && flat.includes('"checked":false'), flat.slice(0, 160));
+  check('the settings page renders every switch with the stored values', flat.includes('optPurgeSchedules') && flat.includes('"checked":true') && flat.includes('"checked":false'), flat.slice(0, 160));
+  check('the retired attachment switch is gone from the page', !flat.includes('optPurgeAttachments'));
+  check('the page has the pending-deletion and attachment-reclaim sections', flat.includes('pendingTitle') && flat.includes('gcTitle'));
   const rendered = (() => {
     const nodes = [];
     const walk = (node) => {
@@ -1670,7 +1738,7 @@ async function testClientHalf(app) {
   const checkbox = rendered.find((node) => node.props?.type === 'checkbox');
   const boxes = rendered.filter((node) => node.props?.type === 'checkbox').length;
   const textFields = rendered.filter((node) => node.props?.type === 'text').length;
-  check('the settings page renders one checkbox per scope switch plus the spill-root field', boxes === 5 && textFields === 1, `checkboxes=${String(boxes)} text=${String(textFields)}`);
+  check('the settings page renders one checkbox per scope switch plus the spill-root field', boxes === 4 && textFields === 1, `checkboxes=${String(boxes)} text=${String(textFields)}`);
   checkbox.props.onChange({ target: { checked: true } });
   check('toggling a switch queues one field write with the revision fence', writes.length === 1 && writes[0].ops[0].op === 'set' && writes[0].revision === 3, JSON.stringify(writes));
   check('list entries carry an id, the keyed entry a key, all a locale namespace', entries.every((entry) => (typeof entry.options.id === 'string' || typeof entry.options.key === 'string') && entry.options.locale === 'plugin.sessionPurge'), JSON.stringify(entries.map((entry) => entry.options.id ?? entry.options.key)));
@@ -1686,8 +1754,8 @@ async function testClientHalf(app) {
   check('both manifests are owned by this package', hostManifest.TYPERT.package === '@jedeiah/session-purge' && mounted[0].package === '@jedeiah/session-purge');
 
   check('the mounted contribution carries every method',
-    mounted[0].descriptors.length === 6
-    && ['inspect', 'purge', 'sweepResidue', 'pending', 'cancelPending', 'retryPending'].every((method) => mounted[0].descriptors.some((descriptor) => descriptor.method === method)),
+    mounted[0].descriptors.length === 7
+    && ['inspect', 'purge', 'sweepResidue', 'pending', 'cancelPending', 'retryPending', 'attachmentGc'].every((method) => mounted[0].descriptors.some((descriptor) => descriptor.method === method)),
     JSON.stringify(mounted[0].descriptors.map((descriptor) => `${descriptor.namespace}/${descriptor.method}`)));
   // The namespace answers `{ ok, value }`. Reading the report off the raw answer
   // is the classic silent break — the page would show `undefined` and look empty —
