@@ -72,7 +72,7 @@ constructor(limits, resolveAddresses = publicHttpNetwork.resolve) { … }
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `allowRanges` | `198.18.0.0/15` | 额外接受的地址段（逗号/空格分隔的 CIDR）；**空串 = 完全等于内置策略** |
+| `allowRanges` | `198.18.0.0/15` | 额外接受的地址段（逗号/空格分隔的 CIDR）；**空串 = 完全等于内置策略**。默认值只有一处定义（`DEFAULT_ALLOW_RANGES`），`apply` 里也有兜底——否则一份未经 schema 校验的配置会让本插件**装上却什么都不做**，而 `apply` 仍会注册一个看起来正常的提供方 |
 | `maxResponseBytes` | `5000000` | 响应主体字节上限 |
 | `maxBodyChars` | `100000` | 解码后字符上限 |
 | `timeoutMs` | `30000` | 抓取超时（构造时校验，非法值直接报错） |

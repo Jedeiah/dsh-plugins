@@ -1,6 +1,6 @@
 {
   "name": "@jedeiah/session-purge",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "type": "module",
   "description": "删除会话（Delete Session）：在会话列表里添加「删除会话」，把会话真正从磁盘上删掉——日志与锁文件、投影缓存、工作区归属、绑定的提醒、工具落盘文件，可选再清理无人引用的附件对象。",

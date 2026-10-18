@@ -76,13 +76,22 @@ export const inject = ['web'];
  * value — the loud, predictable behaviour. `allowRanges` is validated here for the
  * same reason: a typo must fail the load, not quietly restore the strict policy.
  */
+/**
+ * The Clash / Shadowrocket fake-ip pool — the one range this bundle exists for.
+ * One definition, used by the schema default and by the fallback in `apply`: the
+ * default must survive a config that arrives without schema validation, or a
+ * partial config would silently restore the strict policy and the bundle would
+ * look installed but do nothing.
+ */
+export const DEFAULT_ALLOW_RANGES = '198.18.0.0/15';
+
 export const Config = z.object({
   /**
    * Address ranges to accept even though the shipped guard refuses them, as
    * comma or space separated IPv4 CIDRs. `198.18.0.0/15` is the Clash /
    * Shadowrocket fake-ip pool. An empty string restores the shipped policy exactly.
    */
-  allowRanges: z.string().default('198.18.0.0/15'),
+  allowRanges: z.string().default(DEFAULT_ALLOW_RANGES),
   /** Response body byte ceiling. */
   maxResponseBytes: z.number().default(5e6),
   /** Decoded body character ceiling. */
@@ -131,7 +140,7 @@ function parseRange(text) {
  * @returns the parsed ranges.
  * @throws when a non-empty entry is not an IPv4 CIDR.
  */
-function parseAllowance(text) {
+export function parseAllowance(text) {
   const pieces = String(text ?? '').split(/[\s,]+/).filter((piece) => piece !== '');
   const ranges = [];
   const invalid = [];
@@ -161,7 +170,7 @@ function parseAllowance(text) {
  * @param address - the address text.
  * @returns the address as an integer, or undefined when it is not an IPv4 destination.
  */
-function ipv4ValueOf(address) {
+export function ipv4ValueOf(address) {
   const text = stripIpv6Brackets(String(address));
   const dotted = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
   if (dotted !== null) {
@@ -203,7 +212,7 @@ function ipv4ValueOf(address) {
  * @param ranges - the parsed allowance.
  * @returns true when the address is covered.
  */
-function isInsideAllowance(address, ranges) {
+export function isInsideAllowance(address, ranges) {
   const value = ipv4ValueOf(address);
   if (value === undefined) return false;
   return ranges.some((range) => ((value & range.mask) >>> 0) === range.base);
@@ -271,11 +280,16 @@ async function addressesInsideAllowance(hostname, signal, allowance) {
 /**
  * Build the resolver injected into the shipped provider.
  *
+ * Exported (with {@link parseAllowance}, {@link ipv4ValueOf} and
+ * {@link isInsideAllowance}) so `selftest.mjs` can assert the security decision
+ * itself — every rescue is a widening of the shipped policy, so it must be
+ * tested directly instead of only through a live fetch.
+ *
  * @param official - the shipped resolver, authoritative for every verdict.
  * @param allowance - the parsed allowance.
  * @returns a resolver with the shipped signature.
  */
-function createResolver(official, allowance) {
+export function createResolver(official, allowance) {
   return async function resolveWithAllowance(hostname, signal) {
     try {
       return await official(hostname, signal);
@@ -320,7 +334,7 @@ export function apply(ctx, config) {
     throw new Error(`web-fetch-fakeip: timeoutMs must be no greater than ${MAX_NODE_TIMER_DELAY_MS}`);
   }
   assertNonNegativeInteger('maxRedirects', limits.maxRedirects);
-  const allowance = parseAllowance(resolved.allowRanges);
+  const allowance = parseAllowance(resolved.allowRanges ?? DEFAULT_ALLOW_RANGES);
 
   // The shipped resolver, taken from the default the shipped constructor installs.
   const official = new HttpFetchProvider(limits).resolveAddresses;

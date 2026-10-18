@@ -21,7 +21,7 @@
  * @module @jedeiah/session-purge/selftest
  */
 import { createHash } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -476,6 +476,90 @@ async function testGateway(app, workroot) {
     }
     check('a target set that grew since the preview is refused', driftRefusal?.code === 'session-purge/target-set-changed', String(driftRefusal?.code));
     check('the late child survives the refusal', existsSync(join(fourth.project, '99999999-8888-7777-6666-555555555555')));
+    // A failed log removal must leave the session whole. Its Workspace slot, its
+    // projection record and its reminders are what keep it reachable and
+    // configurable; clearing them around a surviving log turns a failed delete
+    // into an invisible orphan that no dialog can ever reach again.
+    const fifth = await buildStore(join(workroot, 'gateway-store-fail'));
+    const host5 = boot({ ...config.value, sessionsRoot: fifth.sessionsRoot, storagesRoot: fifth.storagesRoot, attachmentsRoot: fifth.attachmentsRoot, spillRoots: [fifth.spillRoot] });
+    const detachedAgain = [];
+    const reattached = [];
+    host5.ctx.provide('workspaceRegistry', {
+      list: () => [{
+        id: 'ws-fail',
+        sessionIds: [fifth.parentId],
+        detachSession: (id) => { detachedAgain.push(id); return Promise.resolve(); },
+        attachSession: (id) => { reattached.push(id); return Promise.resolve(); },
+      }],
+      unarchiveSession: () => undefined,
+      unpinSession: () => undefined,
+    });
+    // A session directory without write permission cannot have its entries
+    // unlinked, so `rm -r` fails before touching a single byte: the log survives
+    // intact. (A half-deleted directory is a different, unrecoverable story.)
+    const sessionDirectory = join(fifth.project, fifth.parentId);
+    const sessionMode = (await stat(sessionDirectory)).mode;
+    await chmod(sessionDirectory, 0o500);
+    let failureReport;
+    try {
+      failureReport = await host5.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: fifth.parentId }, signal: new AbortController().signal, peer: host5.peer });
+    } finally {
+      await chmod(sessionDirectory, sessionMode);
+    }
+    check('the failed directory still holds its log', existsSync(join(sessionDirectory, 'session.v4.jsonl.zstd')));
+    check('a directory that cannot be removed is reported as failed',
+      failureReport?.failedIds?.includes(fifth.parentId) === true, JSON.stringify(failureReport?.failedIds));
+    check('the failed session is not announced as removed',
+      failureReport?.removedIds?.includes(fifth.parentId) !== true, JSON.stringify(failureReport?.removedIds));
+    check('its projection record survives the failed purge',
+      existsSync(join(fifth.storagesRoot, 'session_projcache', 'sessions', `${fifth.parentId}.json`)));
+    check('its Workspace slot is put back after the failure',
+      detachedAgain.includes(fifth.parentId) && reattached.includes(fifth.parentId),
+      `detached=[${detachedAgain.join(',')}] reattached=[${reattached.join(',')}]`);
+    check('the failure names the session in a warning',
+      Array.isArray(failureReport?.warnings) && failureReport.warnings.some((line) => line.includes(fifth.parentId)),
+      JSON.stringify(failureReport?.warnings));
+
+    // Cancellation inside the sweep is the same hazard as a filesystem failure:
+    // the slots are dropped before the logs, so a cancel must put back the ones
+    // whose directory never came off the disk.
+    const sixth = await buildStore(join(workroot, 'gateway-store-cancel'));
+    const host6 = boot({ ...config.value, sessionsRoot: sixth.sessionsRoot, storagesRoot: sixth.storagesRoot, attachmentsRoot: sixth.attachmentsRoot, spillRoots: [sixth.spillRoot] });
+    const restoredOnCancel = [];
+    host6.ctx.provide('workspaceRegistry', {
+      list: () => [{
+        id: 'ws-cancel',
+        sessionIds: [sixth.parentId, sixth.childId, sixth.grandId],
+        detachSession: () => Promise.resolve(),
+        attachSession: (id) => { restoredOnCancel.push(id); return Promise.resolve(); },
+      }],
+      unarchiveSession: () => undefined,
+      unpinSession: () => undefined,
+    });
+    // Abort on the fourth `aborted` read: the plan checks once, the step boundary
+    // before the sweep checks again, and each removal step checks once more. That
+    // leaves the first target deleted and the rest untouched — exactly the
+    // half-finished state a cancel produces.
+    const abortReason = new Error('selftest: cancelled mid-sweep');
+    let reads = 0;
+    const cancelling = {
+      get aborted() { reads += 1; return reads >= 4; },
+      get reason() { return abortReason; },
+    };
+    let cancelError;
+    try {
+      await host6.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: sixth.parentId }, signal: cancelling, peer: host6.peer });
+    } catch (error) {
+      cancelError = error;
+    }
+    check('a cancelled sweep reports the cancellation', cancelError !== undefined && /abort/i.test(String(cancelError.message ?? cancelError)), String(cancelError?.message ?? cancelError));
+    check('the target removed before the cancel stays deleted', !existsSync(join(sixth.project, sixth.parentId)));
+    check('the targets left on disk are still there',
+      existsSync(join(sixth.project, sixth.childId)) && existsSync(join(sixth.nestedProject, sixth.grandId)));
+    check('the cancel puts the surviving slots back',
+      restoredOnCancel.includes(sixth.childId) && restoredOnCancel.includes(sixth.grandId) && !restoredOnCancel.includes(sixth.parentId),
+      JSON.stringify(restoredOnCancel));
+
   }
   return true;
 }

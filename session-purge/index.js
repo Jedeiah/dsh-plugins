@@ -30,6 +30,7 @@
  *
  * @module @jedeiah/session-purge
  */
+import { stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import {
@@ -296,39 +297,67 @@ class SessionPurgeService extends TypertRemoteService {
       })
       : undefined;
 
-    // Workspace accounting first: the registry's `sessionIds` view is filtered by
-    // a header index that a removed log directory empties, so detaching after the
-    // delete would silently skip the slot and strand a dangling id.
+    // Workspace accounting first. Two reasons: the registry's `sessionIds` view is
+    // filtered by a header index, so detaching after the delete can skip the slot
+    // and strand a dangling id (0.2.0 behaviour), and dropping the row first is
+    // what makes the sidebar forget the session immediately. 0.2.1 documents that
+    // a missing directory now *retains* its account (`dsh-workspace` README,
+    // "Membership starts from the recorded account"), but `detachSession` writes
+    // the raw record either way, so this order stays correct on both — at the
+    // price that a failed delete must put the slot back, which is what follows.
     throwIfAborted(signal);
-    removed.workspaceSlots = await this.detachFromWorkspaces(plan.targetIds, warnings);
+    const detached = await this.detachFromWorkspaces(plan.targetIds, warnings);
+    removed.workspaceSlots = detached.count;
 
     const directories = await removeSessionDirectories({
       plan,
       removeEmptyProjectDirectory: settings.removeEmptyProjectDirectory,
       warnings,
       signal,
+    }).catch(async (error) => {
+      // Cancelled mid-sweep (or the sweep threw): the slots had to be dropped
+      // before the logs, so put back every one whose directory is still there.
+      // Otherwise a purge that deleted nothing leaves its targets unreachable.
+      await this.restoreSurvivingSlots(plan.targets, detached.restore, warnings);
+      throw error;
     });
     Object.assign(removed, directories);
-    removed.projectionRecords = await removeProjectionRecords({ storagesRoot: this.storagesRoot(), ids: plan.targetIds, warnings, signal });
+
+    // Everything below is keyed on the log directory really being gone. A session
+    // whose directory survived still owns its checkpoint, its spilled output and
+    // its reminders; clearing them around a surviving log is what turns a failed
+    // delete into an invisible orphan. Only the directories that came off the
+    // disk are followed up, and the slots that had to go first are put back.
+    const survivors = new Set(directories.failedIds);
+    if (survivors.size > 0) {
+      await this.reattachToWorkspaces(detached.restore.filter((entry) => survivors.has(entry.id)), warnings);
+    }
+    removed.projectionRecords = await removeProjectionRecords({ storagesRoot: this.storagesRoot(), ids: directories.removedIds, warnings, signal });
     if (settings.purgeSpill) {
       removed.spillDirectories = await removeSpillDirectories({
-        ids: plan.targetIds,
+        ids: directories.removedIds,
         roots: await discoverSpillRoots(settings.spillRoots),
         warnings,
         signal,
       });
     }
-    if (settings.purgeSchedules) removed.schedules = await this.removeSchedules(plan.targetIds, warnings);
+    if (settings.purgeSchedules) removed.schedules = await this.removeSchedules(directories.removedIds, warnings);
     if (digests !== undefined) {
-      const attachments = await removeAttachments({ root: this.attachmentsRoot(), digests, warnings, signal });
-      removed.attachmentObjects = attachments.objects;
-      removed.attachmentLinks = attachments.links;
+      if (survivors.size > 0) {
+        // The surviving logs still reference their attachments, and the digests
+        // were computed for the whole target set, so nothing is collected here.
+        warnings.push('attachment objects were kept: the removal was incomplete, so a surviving log may still reference them');
+      } else {
+        const attachments = await removeAttachments({ root: this.attachmentsRoot(), digests, warnings, signal });
+        removed.attachmentObjects = attachments.objects;
+        removed.attachmentLinks = attachments.links;
+      }
     }
 
     // Only sessions whose directory is really gone are announced; a partially
     // failed sweep must not drop rows that still exist on disk.
     for (const id of directories.failedIds) {
-      warnings.push(`session "${id}" was not fully removed; its log directory is still present`);
+      warnings.push(`session "${id}" was not fully removed; its log directory is still present, so its Workspace slot was restored and its checkpoint, spilled output and reminders were left in place`);
     }
     announceRemoved(this.ctx, directories.removedIds);
     return {
@@ -427,11 +456,13 @@ class SessionPurgeService extends TypertRemoteService {
    * document keeps its invariants.
    * @param ids - the session ids.
    * @param warnings - the operation's warning sink.
-   * @returns how many membership slots were dropped.
+   * @returns how many membership slots were dropped, and what to restore if the
+   *   log turns out to be undeletable.
    */
   async detachFromWorkspaces(ids, warnings) {
     const registry = this.ctx.get('workspaceRegistry');
-    if (registry === undefined) return 0;
+    if (registry === undefined) return { count: 0, restore: [] };
+    const restore = [];
     let dropped = 0;
     for (const id of ids) {
       for (const workspace of registry.list()) {
@@ -439,6 +470,7 @@ class SessionPurgeService extends TypertRemoteService {
         try {
           await workspace.detachSession(id);
           dropped += 1;
+          restore.push({ workspace, id });
         } catch (error) {
           warnings.push(`could not detach "${id}" from workspace "${workspace.id}": ${String(error)}`);
         }
@@ -452,7 +484,59 @@ class SessionPurgeService extends TypertRemoteService {
         }
       }
     }
-    return dropped;
+    return { count: dropped, restore };
+  }
+
+  /**
+   * Put back the slots of every target whose log directory is still on disk.
+   *
+   * Used when the sweep itself throws — cancellation, or a filesystem error the
+   * engine did not absorb. The directory is the truth: a target that is gone
+   * stays detached, a target that is still there gets its slot back.
+   * @param targets - the plan's targets.
+   * @param restore - the pairs {@link detachFromWorkspaces} reported.
+   * @param warnings - the operation's warning sink.
+   * @returns how many slots were restored.
+   */
+  async restoreSurvivingSlots(targets, restore, warnings) {
+    const survived = new Set();
+    for (const target of targets) {
+      try {
+        await stat(target.directory);
+        survived.add(target.id);
+      } catch {
+        /* the directory is gone: that target really was deleted */
+      }
+    }
+    return this.reattachToWorkspaces(restore.filter((entry) => survived.has(entry.id)), warnings);
+  }
+
+  /**
+   * Put back the Workspace slots a failed purge had to drop first.
+   *
+   * The slot has to go before the log directory does, so the registry's filtered
+   * view still sees the id. When the log turns out to be undeletable, that order
+   * would otherwise leave a session with its data intact and no way to reach it
+   * from the interface — an orphan no dialog can ever offer again.
+   * @param entries - the pairs {@link detachFromWorkspaces} reported.
+   * @param warnings - the operation's warning sink.
+   * @returns how many slots were restored.
+   */
+  async reattachToWorkspaces(entries, warnings) {
+    let restored = 0;
+    for (const { workspace, id } of entries) {
+      if (typeof workspace.attachSession !== 'function') {
+        warnings.push(`could not restore "${id}" in workspace "${workspace.id}": this build exposes no attachSession`);
+        continue;
+      }
+      try {
+        await workspace.attachSession(id);
+        restored += 1;
+      } catch (error) {
+        warnings.push(`could not restore "${id}" in workspace "${workspace.id}": ${String(error)}`);
+      }
+    }
+    return restored;
   }
 }
 

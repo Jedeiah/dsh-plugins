@@ -174,5 +174,85 @@ console.log('\nPart A3 — what the Host half exports');
   check('name is the bundle name', host.name === 'web-fetch-fakeip', String(host.name));
 }
 
+
+console.log('\nPart B — the resolver decision (the only reason this bundle exists)');
+{
+  const host = await import(join(here, 'index.js'));
+  const allowance = host.parseAllowance('198.18.0.0/15');
+  check('the default allowance parses to one range', allowance.length === 1);
+
+  // The shipped guard is the authority. Everything below only decides whether a
+  // WEB_BLOCKED_URL refusal may be re-answered from the allowance — so the tests
+  // are written as "what can be rescued", not "what can be fetched".
+  check('the documented fake-ip pool is inside the allowance',
+    host.isInsideAllowance('198.18.0.1', allowance) && host.isInsideAllowance('198.19.255.255', allowance));
+  check('the boundaries hold', !host.isInsideAllowance('198.17.255.255', allowance) && !host.isInsideAllowance('198.20.0.0', allowance));
+  check('loopback, private and link-local addresses are never inside it',
+    ['127.0.0.1', '10.0.0.1', '192.168.1.1', '172.16.0.1', '169.254.169.254', '0.0.0.0'].every((address) => !host.isInsideAllowance(address, allowance)));
+  check('an IPv6 address is never inside it', !host.isInsideAllowance('::1', allowance) && !host.isInsideAllowance('fd00::1', allowance));
+
+  // A TUN proxy answers AAAA for the same fake-ip; the wrapper must read as the
+  // IPv4 destination, not as an unrelated IPv6 address.
+  check('the IPv4-mapped wrapper reads as its IPv4 destination',
+    host.ipv4ValueOf('::ffff:198.18.0.5') === host.ipv4ValueOf('198.18.0.5'));
+  check('…and it is still refused outside the allowance',
+    !host.isInsideAllowance('::ffff:127.0.0.1', allowance) && !host.isInsideAllowance('::ffff:10.0.0.1', allowance));
+
+  const blocked = Object.assign(new Error('blocked'), { code: 'WEB_BLOCKED_URL' });
+  const refuse = () => { throw blocked; };
+  const resolver = host.createResolver(refuse, allowance);
+  const rescued = await resolver('198.18.0.5');
+  check('a blocked fake-ip literal is re-answered from the allowance',
+    rescued.length === 1 && rescued[0].address === '198.18.0.5' && rescued[0].family === 4, JSON.stringify(rescued));
+  const wrapped = await resolver('::ffff:198.18.0.5');
+  check('a wrapped fake-ip is handed back as the IPv4 destination',
+    wrapped.length === 1 && wrapped[0].address === '198.18.0.5' && wrapped[0].family === 4, JSON.stringify(wrapped));
+
+  let refusedOutside;
+  try { await resolver('10.0.0.1'); } catch (error) { refusedOutside = error; }
+  check('a private literal keeps the shipped refusal', refusedOutside === blocked);
+
+  const shipped = [{ address: '93.184.216.34', family: 4 }];
+  const passthrough = await host.createResolver(async () => shipped, allowance)('example.test');
+  check('an allowed answer is returned untouched', passthrough === shipped);
+
+  const otherError = Object.assign(new Error('tls'), { code: 'ENOTFOUND' });
+  let otherRefusal;
+  try { await host.createResolver(() => { throw otherError; }, allowance)('198.18.0.5'); } catch (error) { otherRefusal = error; }
+  check('only WEB_BLOCKED_URL is rescueable; every other failure propagates', otherRefusal === otherError);
+
+
+  // End to end, over the real shipped provider: the guard must refuse the pool and
+  // the registered provider must answer it — with no DNS, because a literal needs
+  // no lookup. This is the bundle's whole promise, so it is asserted against the
+  // installation rather than a stub.
+  const { HttpFetchProvider } = await import(join(app, 'dsh-web-fetch-http', 'lib', 'index.js'));
+  const shippedInstance = new HttpFetchProvider({ maxResponseBytes: 5e6, maxBodyChars: 1e5, timeoutMs: 3e4, maxRedirects: 5, userAgent: 'selftest' });
+  const registered = [];
+  const fakeCtx = {
+    effect: (operation) => { operation(); return () => undefined; },
+    web: { registerFetchProvider: (provider) => { registered.push(provider); } },
+  };
+  host.apply(fakeCtx, {});
+  check('apply registers exactly one fetch provider', registered.length === 1);
+  check('the registered provider carries the injected resolver',
+    typeof registered[0]?.resolveAddresses === 'function' && registered[0].resolveAddresses !== shippedInstance.resolveAddresses);
+
+  let shippedRefused = false;
+  try { await shippedInstance.resolveAddresses('198.18.0.5'); } catch { shippedRefused = true; }
+  check('the shipped guard refuses the fake-ip pool', shippedRefused);
+
+  const rescuedByProvider = await registered[0].resolveAddresses('198.18.0.5');
+  check('the registered provider answers the same literal from the allowance',
+    rescuedByProvider.length === 1 && rescuedByProvider[0].address === '198.18.0.5', JSON.stringify(rescuedByProvider));
+
+  let stillRefused = false;
+  try { await registered[0].resolveAddresses('127.0.0.1'); } catch { stillRefused = true; }
+  check('…and still refuses loopback', stillRefused);
+
+  check('an empty allowance restores the shipped policy exactly',
+    host.parseAllowance('').length === 0 && !host.isInsideAllowance('198.18.0.1', []));
+}
+
 console.log(failures === 0 ? '\nall checks passed' : `\n${String(failures)} check(s) failed`);
 process.exitCode = failures === 0 ? 0 : 1;

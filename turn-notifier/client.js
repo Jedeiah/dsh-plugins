@@ -298,8 +298,23 @@ window.__ModuleLoader__.load({
     /** Stand-in status map for slots that expose no `useSessionStatus` prop. */
     const EMPTY_STATUS = new Map();
 
-    /** Selector over an empty status map, used when the slot provides no hook. */
+    /** Reported once, so a renamed standard prop is diagnosable instead of silent. */
+    let statusHookReported = false;
+
+    /**
+     * Selector over an empty status map, used when the slot provides no hook.
+     *
+     * Without the hook this half can never learn that the agent started or
+     * stopped waiting, so the bell simply never rings — the exact failure this
+     * bundle exists to prevent, and one that looks like "the plugin is broken" or
+     * "the volume is off". Say so once, in the console, with the reason.
+     */
     function readEmptyStatus(selector) {
+      if (!statusHookReported) {
+        statusHookReported = true;
+        console.error('[turn-notifier] the slot supplies no useSessionStatus prop, so the chime cannot fire. '
+          + 'dsh likely renamed it; see the repo README, "已知的 dsh 侧问题".');
+      }
       return selector(EMPTY_STATUS);
     }
 
