@@ -1,7 +1,28 @@
-# 设计 v5：会话删除（最终稿）
+# 设计 v8：会话删除
 
-> 本版是**四轮**审查后的收敛稿：自审、外部审计两轮、终审（v6）。正文只写**现在的设计**。
-> 所有"事实"都标了源码位置；所有"猜"都不写成事实。v6 修了终审的 8 条（其中 6 条我核实成立）。
+> v8 是**换路线**，不是给 v7 打补丁。前五轮（v3–v7）都在"驱逐 → 围栏 → 检测复活"这条路上修洞，
+> 每修一处就冒出新的竞态；根子在于**我们去抢一个不归我们管的生命周期**。v8 只走 dsh 给的门：
+> 会话冷着就用官方写句柄把它围住再删；活着就登记意图、停活归档，等它冷了再删。
+> 所有"事实"都标了依据；没核实的写成"未实测 / 未核实"。v7 原文保留在 `DESIGN.v7.md` 供对照。
+>
+> 依据记法：`<pkg>:N` = `/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai/<pkg>/lib/index.js` 第 N 行（dsh 0.2.1-rc.2）；
+> `docs:<页>` = <https://deepseek-harness.github.io/deepseek-harness/en/> 下的页面。
+
+---
+
+## 0. 一页结论
+
+```
+            ┌─ 全部目标都能 open(id,'write') ──→ 立即路径：围住 → 移出树 → 清各域 → 校验     （提交前零副作用）
+确认删除 ──┤
+            └─ 任一目标被别人持有 ────────────→ 延期路径：登记意图 → 归档并停活 → 等它冷 → 立即路径
+```
+
+- **围栏 = 官方写句柄。** `ctx.sessionPersistence.open(id, 'write')` 同时取进程内单写者声明和跨进程内核租约，
+  会话活着就原子地失败（`SessionAlreadyOwnedError`）。不读状态猜"是不是活的"，**拿到就是证明**。
+- **不驱逐。** 会话的生命周期属于它的 Agent fiber，插件拿不到 disposer；v5–v7 用的 `store.detach` 内部缝正是文档点名的危险做法（§5.4）。
+- **复活靠墓碑收敛，不靠检测。** 对 `domain/changed` 的公开事件按目标 id 立即删回，启动时再定点复检。
+- **附件不在删除里动。** gc 是独立的手工操作。
 
 ---
 
@@ -14,358 +35,436 @@ dsh 的会话日志是只追加的，`seam 无删除接口`（`dsh-session-persi
 
 ---
 
-## 2. 正确性模型
+## 2. 设计原则（五轮审查的教训）
 
-### 2.1 不变量（已按能力边界收窄）
+| # | 原则 | 反例（之前踩过的） |
+|---|---|---|
+| P1 | **权威数据只经它主人的服务改**；文件系统只用来移走"已被我们围住"的目录 | 删检查点文件绕过内存表，内存行还在、下次写回（v7 §3.4） |
+| P2 | **围栏必须是原子的获取，不是事后检测** | "停 → 静置 → 复检"是三次读，读完就过期 |
+| P3 | **提交点之前零副作用** | `archiveSession({stopActivity})` 先写归档、还删提醒，失败只能"尽力补偿" |
+| P4 | **拿不到就等，不抢** | 驱逐别人的会话 → 自锁 / 丢事件 / 绕过守卫（v6、v7） |
+| P5 | **收敛要有确切目标** | 启动时按"缺了什么"去推断残留 → 误删别的实例的 spill（v6 §7.3） |
+| P6 | **每个降级都要留一声**（AGENTS.md） | 静默失效看起来像"插件坏了" |
+
+---
+
+## 3. 正确性模型
+
+### 3.1 不变量
 
 | # | 不变量 | 说明 |
 |---|---|---|
-| **I1** | **单域原子 + 跨域完成后一致** | 会话目录这一个域内，任何观察者看不到中间态（`rename` 保证）；跨域不追求"同一瞬间消失"，由 verify 证明**完成之后**各域一致 |
-| **I2** | **无悬空权威** | 完成之后不存在指向它的权威记录（记账 / 归档 / 置顶 / 提醒） |
-| **I3** | **无共享伤害** | 其他会话仍引用的字节必须完好；delete **结构性不碰**共享字节 |
-| **I4** | **不可复活（可检测）** | 在线删除的上限是"复活会被**检测到并修复**"；只有离线（停掉所有写入者）才谈得上证明 |
-| **I5** | **收敛** | 崩溃后重跑达到"完成"状态；**只向前**，不回滚已提交目标 |
-| **I6** | **可证伪** | 每次结束都校验，且如实报告读不到的域 |
-| **I7** | **可补偿（有界）** | 提交前的**持久化**改动可还原（尽力 + 回读）；被中断的工作不可还原，必须事先声明 |
+| **I1** | **单域原子 + 跨域完成后一致** | 会话目录这个域内 `rename` 原子；跨域由 verify 证明**完成之后**一致 |
+| **I2** | **无悬空权威** | 完成后不存在指向它的记账 / 归档 / 置顶 / 提醒 |
+| **I3** | **无共享伤害** | 其他会话（含**其他 dsh 实例**）引用的字节完好；delete 结构性不碰附件，spill 只按目标 id 精确定位 |
+| **I4** | **不可复活** | 日志域：**可证明**（持有写句柄期间无人能写，§6）；检查点域：**确定性收敛**（墓碑监听，§10），磁盘上可能短暂出现、一定被删回 |
+| **I5** | **收敛** | 崩溃后重跑达到完成；**只向前**，不回滚已提交目标 |
+| **I6** | **可证伪** | 每次结束都校验；读不到的域如实报 `unverified` |
+| **I7** | **副作用可还原或事先声明** | 立即路径提交前**没有**副作用；延期路径的副作用（停活、删活跃提醒）在确认框里写明，取消时尽力还原（§5.3） |
 
-**I4 为什么只能"可检测"**：`detach()` 同步返回 void，检查点写回是另一个包里 **async 且未被 await** 的
-`session/disposed` 监听器（§3.4 有源码）。系统里不存在"写入者完成"的信号，所以任何有限次读取都只是检测。
-
-### 2.2 假设
+### 3.2 假设
 
 | # | 假设 | 不成立时 |
 |---|---|---|
-| A1 | 会话根与 staging 父目录同设备 | `cross-device` 拒绝整批，不降级 `rm -rf` |
-| A2 | POSIX 有 `flock`；Windows 无锁文件 | Windows 退化为"`rename` 失败即拒绝" |
+| A1 | 会话目录与 staging 同卷 | prepare 阶段 `stat().dev` 预检，拒绝整批（`cross-device`） |
+| A2 | 同一 `DSH_HOME` 同一时刻只有一个 dsh 进程 | 日志仍有跨进程租约保护；全局互斥（§7.4）与附件 gc（§11）在 Windows 上只保护本进程 |
 | A3 | 远端已上传文件由提供方过期回收 | 报告里点名，不假装清掉 |
+| A4 | dsh ≥ 0.2.1 | 依赖面（§4）每条 feature-detect；缺失即降级并告警 |
 
-### 2.3 可证明不可达（写清楚，才谈得上"绝对"）
+### 3.3 可证明不可达（写清楚，才谈得上"绝对"）
 
-跨域原子提交、Windows 跨进程写者、远端副本、不可枚举的草稿引用——这四件只能拒绝或声明。
-**"绝对"= 所有失败模式被枚举 + 每种有确定行为 + 每种有测试**，不是"不会出问题"。
-
----
-
-## 3. 域与所有权
-
-### 3.1 七个域
-
-| 域 | 性质 | 处置 |
-|---|---|---|
-| 会话目录（日志 + `session.lock`） | **权威** | 命名空间提交点：移出树 |
-| 投影检查点 | 派生 | purge 阶段删（有界重试）；verify 复读 |
-| 工作区记账（成员 / 归档 / 置顶） | **权威** | 走注册表服务；归档会清置顶，必须能还原 |
-| 提醒 | **权威** | 走 Schedule 服务 |
-| 附件字节 | **共享权威** | **delete 绝不碰**（§6） |
-| 搜索索引 | 派生 | 不碰（每次搜索前自对账） |
-| spill / 引用副本 / 临时对象 | 临时 | 顺手删；上游 `cleanupPeriodDays` **默认 30、启动时清扫、可配置**——所以"30 天"是默认策略不是保证；**别人的转录副本删不到**（§6.3） |
-
-### 3.2 所有权：停 → 静置 → 复检 → 围栏 → 驱逐
-
-顺序是有理由的，不能换：
-
-```
-prior := { archived, pinned }                      // 从注册表读，用于补偿
-
-停     : prior.archived
-           ? ctx.parallel('workspace/session-stop', {sessionId})   // archive 对已归档 id 直接 return，不会停
-           : registry.archiveSession(id, { stopActivity: true })
-
-静置   : 一个窗口，让最末 turn/end 落盘
-
-复检   : 先查服务——ctx.get('agents').get(id)、ctx.get('sessions').get(id)
-         服务答不了再试事件 workspace/session-activity（try/catch，拿不到记 unverified）
-         仍有活动 → live-unstoppable，按 §3.3 补偿
-
-围栏   : POSIX：open('r+') + tryLockExclusive(fd) + 校验 inode 仍是该路径；争用 → foreign-writer
-         Windows：无锁文件，这一步只能靠后面的 rename 失败来拒绝
-
-驱逐   : ctx.get('sessions').store.get(id).detach()   // 内部缝，feature-detect，拿不到就不驱逐并注明
-```
-
-**为什么围栏在驱逐之前**：驱逐不可逆（对象从 store 移除后，原 agent 的写句柄就没了）。
-如果先驱逐、后围栏，一旦 flock 失败，我们就白白杀掉了一个会话的活句柄——那比"什么都没发生"糟得多。
-放在租约之后，**所有可能失败的检查都在不可逆动作之前**。
-
-### 3.3 补偿（I7）
-
-fence 阶段、commit 之前的失败或取消，把副作用还回去：
-
-| 做过的 | 还法 | 备注 |
-|---|---|---|
-| 新写入的归档位 | `unarchiveSession(id)` | 原本已归档的不要动 |
-| 被归档清掉的置顶 | `pinSession(id)` | **必须在 unarchive 之后**：pin 已归档 id 会抛 `WorkspaceArchivedSessionPinError` |
-| 被中断的运行中工作 | **还不了** | 唯一不可还原的副作用，确认框必须写明 |
-
-补偿也不是无竞争的：注册表没有 CAS 令牌，`unarchive`/`pin` 会覆盖这期间用户的合法操作。
-所以只能「记录 → 补偿 → 回读比对」，不一致记 `compensation-drift`。
-
-### 3.4 驱逐到底发生了什么（源码核对）
-
-```js
-// dsh-session
-detachEntered(entry) {                 // 同步，返回 void
-  this.store.delete(entry.id);
-  attachments.delete(entry.session);
-  if (entry.announced) this.emitDisposed(entry);          // 同步 emit
-}
-// dsh-session-projection-cache
-this.ctx.on('session/disposed', (session) => {
-  this.flushSoft(session, 'detach');   // async，且监听器**没有 await**
-  this.markClean(session);
-});
-```
-
-三条事实：
-
-1. **`detach()` 返回 `undefined`**，没有 promise 可等（我早前写"await 驱逐"是错的，已删）。
-2. **检查点写回是 fire-and-forget**，没有完成信号 → 只能检测。
-   注意租约的**作用域**：`session.lock` 的 `flock` 只约束"写日志"的那条路径（后端写打开会取同一把锁），
-   **不约束检查点域**——检查点写入根本不碰这把锁。所以 I4 的证据只覆盖日志，检查点靠检测。
-3. `store` / `entry.detach` 是**未公开的内部缝**，必须 feature-detect；拿不到就不驱逐并写进报告。
+活会话的即时删除（插件没有卸载它的能力）、跨域原子提交、远端副本、不可枚举的客户端草稿引用、
+别的会话 spill 里的转录副本——这五件只能**等待、声明或拒绝**。
+**"绝对" = 所有失败模式被枚举 + 每种有确定行为 + 每种有测试**，不是"不会出问题"。
 
 ---
 
-## 4. 状态机与预写清单
+## 4. 依赖面（每条都分级）
 
-### 4.1 清单（staging 之外、会话树之内都不放）
+| 接口 | 级别 | 依据 | 拿不到时 |
+|---|---|---|---|
+| `ctx.sessionPersistence.open(id,'write')` / `handle.close()` | **公开 seam** | `docs:reference/capability-seams`；`docs:reference/subsystems/persistence`（"the handle is the single door the cross-process write lease guards"） | 整个插件不可用（报错，不降级） |
+| `SessionAlreadyOwnedError`（按 `error.name` 判） | 公开导出 | `dsh-session-persistence:44-51`；会话控制器也按 name 判（`dsh-api-session-controller:243`、`:462`） | — |
+| `ctx.sessions.get` / `ctx.agents.get` | 公开 | `docs:reference/subsystems/session`、`docs:reference/subsystems/core` | 只用作复核，缺失记 `unverified` |
+| `workspaceRegistry.archiveSession / unarchiveSession / pinSession / unpinSession`、`Workspace.detachSession` | 公开 | `dsh-workspace/README.md:99-101` | 工作区域记 `unverified` |
+| `workspace.record.sessionIds`（原始记录） | **内部字段** | `dsh-workspace:79` | 只用于 verify，缺失记 `unverified: ['workspace-raw']` |
+| `ctx.storageDomain.get('session_projcache').table('sessions')` | **文档化的诊断入口** | `docs:reference/subsystems/storage`（"get(name) is an untyped diagnostic lookup"）；域名 `dsh-session-projection-cache:90`；表句柄稳定 `dsh-storage-domain:187-191` | 退回删文件 + 墓碑复检，告警 |
+| `domain/changed` 事件 | 公开 | `docs:reference/subsystems/storage`（"strictly after the backend acknowledged durability … in write-chain order"） | 墓碑监听不可用，只剩启动复检，告警 |
+| `schedule.catalog / delete / create` | 公开 Host 方法 | `docs:reference/subsystems/schedule`；`dsh-schedule:2083`、`:2129`、`:2164` | 提醒域记 `unverified` |
+| `agent/disposed` 事件 | 公开 | `docs:reference/subsystems/core`（"Disposal removes the agent from the registry and emits agent/disposed"） | 延期路径只在启动时推进 |
+| `node-addon-system/flock` 的 `tryLockExclusive` | 公开子路径；但 `session.lock` 协议是 jsonl 后端内部的 | `node-addon-system/package.json` `exports`；协议 `dsh-session-persistence-jsonl:617-646` | 只用于"日志读不出"的后备路径（§6.3） |
+| spill 目录名 `session-<sha256(id)[:12]>` | 内部约定 | `dsh-spill-local:70` | spill 域记 `unverified` |
+
+**明确不用**：`ctx.sessions.store`、`entry.detach`、`SessionProjectionCache#table`（v5–v7 用过的内部缝）。
+
+---
+
+## 5. 两条路径
+
+### 5.1 分流
+
+1. **prepare**（只读 header，绝不冷读日志）：目标集（含子 agent 会话）、血缘、链接解析、`dev` 预检、prior 快照
+   （`archived`/`pinned`/全部提醒的完整记录）。预览里的"谁在用"来自 `sessions.get`/`agents.get`，**仅供展示**。
+2. **确认框**按预览分两种文案：全冷 → "将立即删除"；含活会话 → "这些会话正在使用：将**停止**并**归档**，
+   **活跃提醒会被删除**，内容在**下次启动 dsh 时**删除；在此之前可以取消"。
+3. **执行时以围栏为准**：按 id 排序依次 `open(id,'write')`。全部成功 → 立即路径；任一 `SessionAlreadyOwnedError`
+   → 立刻关掉已拿到的句柄 → 延期路径（确认框已覆盖这种情况；若预览时全冷、执行时有人抢先打开，
+   返回 `became-live`，让用户重新确认，不自动降级到会停活的路径）。
+
+整组同进同退：一个目标集要么全部走立即路径，要么全部延期。
+
+### 5.2 立即路径（目标全冷）
 
 ```
-<stagingRoot>/<runId>/
-  manifest.json                    # 意图 + 目标 + 每步进度 + 结果
-  entries/<project>/<dirName>/     # 被移出的真实目录（链接布局则是一条链接）
+fence    : 持有每个目标的写句柄；再核一次 sessions.get(id)、agents.get(id) 均为 undefined
+arm      : 在内存墓碑集里加入目标 id（§10），先于提交
+commit   : 每个目标 rename 进 staging + fsync 两个父目录（§7）
+release  : 关闭写句柄（目录已在树外）
+purge    : 工作区 → 检查点 → 提醒 → spill → 广播 api-session/removed
+cleanup  : 删 staging 条目（链接规则见 §7.3）+ fsync 父目录
+verify   : §9；写审计；清单保留到墓碑过期
 ```
 
-`<stagingRoot>` = `dirname(realpath(sessionsRoot))/.session-purge-staging`：**必须在会话树之外**
-（后端 `listProjectDirs` 把根下每个目录都当项目，放进去会被重新列出来），又必须同卷。
+**fence 之前和 fence 失败时什么都没发生**（P3）。唯一的例外是 `open('write')` 对旧格式日志会先发布当前代际
+（`dsh-session-persistence-jsonl:2529`）——这与 dsh 自己恢复任何旧会话时做的完全一样，不算副作用。
 
-写入：`tmp → fsync → rename`，且 **`rename` 后 fsync 源与目标两个父目录**（目录项也要落盘）。
+### 5.3 延期路径（有目标活着）
+
+```
+intent   : 写清单，状态 PENDING（先于任何外部写入）
+quiesce  : 对每个目标 registry.archiveSession(id, { stopActivity: true })
+           （已归档的改发 ctx.parallel('workspace/session-stop', {sessionId})，因为 archive 对已归档 id 直接 return，dsh-workspace:528）
+hide     : 客户端清掉指向它的 dsh.sessions.current，让下次启动不自动打开它
+wait     : 监听 agent/disposed（目标 id）→ 尝试立即路径；每次启动时也尝试一次
+```
+
+- **为什么要归档并停活**：用户已确认删除，不该让它继续跑、继续写新内容、继续被提醒唤醒。
+  归档集正是 provider 的 `agent/pre-step` 闸门读的东西，停请求诱发的唤醒都会被挡住（`dsh-workspace:512-524` 注释）。
+- **代价写在明处**：`stopActivity` 会让 schedule 把该会话所有 `active` 提醒直接删掉（`dsh-schedule:2056`、`:2273-2292`）；
+  归档先持久化、再清置顶、最后才发停请求，失败不回滚（`dsh-workspace:527-541`）。
+- **取消**（只有 `PENDING` 可取消）：`unarchiveSession` → `pinSession`（必须在 unarchive 之后，
+  否则抛 `WorkspaceArchivedSessionPinError`，`dsh-workspace:581`）→ 用 prior 快照经 `schedule.create(sessionId, request)` 重建提醒。
+  重建出来的是**新 id**，投递历史不在了（`docs:reference/subsystems/schedule`："Lost history … never reconstructed"）——
+  取消确认框写明这一点。没有 CAS，补偿可能覆盖期间用户的合法操作：「记录 → 补偿 → 回读」，不一致记 `compensation-drift`。
+- **重试与卡死**（吸取 Firefox Bug 1778090：待办在每次启动都静默失败、永远清不掉）：
+  - `SessionAlreadyOwnedError` 不算失败，只说明还在用；超过 7 天仍在用 → 设置页提示。
+  - 其他错误计数；连续 3 次 → 状态 `STUCK`，停止自动重试，设置页点名原因，提供"重试 / 取消"。
+
+### 5.4 为什么不驱逐（v5–v7 的路线，正式放弃）
+
+- 文档：Agent 的 disposer "is a CAPABILITY: among consumers, only the holder can tear this agent down"（`docs:reference/subsystems/core`）。
+- 文档：agent 工厂把会话生命周期折进同一个 effect，"so a fiber unload tears the session + agent down as a single ORDERED chain
+  rather than as racing sibling effects — which would remove the publication hooks before the driver's closing events commit, dropping them"
+  （`docs:reference/subsystems/session`，`SessionStore.prepare`）。从外面 `detach` 正是这种"抢跑的兄弟 effect"。
+- 源码：UI 会话的 Agent 由会话控制器 `agents.resume(...)` 创建后**只取 `.agent`、丢掉 handle**（`dsh-api-session-controller:399`、`:455`），
+  所以活会话在本进程里一直活到退出；没有任何插件能拿到它的 disposer。
+- v6 证明了驱逐前围栏会自锁，v7 证明了驱逐后还有在途写回、drain 失败丢事件、绕过 appending 守卫。
+  这些都不是可以再补的洞，是路线本身的代价。
+
+---
+
+## 6. 围栏
+
+### 6.1 `open(id,'write')` 到底做了什么
+
+`dsh-session-persistence-jsonl:2488-2556`：
+
+1. `tracker.claimWrite(id)`：进程内单写者声明，已被占用就抛 `SessionAlreadyOwnedError`（`:314-317`）；
+   新建尚未落盘的会话也占着这个位（`registerCreated` 置 `writers.set(id, null)`，`:300-307`）。
+2. `acquireLease`：跨进程内核租约。POSIX 是 `session.lock` 上的 `flock` + inode 复核；Windows 是命名内核信号量
+   （`:617-646`、`:561-563`）。租约在写句柄**整个生命周期**内持有（`:620`）。
+3. 读并校验整份日志（`requireStoredLog`）；旧格式就发布当前代际。
+
+所以**持有写句柄 = 本进程和其他进程都不能再写这个会话**；`agents.resume` 走的也是 `open(write)`，会被同一把门挡住。
+`close()` 只做 drain（我们从不追加，缓冲为空）、释放租约、`tracker.release`（只删声明，`:373-378`），**不写会话目录**。
+
+持句柄的这段时间里，若界面恰好要打开这个会话，会话控制器会把 `SessionAlreadyOwnedError` 映射成
+`session/writer-held` 返回（`dsh-api-session-controller:243`）——窗口是可见的、有确定错误，不会静默建出一个新会话。
+
+代价：`open('write')` 会把整份日志读进内存校验。超大日志（数百 MB）会有一次内存尖峰——prepare 时按 `sizeBytes` 提示。
+
+### 6.2 为什么还要再核 `sessions.get` / `agents.get`
+
+文档保证"活会话的写句柄由其生命周期 owner 持有"（`docs:reference/subsystems/persistence`，Repair 一节），
+但没有保证**每一种**进入 store 的会话都持有写句柄。持句柄之后再核一次，任何一个非空 → 释放句柄、按"活着"处理。
+持句柄之后不会再有新的同 id 会话进入 store：恢复要先 `open('write')`，而那把门在我们手里。
+
+### 6.3 日志读不出来的会话
+
+`open('write')` 遇到损坏会抛 `SessionPersistenceCorruptionError` / `SessionFormatUnsupportedError`。这类会话：
+
+- 它的 header 若也读不出，后端本来就不会列出它（`dsh-session-persistence-jsonl` README："omitted from discovery and `list()`"），
+  界面上选不中——归"残留目录"手动清理（§10.3），不走本流程；
+- header 读得出但正文坏：任何人都 `open('write')` 不了，所以也没有写者。POSIX 上退回**同一协议**的裸租约
+  （`open(lockPath,'w')` + `tryLockExclusive` + inode 复核，照抄 `:692-712`）作围栏；Windows 上信号量获取函数未导出，
+  只能拒绝（`fence-unavailable`），让用户走残留清理。
+
+### 6.4 Windows（未实测）
+
+写句柄持有的是信号量，"never a file lock or handle, so … directory removal proceed freely"（`:553`、`:624`），
+所以持句柄期间 `rename` 目录应当可行。**未实测**：若有别的读者正开着日志文件（搜索索引、杀毒），`rename` 会失败 →
+`commit-failed`，已提交的向前、未提交的原样留着，稍后重试。
+
+---
+
+## 7. 提交点与清单
+
+### 7.1 布局
+
+```
+<stagingRoot>/                      = dirname(realpath(sessionsRoot))/.session-purge-staging
+  .lock                             # 全局互斥（§7.4）
+  runs/<runId>/
+    manifest.json
+    entries/<project>/<dirName>/    # 被移出的目录（链接布局则是一条链接）
+  gc/candidates.json                # 附件 gc 第一轮候选（§11），与删除无关
+```
+
+`<stagingRoot>` **必须在会话树之外**（后端把根下每个目录都当项目，`dsh-session-persistence-jsonl:3506`），
+又必须同卷；它只由 `realpath(sessionsRoot)` 派生，不是配置项。
+
+### 7.2 清单
 
 ```json
-{ "version": 3, "runId": "…", "startedAt": 0, "callerSessionId": null,
-  "states": { "group": "PREPARED", "members": { "session-…": "PREPARED" } },
-  "targets": [{ "id": "…", "projectDir": "…", "dirName": "…",
-                "linked": false, "realTarget": null, "identity": "dev:ino",
-                "sizeBytes": 0, "prior": { "archived": false, "pinned": true } }],
-  "steps": { "fence": "pending", "evict": "pending", "commit": "pending",
-             "workspace": "pending", "cache": "pending", "schedules": "pending" },
-  "outcome": null }
+{ "version": 5, "runId": "…", "path": "immediate | deferred", "state": "PREPARED",
+  "createdAt": "…", "attempts": 0, "lastError": null,
+  "targets": [{ "id": "…", "projectDir": "…", "dirName": "…", "linked": false, "realTarget": null,
+                "identity": "dev:ino", "checkpointIdentity": { /* §10.2 */ }, "sizeBytes": 0,
+                "prior": { "archived": false, "pinned": true, "reminders": [ /* 完整 ScheduleRecord */ ] },
+                "state": "PREPARED" }],
+  "steps": { "quiesce": "pending", "fence": "pending", "commit": "pending", "workspace": "pending",
+             "cache": "pending", "schedules": "pending", "spill": "pending", "cleanup": "pending", "verify": "pending" },
+  "outcome": null, "completedAt": null }
 ```
 
-**恢复只认清单里的 runId**；没有清单的残骸一律不动，只记"未知残骸"。
+- 组状态：`PREPARED → (PENDING →) FENCED → COMMITTED → DONE`，旁支 `CANCELLED` / `STUCK` / `FAILED`；
+- 目标状态：`PREPARED → FENCED → COMMITTED → DONE`；
+- 结果 `outcome`：`verified` / `verified-with-gaps` / `incomplete` / `failed-partial`。任一目标无法判定，组就不能报 `verified`；成员结果逐条保留。
 
-### 4.2 生命周期
+写入：`tmp → fsync → rename → fsync 父目录`。macOS 上 Node 的 `fsync` 经 libuv 发 `F_FULLFSYNC`，
+失败才退到 `F_BARRIERFSYNC` 再到 `fsync`（libuv `src/unix/fs.c` 的 `uv__fs_fsync`）；SMB / virtiofs 不支持 `F_FULLFSYNC`，
+那时只有写序、没有落盘保证——报告里不额外区分，写在这里。
 
-| 阶段 | 动作 | 失败语义 |
+### 7.3 提交
+
+- **普通目录**：`<sessions>/<proj>/<dir>` → `runs/<runId>/entries/<proj>/<dir>`，同卷原子，随后 fsync 两个父目录。
+- **链接目录**：`rename` 链接本身。cleanup **永不递归删目标**：目标里只有会话产物就删产物再 `rmdir`；
+  还有别的文件就只删产物、其余保留并记 `leftover`；没有会话产物 → prepare 就拒绝。
+  会话产物白名单：`session*.jsonl*`（含迁移临时文件 `session.migration.<token>.jsonl[.zstd].tmp`，`dsh-session-persistence-jsonl:1957`）
+  与 `session.lock`（`:648`）。每处破坏性动作前重取身份，不符跳过并记 `identity-drift`；跨卷无写权限 → 只删链接，报 `external_target: PRESERVED`。
+- **`EXDEV`**：prepare 预检 `dev`；预检之后挂载点变了导致 `EXDEV` → `commit-failed`，已提交的向前，未提交的原样留着。不降级 `rm -rf`。
+
+### 7.4 全局互斥
+
+POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。Windows：进程内互斥（A2）。
+同一会话不可能被两个 run 同时提交——两边都要先拿它的写句柄。
+
+---
+
+## 8. purge：各域怎么清
+
+| 域 | 怎么清 | 依据 / 注意 |
 |---|---|---|
-| prepare | 索引、目标集、血缘、链接解析、prior 快照、`callerSessionId` 检查 | 什么都没发生 |
-| fence | 停 → 静置 → 复检 → 围栏 | 补偿后什么都没发生 |
-| evict | 驱逐内存条目（feature-detect） | 已过不可逆线，继续 |
-| commit | 每目标 `rename` 进 `entries/` + fsync 目录 | 部分已提交 → 向前收敛 |
-| purge | 工作区 → 检查点（有界重试） → 提醒 | 已提交，重试/汇报 |
-| cleanup | `rm -rf entries/` + **fsync 其父目录**（删除也要落盘） | 已提交，重试 |
-| verify | §7 断言 + 审计 | 已提交，可能 verify-failed |
+| 工作区记账 | 对**每个**工作区无条件 `detachSession(id)`；再 `unarchiveSession(id)`、`unpinSession(id)` | `detachSession` 改原始记录且幂等（`dsh-workspace:148-152`）；不要用过滤视图 `sessionIds`（`:102-104`）先判断包不包含；unarchive/unpin 对已不存在的 id 也能用（`:553-562`、`:597-606`） |
+| 投影检查点 | `table.delete(id)`；再删 `<id>.json.bak.*` 这类表不追踪的备份文件 | 与所有写回同一条 FIFO 链，内存与磁盘一起变（`dsh-storage-domain:222-225`、`:264-276`）；拿不到表 → 删文件 + 告警 |
+| 提醒 | `catalog()` 里 `sessionId` 等于目标的**所有**行（任何 status）逐条 `delete({sessionId, id})` | `delete` 不看 status（`dsh-schedule:2164-2181`）；非活跃行还留着投递历史与指令快照（`docs:reference/subsystems/schedule`）——隐私上必须删 |
+| spill | 在本实例活动根与 `discoverDefaultRoots` 发现的根里，只删 `session-<sha256(id)[:12]>` | 目录名由目标 id 精确算出（`dsh-spill-local:70`），不会碰别的实例的会话（I3） |
+| 浏览器状态 | 客户端半边清 `dsh.conversation.<id>` 等键（现有实现） | 广播 `api-session/removed` 只含真正提交的 id |
+| 搜索索引 | 不碰 | 每次搜索前自对账（`dsh-session-query-sqlite` README） |
+| 附件字节 | **不碰** | §11 |
+| 别的会话 spill 里的引用副本 | **删不到，声明** | `dsh-session-reference` 把被引用会话的完整转录写进引用方自己的 spill，随上游清扫过期（默认 30 天，`dsh-spill-local:484`） |
 
-**组状态**（吸收外部审计的 B 条）：`VERIFIED` / `INCOMPLETE` / `FAILED_PARTIAL`。
-任何一个成员无法判定，组就不能报 VERIFIED；但**成员级结果必须逐条保留**——
-"整组失败"不等于"什么都没发生"。
+---
 
-### 4.3 全局互斥
+## 9. 校验与审计
 
-`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。
-**锁文件按 `realpath(sessionsRoot)` 派生**——否则两份配置指向不同 staging、同一个 sessions 根时互斥失效。
+### 9.1 verify
 
-### 4.4 崩溃矩阵（只向前）
+1. `sessionPersistence` 列不出该 id；`sessions.get(id)`、`agents.get(id)` 为 undefined；
+2. 检查点：`table.get(id) === undefined`，且 `<storages>/session_projcache/sessions/<id>.json*` 不存在（布局见 `dsh-session-projection-cache:15`）；
+3. 工作区：原始 `workspace.record.sessionIds`（内部字段，feature-detect）、`archivedSessionIds`、`pinnedSessionIds` 都不含它。
+   **过滤视图不能作证据**：它只放行 `sessionPaths` 里有路径的 id（`dsh-workspace:367`），日志一删、索引一刷就会把原始记录里的悬空格藏起来。
+   README 的"missing-directory candidates retain their account"说的是**会话 cwd 不存在**（`dsh-workspace:892`），与日志被删无关；
+4. 提醒：`catalog()` 里没有任何 `sessionId` 等于它的行；
+5. `runs/<runId>/entries/` 已清空。
 
-| 崩在 | 磁盘 | 恢复（启动时自动跑一次） |
+读不到的域记 `unverified: [...]`，`outcome: verified-with-gaps`，不许静默算通过。
+
+### 9.2 审计
+
+`<DSH_HOME>/session-purge/audit.jsonl`，追加、8 MiB 滚动。每条：runId、路径（立即 / 延期）、目标 **id 与字节数**、每步结果、`outcome`、`unverified`。
+**不记标题、不记内容**——审计不能成为被删会话的残留。
+
+---
+
+## 10. 收敛：墓碑
+
+### 10.1 为什么需要
+
+日志域被写句柄证明了；检查点域还有一个写回源我们挡不住：`coldSnapshot()` 的 fire-and-forget 写回
+（`dsh-session-projection-cache:284-289`）。一个在提交前读完日志、在我们删除后才调用它的读者，会把检查点写回磁盘。
+检查点按日志身份绑定，身份不符直接丢弃（`:156-170`），所以它**不会被误用**；问题只在隐私：磁盘上又有了被删会话的投影。
+
+### 10.2 机制
+
+- **arm**：commit 之前把目标 id 放进墓碑集（内存 + 清单）。
+- **监听**：`ctx.on('domain/changed', c => c.domain === 'session_projcache' && c.operation === 'put' && matches(c.key, c.value.identity) && table.delete(c.key))`。
+  事件在持久化确认之后、按写链顺序发出（`docs:reference/subsystems/storage`），并带着写入的记录（`dsh-storage-domain:288-295`），
+  删除排在那次写回之后——**确定性删回**。
+- **按身份认人，不按 id**：`matches` 要求 id 在墓碑集里，**且**记录的 `identity` 等于被删日志的身份。
+  身份只由 header 字段推出（`formatVersion`/`createdAt`/`cwd`/`isSeeded` + `inheritedEventCount`，`dsh-session-projection-cache:372-379`），
+  prepare 时就能算好存进清单。不一致说明有人用同一个 id **新建**了会话——那不是复活，不碰。
+- **启动复检**：插件启动时，对保留期内每份清单的目标 id 查表，身份一致就删。覆盖"写回发生在进程退出前、监听来不及"的窗口。
+- **保留期**：墓碑随清单保留 7 天（`retainManifestDays`），过期即删清单。7 天远大于任何一次冷读的时长。
+
+监听不可用时（事件或表拿不到）：只剩启动复检，告警。
+
+### 10.3 不自动清"来路不明"的东西
+
+读不出头的会话目录、没有会话目录的孤儿检查点，**只在设置页手动"扫描 → 看到路径 → 删除"**（现有安全阀）。理由：
+它们没有清单、可能是损坏的用户数据；spill 根跨实例共享（`dsh-spill-local:393-430`）；会话根暂时不可达时"缺了什么"会一次误判全部。
+
+---
+
+## 11. 附件 gc（独立的手工操作，默认不跑）
+
+- **根**：所有可读会话日志里的 `sha256:` 引用 + `~/.dsh/llm-deepseek/files-v3.json` 的 `attachmentId`。staging 里的日志不算根。
+- **两轮**：第一轮只登记候选（不可达 + 超过宽限期 7 天）到 `gc/candidates.json`；至少 24h 后第二轮重新 mark，只删两轮都不可达的。
+  这和 git gc 的 `gc.pruneExpire`（默认两周）同理：用宽限期挡"先写对象、后建立引用"的并发写者。
+- **插入屏障**：第二轮从 mark 开始到最后一个 unlink 结束，监听 `session/event`，事件里出现的 digest 立即移出待删集
+  （Dijkstra 增量更新屏障的思路：变更者新建的引用要通知收集器）。这把"第二轮 mark → delete"的窗口在**本进程内**关掉。
+- **关不掉的**：别的进程；客户端草稿里引用了一个**老对象**（重复上传命中去重，对象 mtime 仍是旧的）。
+  所以 gc 默认关闭，结果里必须写"无法排除客户端草稿引用"。
+- **不可判定持有者**：任何"像会话但读不出头"的目录 → 整次 gc 中止，一个字节都不删。
+
+---
+
+## 12. 恢复与崩溃矩阵（启动时自动跑，只向前）
+
+| 崩在 | 磁盘 | 恢复 |
 |---|---|---|
-| prepare | 只有清单 | 删清单目录；写过归档位则按 §3.3 还原 |
-| fence | 清单 + 归档位 | 还原归档/置顶 → 删清单目录 |
-| evict 后 / commit 前 | 清单 + 归档位 | 会话仍在原处：按"未提交"处理，还原 prior 并记 failed |
-| commit 中 | 清单 + 部分条目 | **已提交的必须向前**（purge→cleanup→verify）；未提交的还原 prior |
-| purge / cleanup 中 | 全部在 entries/ | 重做剩余步骤（幂等） |
-| verify 后 | 清单未标 outcome | 重跑 verify |
+| prepare / fence（立即） | 只有清单；租约随进程死亡由内核释放（`:621-628`） | 删清单——什么都没发生 |
+| intent 后、quiesce 中（延期） | 清单 PENDING + 可能部分归档 | 继续延期流程：启动时会话是冷的 → 直接走立即路径 |
+| commit 中 | 部分条目 | 已提交的向前；未提交的：立即路径原样留着，延期路径保持 PENDING |
+| commit 后、目录项未落盘（掉电） | 清单说已提交，目录却在原处 | 按 `identity` 认出同一对象 → 重新 fence + rename（提交幂等）；身份不符 → `identity-drift`，不碰 |
+| purge / cleanup 中 | 条目在 staging | 重做剩余步骤（全部幂等） |
+| verify 后、未写 outcome | — | 重跑 verify |
 
-**恢复先验身份**：清单记的 `identity`（`dev:ino`）与当前对象不一致 → **不碰**，记 `identity-drift`。
-理由：已提交目标若被外部改写（从备份拷回同名目录、同 id 重建），只按 id 认人会把**新的**删掉。
-
----
-
-## 5. 提交点
-
-### 5.1 普通目录
-
-`<sessions>/<proj>/<dir>` → `<staging>/<runId>/entries/<proj>/<dir>`，同设备、原子，随后 fsync 两个父目录。
-
-### 5.2 链接目录
-
-`rename` **链接本身**同样原子，提交点成立。cleanup 阶段**不递归删目标**——身份吻合不等于"目标里只有会话文件"：
-
-- 目标里只有会话产物（`session*.jsonl*`、`session.lock`）→ 删这些文件，再 `rmdir` 目标（变空才成功），最后删链接；
-- 目标里还有别的文件 → 只删会话产物，**其余原样保留**并记 `leftover`，链接照删；
-- 目标里没有任何会话产物 → prepare 阶段就拒绝。
-
-理由（外部审计指出）：`dev:ino` + "看起来像会话"都推不出**独占所有权**；递归删目标可能在
-用户把会话目录链接到共享文件夹时带走别人的东西。**只删已知产物**把这个风险从"要靠证明"降成"结构性没有"。
-
-**竞态**：`realpath` 到实际删除之间路径可变。所以每一处破坏性动作前**重新取一次身份**，
-不符就跳过并记 `identity-drift`；这是能做的上限，残余窗口写进报告。
-
-共享目标不再整批拒绝（上面的分支不碰非会话文件）。跨卷无写权限 → 只删链接并报 `external_target: PRESERVED`。
-
-### 5.3 `EXDEV`
-
-拒绝整批，不降级。
+**恢复先验身份**：已提交目标若被外部改写（备份拷回同名目录、同 id 重建），只按 id 认人会把新的删掉——所以一律先比 `dev:ino`。
+**没有清单的残骸**：一律不动，只记"未知残骸"。
 
 ---
 
-## 6. 共享字节
-
-### 6.1 delete 绝不碰附件
-
-这让 I3 从"靠算法保证"变成"结构性不可能违反"。
-
-### 6.2 gc 是独立的手工操作（默认不跑，且分两轮）
-
-**手工运行 ≠ 离线运行**：sweep 期间用户仍可能在别的会话里新建引用（比如把一张老图引用进新会话）。
-宽限期救不了这种"对象很老、引用很新"的情况。所以 gc 分两轮、跨运行：
-
-- 第一轮：只**登记候选**（不可达 + 超过宽限期），不动一个字节，候选写进清单；
-- 第二轮（至少 `candidateAgeHours` 之后，默认 24h）：重新 mark，**只删两轮都不在根集合里的对象**。
-
-两轮之间任何新引用都会让对象退出候选。代价是回收慢一天，收益是"新引用不会被扫掉"。
-
-- **根**：所有**可读**会话日志的 `sha256:` 引用 + `~/.dsh/llm-deepseek/files-v3.json` 里的 `attachmentId`。
-- **不可判定持有者**：任何"像会话但读不出头"的目录 → **整次 gc 中止**，一个字节都不删。
-- **草稿/在途**：客户端不可枚举，服务端**无法证明**它不存在 → 宽限期（默认 7 天）只是降低概率，**不是证明**。
-  因此 gc 默认关闭，结果里必须写"无法排除客户端草稿引用"。
-- **staging 里的日志不算根**：它们对应已提交删除的会话。
-
-### 6.3 删不到的副本（必须告知）
-
-`dsh-session-reference` 用 `ctx.get('spillStore')` 把被引用会话的**完整转录**写进**引用方会话自己的 spill**
-（`session-reference-N.txt`）。删 A 不会碰 B 那份，直到 B 的 spill 过期（30 天）。
-这不是"复活"，但确实是残留——必须在"删什么 / 不删什么"里写明。
-
----
-
-## 7. 校验与审计
-
-### 7.1 verify
-
-1. `sessions.list()` 不含该 id（提交后读一次，静置后再读一次）；
-2. 检查点不存在——purge 已做有界重试（删 → 读 → 再删，最多 3 次），verify **再读一次**；
-   仍在 → `cache-resurrection-detected`（这是检测，不是证明）；
-3. `workspaceRegistry` 的每个 `sessionIds`、`archivedSessionIds`、`pinnedSessionIds` 都不含它（三者在 0.2.1 都可读）；
-4. 提醒域：`schedule.catalog()` 里没有绑定到目标 id 的任务（**这一条原来漏了**，外部审计指出）；
-5. `entries/<runId>` 已清空。
-
-读不到的域记 `unverified: [...]`，`outcome: verified-with-gaps`，**不许静默算通过**。
-
-### 7.2 审计
-
-`<DSH_HOME>/session-purge/audit.jsonl`，追加、8 MiB 滚动。每条：runId、目标、字节、每步结果、组状态、`unverified`。
-
-### 7.3 残留清扫：启动时自动跑（迟到的检查点靠它收敛）
-
-因为"迟到写入"无法被有限的两次读证明掉（§3.4），检测之后必须有**收敛机制**，否则
-`cache-resurrection-detected` 只是报警。所以残留清扫在**每次启动时自动执行一次**，且只处理两类明确目标。
-
-`cache-resurrection-detected` 会在磁盘上留下**没有日志的检查点**。残留清扫因此有两类目标：
-① 读不出头的**会话目录**（60 秒年龄门 + 名字/内容形状门）；② **没有会话目录的检查点与 spill 目录**。
-两者都先预览、再删除，路径由宿主重算，浏览器从不传路径。
-
----
-
-## 8. 失败分类
+## 13. 失败分类
 
 | 码 | 触发 | 副作用 |
 |---|---|---|
 | `session-unknown` | 索引里没有 | 无 |
-| `caller-session` | 目标是 `callerSessionId` | 无（客户端必须在 args 里带这个字段） |
-| `live-unstoppable` | 复检仍有活动 | 已补偿 |
-| `foreign-writer` | flock 争用（仅 POSIX） | 已补偿、未驱逐 |
-| `cross-device` | EXDEV | 无 |
+| `target-set-changed` | 确认时目标集与预览不同（现有安全阀） | 无 |
+| `cross-device` | `dev` 预检不符 | 无 |
 | `linked-unresolvable` | 链接目标不可判定 | 无 |
-| `busy` | 另一个 run 在跑 | 无 |
-| `commit-failed` | `rename` 失败（含 Windows 句柄占用） | **部分已提交** |
-| `verify-failed` / `cache-resurrection-detected` | 完成后残留 | **已提交**，附差异 |
+| `busy` | 另一个 run 持有全局锁 | 无 |
+| `became-live` | 预览全冷、执行时有人抢先打开 | 无（等用户重新确认） |
+| `fence-unavailable` | 日志损坏且平台没有后备围栏 | 无 |
+| `deferred` | 有目标活着，转延期 | **已停活、已归档、活跃提醒已删**（确认框已写明） |
+| `stuck` | 延期待办连续 3 次非占用错误 | 同上；停止自动重试 |
+| `commit-failed` | `rename` 失败 | **部分已提交** → 向前 |
+| `verify-failed` | 完成后有残留 | 已提交，附差异 |
 | `identity-drift` | 恢复时身份不符 | 该条不动 |
-
-前七条**全部在不可逆动作之前**，但语义要说准：
-
-- `archiveSession({stopActivity:true})` **先持久化归档位、再清置顶、最后才发停请求**，provider 失败不会回滚归档；
-  所以失败路径的准确说法是「**已尽力补偿、可能残留 `compensation-drift`**」，不是"没有副作用"。
-- 补偿本身可能覆盖这期间用户的合法操作（注册表没有 CAS），因此 `compensation-drift` 是**上报项**，不是异常。
+| `compensation-drift` | 取消后回读与快照不一致 | 上报项，不是异常 |
 
 ---
 
-## 9. 验证计划
+## 14. 验证计划（落到 `selftest.mjs`）
 
-| 不变量 | 注入 | 断言 |
-|---|---|---|
-| I1 | commit 各 rename 之间崩溃 | 任一时刻 `list()` 无半状态 |
-| I2 | 工作区摘除失败 | 组状态非 VERIFIED，成员结果保留 |
-| I3 | 损坏日志 + 共享对象 + 跑 gc | gc 中止，一字节不删 |
-| I4 | 驱逐后立刻读检查点；再延迟 500ms 读 | 有界重试覆盖；仍出现 → `cache-resurrection-detected` |
-| I5 | 伪造"清单 + 部分条目" | 启动后向前收敛 |
-| I6 | 校验读到残留 | `verify-failed` + 审计 |
-| I7 | fence 后取消，原本 pinned | 置顶回来、归档位回到 false |
-| I7 | **围栏失败，会话原本 live** | **未被驱逐**（围栏在驱逐之前） |
-| 恢复防误删 | 提交后换成同名目录再触发恢复 | 不删（`identity-drift`） |
-| A1 | staging 指到另一设备 | 拒绝、无变化 |
-| A2 | 子进程持 flock | `foreign-writer`、无变化 |
-| A3 | 附件有远端副本 | 报告点名 |
-
----
-
-## 10. 回收站
-
-不加。归档已经是"可撤销的删除"；回收站 = 归档 + 延迟销毁，是第二套状态机，还会制造"已删"的隐私假象。
-若要撤销窗口，形态是 `retainMinutes`（默认 0）+ `restore(runId)` + UI 明示"尚未释放"。
-
----
-
-## 11. 竞品取舍
-
-吸收：`stopActivity` 停活、驱逐后防写回、链接布局分策略（Baboo 实测六种布局）。
-不吸收：回收站、直接重写 `workspace.json`、工作区级删除。
-增量：预写清单、全局互斥、启动即恢复、校验 + 审计、跨进程围栏、GC 分离、残留清扫。
-
----
-
-## 12. 一句话
-
-> **删除 = 一次有身份、有提交点、有围栏、有补偿、有校验、有留痕的事务；共享字节不在这里动。**
-
----
-
-## 13. 审查历史（三轮，只列改了什么）
-
-| 轮次 | 发现 | 结果 |
-|---|---|---|
-| 自审 v3 | 附件自相矛盾、`stopActivity` 吞错导致错误码是死码、检查点"删两次"无对象、互斥锁键错、批量语义没说清、链接共享未考虑、gc 漏根、校验没说读不到怎么办、审计无上限、没有 caller 拒绝、依赖事件名 | 全部修 |
-| 外部审计① | **异步 dispose 复活竞态**（保留）、目录 fsync、I7 自欺、域外残影；另主张全局墓碑 | 前四条采纳；墓碑驳回（插件改不了读取路径，`provide` 冲突直接抛错） |
-| 外部审计② | **"await 驱逐"是错的**（`detach()` 返回 void）、两次读证明不了未来、组三态、链接归属不看 basename | 全部采纳，形成 v5 |
-| 本次终审 | I1/I4 收窄后正文仍写旧承诺；**围栏与驱逐顺序**（先驱逐后围栏会白杀活会话）；检查点"删一次"与"有界重试"两处说法不一；§5.2 仍用 basename 判归属；gc 默认开关表述冲突；错误码缺 4 个；`callerSessionId` 没有入口 | 全部修，见正文 |
-
-**仍未解决（写在明处）**：在线删除无法**证明**不复活，只能检测；跨卷只能拒绝；Windows 跨进程只能靠 `rename` 失败；
-客户端草稿引用无法枚举；别的会话 spill 里的转录副本删不到。
-
----
-
-## 14. 终审（外部审计第三轮）：8 条，6 条成立
-
-| # | 它说的 | 核对 | 处置 |
+| 不变量 | 注入 | 断言 | 放在 |
 |---|---|---|---|
-| 1 | 链接目标递归删违反 I3：`dev:ino` + 像会话 ≠ 独占所有权 | 成立 | §5.2 改为**永不递归删目标**，只删会话产物；每处破坏性动作前重取身份 |
-| 2 | 错误码的"无副作用"承诺与 `archiveSession` 先写归档相矛盾 | 成立 | §8 改成"已尽力补偿、可能 `compensation-drift`" |
-| 3 | `flock` 不是上游写入者的围栏（合作式锁） | **部分**：后端写打开确实取同一把锁；但检查点域不取 | §3.4 写明**租约只覆盖日志域** |
-| 4 | 双读不能保证检测到迟到写入 | 成立（与我的结论一致，但它指出"检测后要有收敛"） | §7.3 残留清扫改为**启动时自动跑** |
-| 5 | gc 缺与新引用创建的屏障；手工 ≠ 离线 | 成立 | §6.2 改为**两轮候选**（跨 24h 重 mark） |
-| 6 | verify 漏查提醒域 | 成立（我的验收清单确实没有） | §7.1 增加 `schedule.catalog()` 断言 |
-| 7 | 递归 unlink 的崩溃持久性没闭合 | 成立（可补） | cleanup 后 fsync 父目录，并写明 VERIFIED 的口径 |
-| 8 | "spill 30 天清除"是 backend 策略不是契约 | 成立 | §3.1 改成"默认 30、启动时清扫、可配置" |
+| I4 日志 | 真实 Cordis 里 resume 一个会话，再对它 `open('write')` | 抛 `SessionAlreadyOwnedError`；owner dispose 后同一 open 成功 | **Part B2 P1 ✅** |
+| I4 日志 | 子进程按同一协议持有 `session.lock` | `open('write')` 被拒；子进程退出后内核释放、open 成功 | **Part B2 P1b ✅**（POSIX） |
+| I4 日志 | 我们持句柄时让 `agents.resume` 同一 id | resume 被拒、不留半截会话、目录未被改写 | **Part B2 P2 ✅** |
+| P3 | 持句柄时把目录 rename 出树，再关句柄 | 不重建原目录、不往移走的目录写任何东西、`list()` 不再列出、再 `open('write')` 得 `NotFound` | **Part B2 P2 ✅**（POSIX） |
+| P3 | fence 第 2 个目标失败 | 第 1 个的句柄已关；磁盘、注册表、提醒全无变化 | Part B |
+| I4 检查点 | **对照**：不装监听，提交后调真实的 `coldSnapshot()` | 检查点确实复活（内存与磁盘） | **Part B2 P3 ✅** |
+| I4 检查点 | 装上监听，再调 `coldSnapshot()` | 监听删回；put 事件带着记录与身份；delete 排在 put 之后；内存与磁盘都空 | **Part B2 P3 ✅** |
+| I4 检查点 | 写回发生后立即重启（不给监听机会） | 启动复检删掉 | Part B |
+| I4 检查点 | 删除后用同一 id **新建**会话（真实 `agents.create`），让 dsh 自己的 detach 写检查点 | 监听看到了这次 put，但身份不同、不碰 | **Part B2 P4 ✅** |
+| I2 | 删除后刷新 header 索引再读原始记录 | 原始 `record.sessionIds` 不含 | Part B |
+| I2 | 目标有一条 inactive 提醒 | `catalog()` 里也没了 | Part B |
+| I3 | 另一个 `dsh-spill-<6>` 根里放一个别的 id 的 spill | 不被碰 | Part A2 |
+| I1 | commit 各 rename 之间崩溃 | 任一时刻 `list()` 无半状态 | Part A |
+| I5 | 伪造"清单 COMMITTED + 目录仍在原处、身份相同" | 重新提交并完成 | Part A |
+| 防误删 | 伪造"清单 COMMITTED + 原处是身份不同的同名目录" | 不碰，`identity-drift` | Part A |
+| 延期 | PENDING 后取消，原本 pinned + 两条活跃提醒 | 归档位 false、置顶回来、提醒以新 id 重建、报告写明历史丢失 | Part B |
+| 卡死 | 让 `open('write')` 连续 3 次抛非占用错误 | 状态 `STUCK`，不再自动重试 | Part B |
+| A1 | staging 指向另一设备 | prepare 拒绝，无任何外部写入 | Part A |
+| 链接 | 链接目标里有用户文件 | 只删会话产物，用户文件在，记 `leftover` | Part A |
 
-**它这轮的价值**：不是新理论，而是抓具体——**漏了一个验收域**（提醒）、**一条承诺与实现的差**（归档先写）、
-**一个我写成"证明"实际只是"检测"的洞**（迟到写入的收敛机制）。
+Windows 两条（持句柄 rename、读者占用导致 `commit-failed`）**需要真机**，自测里标 `skip` 并打印原因。
+
+**已实测的部分（2026-10-18，dsh 0.2.1-rc.2，macOS）**：标 ✅ 的行在 `selftest.mjs` Part B2 里跑在 dsh **自己的**
+storage / storage-json / storage-domain / session / session-persistence-jsonl / session-projection-cache / agent / agent-loop 上，
+配置照抄 `dsh-base/cordis.patch.yml`；只有 llm / tools / system-prompt 用的是 dsh 自带的空 hub（resume 在开 turn 之前不调用它们）。
+Part B2 验证的是**dsh 的行为**（设计前提），不是插件——墓碑监听是测试自带的，插件里还没有。
+**变异测试**：把监听的身份比对换成只比 id，P4 的三条立即失败（新会话的检查点被删）——这正是 §10.2 坚持按身份认人的实证。
+其余行（P3 第一行、I2、延期、卡死等）依赖尚未实现的插件逻辑，等实现时再落。
+
+---
+
+## 15. 不做的事
+
+| 不做 | 理由 |
+|---|---|
+| 驱逐活会话（`store.detach`） | §5.4 |
+| 回收站 | 归档已经是可撤销的删除；延期路径的 PENDING 本身就是撤销窗口，不需要第二套状态机 |
+| 启动时自动清来路不明的残留 | §10.3 |
+| 直接改 `workspace.json` / `schedule.json` / 检查点文件 | P1；只用它们主人的服务 |
+| 改别人的读取路径来"隐藏"已删会话（全局墓碑过滤） | 插件改不了读取路径，`provide` 冲突直接抛错（外部审计①已驳回） |
+| 删除时顺带删附件 | I3 结构性保证；要回收就单独跑 §11 |
+
+---
+
+## 16. 业界先例
+
+| 做法 | 先例 | 对应本设计 |
+|---|---|---|
+| 正在使用的东西不硬删，登记后在下次启动完成 | Windows `MoveFileEx(…, MOVEFILE_DELAY_UNTIL_REBOOT)` 把待删项写进 `PendingFileRenameOperations`，重启时执行（[Microsoft Learn](https://learn.microsoft.com/pl-pl/windows/desktop/api/WinBase/nf-winbase-movefileexa)） | 延期路径 |
+| 待办持久化 + 启动补做；但要防"永远静默重试" | Firefox `privacy.sanitize.pending`："retry sanitizations on startup in case they didn't run or were interrupted by a crash"（[Sanitizer.sys.mjs](https://searchfox.org/firefox-main/source/browser/modules/Sanitizer.sys.mjs)）；反例 [Bug 1778090](https://bugzilla.mozilla.org/show_bug.cgi?id=1778090) 每次启动都失败、什么都没清掉 | 清单 + 启动恢复；`STUCK` 状态 |
+| 重活别放在退出时做 | Firefox 文档：关闭时清理太慢会让父进程被终止、变成 shutdown crash（[Data Sanitization](https://firefox-source-docs.mozilla.org/toolkit/components/antitracking/anti-tracking/data-sanitization/index.html)） | 延期删除放在**启动后**推进，不挂在退出钩子上 |
+| 只在没有写者时清扫 | Claude Code 的 `cleanupPeriodDays` 在启动时（新版文档说是启动后的后台清扫）删过期转录（[分析](https://dev.classmethod.jp/en/articles/claude-code-conversation-history-retention/)）；它也因"静默、不可恢复"被投诉（[#62476](https://github.com/anthropics/claude-code/issues/62476)） | 启动推进延期删除；确认框必须写清楚 |
+| 宽限期挡并发写者 | git gc `gc.pruneExpire` 默认两周，"prevent corruption when git gc runs concurrently with another process writing"（[git-gc](https://git-scm.com/docs/git-gc)；[Gitaly !4410](https://gitlab.com/gitlab-org/gitaly/-/merge_requests/4410)） | §11 两轮 + 宽限 |
+| 并发收集时新引用必须通知收集器 | Dijkstra 插入屏障（[Go 提案 17503](https://go.googlesource.com/proposal/+/master/design/17503-eliminate-rescan.md)、[V8 并发标记](https://v8.dev/blog/concurrent-marking)） | §11 插入屏障 |
+| 只追加日志里的"删除"是撤销 + 派生收敛 | 事件溯源处理擦除的几种通行做法：墓碑事件让各投影自己收敛、把敏感数据放在日志外、crypto-shredding（[Michiel Rook](https://www.michielrook.nl/2017/11/forget-me-please-event-sourcing-gdpr/)、[DEV 社区综述](https://dev.to/norbertrosenwinkel/you-cant-delete-an-event-gdpr-says-you-must-crypto-shredding-is-the-truce-26ak)） | §1 问题定义；§10 墓碑 |
+| rename 之后要 fsync 父目录 | ALICE（OSDI '14）研究应用层崩溃一致性协议（[论文](https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-pillai.pdf)） | §7.2 |
+| macOS 上 `fsync` 不等于落盘 | libuv 在 Apple 上先发 `F_FULLFSYNC`（[libuv fs.c 镜像](https://clickhouse.tech/codebrowser/html_report/ClickHouse/contrib/libuv/src/unix/fs.c.html)；[pnpm#16858](https://github.com/pnpm/pnpm/pull/16858) 记录了 SMB/virtiofs 的回退） | §7.2 |
+
+---
+
+## 17. 审查历史
+
+| 轮次 | 主要发现 | 结果 |
+|---|---|---|
+| 自审 v3 | 附件自相矛盾、错误码是死码、互斥锁键错、gc 漏根、校验没说读不到怎么办等 11 条 | 全部修 |
+| 外部审计① | 异步 dispose 复活竞态、目录 fsync、I7 自欺、域外残影；全局墓碑 | 前四条采纳；墓碑驳回 |
+| 外部审计② | "await 驱逐"是错的、两次读证明不了未来、组三态、链接归属 | 采纳 |
+| 终审 v6 | 8 条成立 6 条（链接不递归删、提醒验收、gc 两轮等） | 采纳 |
+| 源码复核 v7 | 围栏在驱逐前会自锁、`stopActivity` 删提醒、过滤视图不能作证据、Windows 信号量不挡 rename 等 13 处 | 采纳；但复核后又发现 v7 自己的"可排序消除"漏了在途写回 |
+| **换路线 v8** | 驱逐路线的洞是结构性的：生命周期不归插件管（文档 + 会话控制器丢弃 handle） | 改为"官方写句柄围栏 + 延期到冷 + 墓碑收敛"；去掉全部 `store`/`detach`/私有字段依赖 |
+| **v8 实测** | Part B2：I4 的四条前提 + 跨进程租约 + 持句柄 rename，26 项在真实服务上通过；对照证实冷读写回确会复活检查点；变异测试证实只按 id 认人会误删 | 前提成立；§14 标注 ✅ |
+
+**仍未解决（写在明处）**：活会话只能延期到下次启动；延期期间内容仍在磁盘上；取消延期时提醒只能以新 id 重建；
+客户端草稿引用无法枚举；别的会话 spill 里的转录副本删不到；Windows 两条行为未实测；§6.2"每一种进入 store 的会话都持有写句柄"只实测了 resume 这一条路径。
+
+---
+
+## 18. 落地影响（相对当前 `index.js` / `engine.js`）
+
+| 现状 | v8 | 备注 |
+|---|---|---|
+| 活会话硬拒绝 `session-purge/session-live`，让用户先重启 | 转延期路径（§5.3），设置页列出待完成删除，可取消 / 重试 | README「活会话是硬性拒绝」一节要改写 |
+| 先摘工作区槽位、再删目录，失败再挂回（`index.js:307-341`） | 先围住、再移出树、再摘槽位；提交前无副作用，不需要"挂回" | `index.js:312` 的注释把 README 的 "missing-directory" 读成了"日志目录被删"，实际指 cwd 缺失（§9.1） |
+| 直接 `rm` 目录 | 持写句柄 → rename 进 staging → 清理 | 需要新的清单 / 恢复代码 |
+| 删检查点文件 | 经 `session_projcache` 表删除 + 墓碑监听 | 文件删除降为后备 |
+| 只删活跃提醒（经 Schedule 服务） | 删 `catalog()` 里该会话**所有**行 | 非活跃行带投递历史 |
+| `purgeAttachments` 删除时顺带算引用减法 | 删除不碰附件；gc 独立、两轮、带插入屏障 | 配置项语义要改，旧配置给一次性迁移提示 |
+| — | 新 Remote 方法：列出 / 取消 / 重试待完成删除 | **`typert.js` 的 `invocations` 与 `client.js` 的 `TYPERT_REMOTE.descriptors` 两处都要加**，否则设置页白屏（AGENTS.md） |
+| — | 新依赖：`@deepseek-ai/dsh-session-persistence`（只为按 name 判错时的常量，可不导入）、`@deepseek-ai/node-addon-system`（§6.3 后备） | 裸导入的必须写进 `peerDependencies` |

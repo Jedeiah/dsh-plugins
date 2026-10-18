@@ -15,13 +15,20 @@
  * invokes `sessionPurge.inspect` and `sessionPurge.purge` through the gateway —
  * the same path the browser takes — including the live-session refusal.
  *
+ * Part B2 checks the premises DESIGN.md v8 stands on (§14, I4) against dsh's own
+ * persistence, session, agent and storage services — no stubs except the empty
+ * llm/tools/system-prompt hubs, which a resume never calls before a turn. It
+ * exercises nothing in this plugin; it answers "does dsh behave the way the
+ * design assumes", so a dsh upgrade that breaks an assumption fails here first.
+ *
  * Nothing outside the temporary directory is read or written, except reading the
  * installation's packages.
  *
  * @module @jedeiah/session-purge/selftest
  */
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -626,7 +633,225 @@ async function testGateway(app, workroot) {
     check('healthy sessions are untouched by the sweep', existsSync(join(seventh.project, seventh.parentId)));
 
   }
+  await testDesignPremises(app, join(workroot, 'premises'));
   return true;
+}
+
+/**
+ * Part B2: the I4 premises of DESIGN.md v8, against dsh's real services.
+ *
+ * Four claims the design cannot hold without, each with a control that would
+ * fail if the test were vacuous:
+ *   P1  a resident session holds its write handle, so `open(id, 'write')` is
+ *       refused — in-process (P1) and across processes (P1b);
+ *   P2  while we hold that handle `agents.resume` is refused, and closing it
+ *       after the directory moved out of the tree writes nothing;
+ *   P3  a late cold-read write-back really resurrects the checkpoint (control),
+ *       and a `domain/changed` watcher deletes it again, after it, on the chain;
+ *   P4  a new session created under the same id is not taken for a resurrection.
+ * The watcher here is the test's own — the plugin does not have one yet.
+ * @param app - the installation's package directory.
+ * @param workroot - an empty scratch directory for this part.
+ */
+async function testDesignPremises(app, workroot) {
+  console.log('\nPart B2 — DESIGN v8 premises (§14, I4) against dsh\'s real services');
+  const sessionsRoot = join(workroot, 'sessions');
+  const storagesRoot = join(workroot, 'storages');
+  await mkdir(workroot, { recursive: true });
+
+  const imported = (name) => import(join(app, name, 'lib', 'index.js'));
+  const { Context } = await imported('cordis');
+  const ctx = new Context();
+  const fibers = [];
+  const mount = async (name, config) => {
+    const module = await imported(name);
+    const fiber = ctx.plugin(module.default ?? module, config);
+    fibers.push(fiber);
+    await fiber;
+  };
+  // The same plugins and configs dsh-base composes (`dsh-base/cordis.patch.yml`),
+  // rooted in the scratch directory.
+  await mount('dsh-storage');
+  await mount('dsh-storage-json', { root: storagesRoot });
+  await mount('dsh-storage-domain', { backend: 'json', routes: {} });
+  await mount('dsh-session-projection');
+  await mount('dsh-session');
+  await mount('dsh-session-persistence-jsonl', { root: sessionsRoot, compression: 'zstd', listConcurrency: 4 });
+  await mount('dsh-session-projection-cache', { writeEveryEvents: 200, writeIntervalMs: 5000 });
+  for (const name of ['dsh-llm', 'dsh-tools', 'dsh-system-prompt', 'dsh-agent']) await mount(name);
+  await mount('dsh-agent-loop', { maxParallelToolCalls: 10, agents: [] });
+
+  const persistence = ctx.sessionPersistence;
+  const isOwned = (error) => error?.name === 'SessionAlreadyOwnedError';
+  const attempt = async (operation) => {
+    try {
+      return { value: await operation() };
+    } catch (error) {
+      return { error };
+    }
+  };
+  /** Every entry of a directory with its size and mtime: "did anything write here". */
+  const fingerprint = async (directory) => {
+    const entries = [];
+    for (const name of (await readdir(directory)).sort()) {
+      const info = await stat(join(directory, name));
+      entries.push(`${name}:${String(info.size)}:${String(info.mtimeMs)}`);
+    }
+    return entries.join('|');
+  };
+  /** The checkpoint identity a stored header witnesses (`dsh-session-projection-cache:365-379`). */
+  const identityOf = (header, inheritedEventCount) => ({
+    formatVersion: header.version,
+    createdAt: header.createdAt,
+    isSeeded: header.isSeeded,
+    inheritedEventCount,
+    ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+  });
+  const canonical = (value) => JSON.stringify(Object.fromEntries(Object.entries(value ?? {}).filter(([, entry]) => entry !== undefined).sort(([a], [b]) => a.localeCompare(b))));
+  /** Resolve on the first `domain/changed` for `key` with `operation`, or false after five seconds. */
+  const nextChange = (key, operation) => new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      off();
+      resolve(false);
+    }, 5_000);
+    const off = ctx.on('domain/changed', (change) => {
+      if (change.domain !== 'session_projcache' || change.key !== key || change.operation !== operation) return;
+      clearTimeout(timer);
+      off();
+      resolve(true);
+    });
+  });
+
+  try {
+    const id = 'session-11111111-2222-4333-8444-555555555555';
+    const created = await ctx.agents.create({ sessionId: id, meta: { cwd: workroot } });
+    await ctx.sessions.flush(created.agent.session);
+    await created.dispose();
+    const project = (await readdir(sessionsRoot)).find((name) => existsSync(join(sessionsRoot, name, id)));
+    const directory = project === undefined ? undefined : join(sessionsRoot, project, id);
+    check('setup: a real session is materialized, then cold', directory !== undefined && ctx.sessions.get(id) === undefined && ctx.agents.get(id) === undefined);
+    if (directory === undefined) return;
+
+    // P1 — the fence refuses a resident session.
+    const resident = await ctx.agents.resume({ resumeSessionId: id });
+    check('P1 resume makes the session resident', ctx.sessions.get(id) !== undefined && ctx.agents.get(id) !== undefined);
+    const blocked = await attempt(() => persistence.open(id, 'write'));
+    check('P1 open(id, "write") on a resident session is refused with SessionAlreadyOwnedError', isOwned(blocked.error), String(blocked.error ?? 'it succeeded'));
+    await blocked.value?.close();
+    await resident.dispose();
+    const released = await attempt(() => persistence.open(id, 'write'));
+    check('P1 once the owner disposes, the same open succeeds', released.value !== undefined, String(released.error));
+    await released.value?.close();
+
+    // P1b — and across processes: the lease is the kernel's, not this process's.
+    if (process.platform === 'win32') {
+      console.log('  skip P1b (Windows holds a named semaphore, not session.lock)');
+    } else {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', `
+        import { open } from 'node:fs/promises';
+        const { tryLockExclusive } = await import(${JSON.stringify(join(app, 'node-addon-system', 'lib', 'flock.js'))});
+        const handle = await open(${JSON.stringify(join(directory, 'session.lock'))}, 'r+');
+        await tryLockExclusive(handle.fd);
+        process.stdout.write('locked\\n');
+        process.stdin.resume();
+        process.stdin.on('end', () => process.exit(0));
+      `], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['pipe', 'pipe', 'inherit'] });
+      const exited = new Promise((resolve) => child.on('exit', resolve));
+      const locked = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(false), 10_000);
+        child.stdout.on('data', (chunk) => {
+          if (!String(chunk).includes('locked')) return;
+          clearTimeout(timer);
+          resolve(true);
+        });
+        void exited.then(() => {
+          clearTimeout(timer);
+          resolve(false);
+        });
+      });
+      check('P1b a child process takes the session lease', locked);
+      const foreign = await attempt(() => persistence.open(id, 'write'));
+      check('P1b open(id, "write") is refused while another process holds the lease', isOwned(foreign.error), String(foreign.error ?? 'it succeeded'));
+      await foreign.value?.close();
+      child.stdin.end();
+      await exited;
+      const reclaimed = await attempt(() => persistence.open(id, 'write'));
+      check('P1b the kernel releases the lease when that process exits', reclaimed.value !== undefined, String(reclaimed.error));
+      await reclaimed.value?.close();
+    }
+
+    // P2 — holding the handle: resume is refused, and close writes nothing.
+    const reader = await persistence.open(id, 'read');
+    const { header, inheritedEventCount } = reader;
+    const { events } = await reader.read();
+    await reader.close();
+    const ours = await persistence.open(id, 'write');
+    const before = await fingerprint(directory);
+    const resume = await attempt(() => ctx.agents.resume({ resumeSessionId: id }));
+    check('P2 agents.resume is refused with SessionAlreadyOwnedError while we hold the handle', isOwned(resume.error), String(resume.error ?? 'it succeeded'));
+    await resume.value?.dispose();
+    check('P2 the refused resume leaves no half-entered session', ctx.sessions.get(id) === undefined && ctx.agents.get(id) === undefined);
+    check('P2 the refused resume wrote nothing into the session directory', (await fingerprint(directory)) === before);
+    const staged = join(workroot, 'staged');
+    await rename(directory, staged);
+    await ours.close();
+    check('P2 closing the handle after the directory moved out does not recreate it', !existsSync(directory));
+    const after = await fingerprint(staged);
+    check('P2 closing the handle writes nothing into the moved directory', after === before, `${before} -> ${after}`);
+    const listed = (await persistence.list()).map((snapshot) => snapshot.header.id);
+    check('P2 the moved session is no longer listed', !listed.includes(id), JSON.stringify(listed));
+    const reopened = await attempt(() => persistence.open(id, 'write'));
+    check('P2 nobody can open it for write once it is out of the tree', reopened.error?.name === 'SessionPersistenceNotFoundError', String(reopened.error?.name ?? 'it succeeded'));
+
+    // P3 — a late cold-read write-back, and the watcher that deletes it again.
+    const table = ctx.storageDomain.get('session_projcache')?.table('sessions');
+    const recordFile = join(storagesRoot, 'session_projcache', 'sessions', `${id}.json`);
+    const tombstone = identityOf(header, inheritedEventCount);
+    check('P3 the documented diagnostic lookup reaches the table the cache writes', table !== undefined && table === ctx.sessionProjectionCache.table);
+    if (table === undefined) return;
+    check('P3 the detach wrote a checkpoint bound to the log identity', canonical(table.get(id)?.identity) === canonical(tombstone) && existsSync(recordFile), `${canonical(table.get(id)?.identity)} vs ${canonical(tombstone)}`);
+    // Control: with no watcher, the late write-back does resurrect the record —
+    // otherwise the watcher check below would prove nothing.
+    await table.delete(id);
+    const resurrected = nextChange(id, 'put');
+    ctx.sessionProjectionCache.coldSnapshot(header, inheritedEventCount, events);
+    check('P3 control: with no watcher, a late cold-read write-back resurrects the checkpoint', (await resurrected) && table.get(id) !== undefined && existsSync(recordFile));
+
+    const changes = [];
+    ctx.on('domain/changed', (change) => {
+      if (change.domain !== 'session_projcache') return;
+      changes.push({ operation: change.operation, key: change.key, identity: change.value?.identity });
+      if (change.operation === 'put' && change.key === id && canonical(change.value?.identity) === canonical(tombstone)) void table.delete(change.key);
+    });
+    await table.delete(id);
+    check('P3 purging through the table clears memory and disk', table.get(id) === undefined && !existsSync(recordFile));
+    const deletedAgain = nextChange(id, 'deleted');
+    // The real late source (`dsh-session-projection-cache:284-289`): a reader that
+    // loaded the log before the commit and folds it after the delete.
+    ctx.sessionProjectionCache.coldSnapshot(header, inheritedEventCount, events);
+    check('P3 the watcher deletes the late write-back', await deletedAgain);
+    const putAt = changes.findIndex((change) => change.operation === 'put' && change.key === id);
+    const deletedAt = changes.findIndex((change, index) => index > putAt && change.operation === 'deleted' && change.key === id);
+    check('P3 the put event carries the record and its identity', putAt !== -1 && canonical(changes[putAt].identity) === canonical(tombstone), JSON.stringify(changes[putAt]));
+    check('P3 the delete lands after the put on the write chain', putAt !== -1 && deletedAt > putAt, JSON.stringify(changes.map((change) => change.operation)));
+    check('P3 memory and disk both end empty', table.get(id) === undefined && !existsSync(recordFile));
+
+    // P4 — the same id, created anew, is a new session, not a resurrection.
+    await new Promise((resolve) => setTimeout(resolve, 5)); // a distinct createdAt
+    const reborn = await ctx.agents.create({ sessionId: id, meta: { cwd: workroot } });
+    await ctx.sessions.flush(reborn.agent.session);
+    await reborn.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 200)); // let the detach write-back and any watcher reaction land
+    const record = table.get(id);
+    check('P4 the new session has a checkpoint after its own detach', record !== undefined);
+    check('P4 its identity differs from the tombstone', record !== undefined && canonical(record.identity) !== canonical(tombstone), `${canonical(record?.identity)} vs ${canonical(tombstone)}`);
+    check('P4 the watcher saw that put (it was armed, not absent)', changes.some((change) => change.operation === 'put' && change.key === id && canonical(change.identity) !== canonical(tombstone)), JSON.stringify(changes.slice(-3)));
+    check('P4 the watcher left it alone (memory and disk)', record !== undefined && existsSync(recordFile));
+  } catch (error) {
+    check('Part B2 ran to completion', false, error?.stack ?? String(error));
+  } finally {
+    for (const fiber of fibers.reverse()) await fiber.dispose();
+  }
 }
 
 /**
