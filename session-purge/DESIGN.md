@@ -73,10 +73,38 @@ prior := { archived: registry.archivedSessionIds.includes(id),
 复检  : activity := await ctx.waterfall('workspace/session-activity', { sessionId: id }, () => [])
         activity.length > 0 → 中止（这是唯一能发现"停不下来"的手段，见 §13-②）
 
-驱逐  : ctx.get('sessions').store?.get?.(id)?.detach?.()
+驱逐  : ctx.get('sessions').store?.get?.(id)?.detach?.()   // 内部缝，见下
 
 围栏  : POSIX 取 session.lock 的 flock（r+ + inode 校验）证明没有别的进程在写
 ```
+
+#### 3.2.1 驱逐到底发生了什么（源码核对，2026-10-18）
+
+`ctx.get('sessions').store.get(id).detach()` 这条链，我逐行核过：
+
+```js
+// dsh-session
+detachEntered(entry) {           // 同步，返回 void
+  this.store.delete(entry.id);
+  attachments.delete(entry.session);
+  if (entry.announced) this.emitDisposed(entry);   // 同步 emit
+}
+// dsh-session-projection-cache
+this.ctx.on('session/disposed', (session) => {
+  this.flushSoft(session, 'detach');   // async，且**没有 await**
+  this.markClean(session);
+});
+```
+
+三条结论，全是事实：
+
+1. **`detach()` 返回 `undefined`，没有 promise 可等。** "await 驱逐"是我之前的想当然，已删。
+2. **检查点的写回是另一个包的 fire-and-forget**：`flushSoft` 是 async，监听器不等它。所以**没有任何完成信号**。
+3. `detach()` 是**未公开的内部缝**（`store` 是公有字段，`entry.detach` 只为内部使用而存在）。因此必须 feature-detect，
+   拿不到就**不驱逐**并在报告里注明——因为不驱逐的后果（写入方继续持有日志）比误以为驱逐了更可控。
+
+于是"防写回"只能做成**有界重试**：驱逐 → 静置 → 删检查点 → 读一次 → 若又出现再删（最多 3 次）→ 仍出现则记
+`cache-resurrection-detected`。**这是检测，不是证明**——这一点不再辩解。
 
 **为什么必须有"复检"**：`archiveSession({stopActivity:true})` 内部 `stopSessionActivity`
 用 `try/catch` **吞掉所有 provider 失败**，只写一条 `logger.warn`，然后正常 resolve。
@@ -332,8 +360,11 @@ evict → dispose 异步写检查点 → rename → settle 删检查点 → disp
       → verify 看见「没有」 → 下次启动重放又出现
 ```
 
-我原设计把「驱逐」放在提交前就以为安全了——**错在 dispose 是异步的**。修法三件：
-① `await` 驱逐返回的 promise；② settle 删完之后**再静置一次并复读**；③ verify 的检查点断言分两次读。
+我原设计把「驱逐」放在提交前就以为安全了——**错在 dispose 是异步的**。
+
+**注：我第一版修法里写的"`await` 驱逐返回的 promise"是错的**，`detach()` 返回 void（§3.2.1 有源码）。
+现在的修法是：删除后**读一次 → 若又出现再删（最多 3 次）→ 仍出现记 `cache-resurrection-detected`**，
+外加 verify 的双次读。这是检测，不是证明。
 
 **A2 fsync 目录项。** 文件内容 fsync ≠ 目录项落盘。`rename` 之后必须 fsync **源与目标两个父目录**。
 
@@ -382,3 +413,37 @@ evict → dispose 异步写检查点 → rename → settle 删检查点 → disp
 
 迟到写入、外部变化分别由双次读取（§4.2）与校验（§7）覆盖；**不声称它们被"证明"，只说被"检测"**。
 这也是双方一致的结论：拿不到上游写屏障时，能做到的上限是「检测 + 只向前」，不是「证明不存在」。
+
+---
+
+## 16. 第二轮完整回复的吸收（2026-10-18）
+
+它把回答按 A/B/C 拆开，并给了"要求上游提供什么"的清单。逐条判定：
+
+### 16.1 吸收（三条）
+
+**① A 的核心判断成立：两次读不能证明"未来没有写入者"。** 我核了源码，比它说得更硬（§3.2.1）：
+`detach()` 同步返回 void，检查点写回是 `dsh-session-projection-cache` 里一个 **async 且未被 await** 的
+`session/disposed` 监听器——**系统里根本不存在"写入者完成"的信号**。
+所以在线删除能达到的上限是「**检测到复活**」，不是「**证明不会复活**」。只有离线（停掉所有写入者）才能给严格证明。
+在设计里，这体现为：有界重试删除 + `cache-resurrection-detected` 结果码，而不是"await 之后必然干净"。
+
+**② B 的组状态模型成立且可直接用。** 批量删除不应在成员无法判定时报告"整组成功"，也不应把"部分已删"说成
+"整组失败、什么都没发生"。采用它的三态：`VERIFIED` / `INCOMPLETE` / `FAILED_PARTIAL`，并强制保留**成员级**结果。
+这与「只能向前」兼容：恢复继续推进能推进的项，但组状态不许美化。
+
+**③ C 的所有权判据成立。** 不能用 `basename == 会话 id` 判归属，也不能让 `realpath + dev/ino` 决定业务所有权。
+采用：**prepare 记录身份，操作前复验身份**（已加）；跨卷且无写权限时，**默认只移除会话拥有的链接、报告目标未删**；
+若删除契约要求物理清除，则在 **commit 之前**拒绝该目标集。
+
+### 16.2 不采纳
+
+- **"保留 staging 作为隔离残留、不要立即 rm"**：在我们"无回收站"的语义下，那等于把删除变成延迟删除，
+  且用户会以为已经删了。改为：立即清理 + 事后检测复活（16.1①）。
+- **"要求上游提供 P0/P1 清单"**：清单本身有价值（可见性钩子、`quiesceAndDrain`、组版本、引用登记、幂等读回），
+  但它明确标注了这些是**要求上游补充的能力**，不是现存能力。作为"将来若上游开放"的记录保留，不作为设计前提。
+
+### 16.3 它这次的证据标注（值得记一笔）
+
+它自己区分了三档：已核实（我给的源码 + 它交叉核对的公开 cordis 仓库）、架构推断、需要上游确认。
+并明确承认"不等于我已核实你所安装的每个二进制包与公开仓库完全一致"。**这正是我要的态度**：结论可以强，依据要标。
