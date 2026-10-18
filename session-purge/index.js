@@ -1,36 +1,29 @@
 /**
  * Session Purge — host half.
  *
- * Deleting a session is out-of-band by design: the Session persistence seam has
- * no delete interface (its reader accumulates logs "until an external removal"),
- * so a purge is a coordinated filesystem sweep plus the reference bookkeeping the
- * composed Host already owns. This half owns the pieces that need a live Host —
- * the liveness guard, the Workspace registry, the Schedule service and the
- * browser notification — and delegates every filesystem step to `engine.js`,
- * which stays testable on its own.
+ * The Session persistence seam has no delete interface (its reader accumulates
+ * logs "until an external removal"), so a delete is a transaction this plugin
+ * runs itself, through the doors dsh provides (DESIGN.md v8):
  *
- * What one session owns, and what this removes:
+ *   fence    every target is opened for write through `ctx.sessionPersistence`;
+ *            holding that handle is the proof that no one — in this process or
+ *            another — can write the log, and a live session refuses it;
+ *   commit   each session directory is renamed out of the tree into a staging
+ *            area on the same volume, behind a write-ahead manifest;
+ *   purge    the derived and accounting state is cleared through its owners'
+ *            services: Workspace registry, the projection checkpoint table,
+ *            Schedule, plus the spilled output;
+ *   verify   every domain is read back; what could not be read is reported;
+ *   converge a `domain/changed` watcher deletes a checkpoint that a late cold read
+ *            writes back for a deleted log, and startup re-checks the same ids.
  *
- *   1. its session directory under the log root (all format generations plus
- *      `session.lock`), including subagent children, which are ordinary stored
- *      sessions linked by `parentSession`;
- *   2. its projection checkpoint (`session_projcache`);
- *   3. its Workspace accounting slot, archive entry and pin entry — through the
- *      registry's own methods, never by editing `workspace.json`;
- *   4. its reminders — through the Schedule service, because a reminder that
- *      outlives its session keeps firing into a log that no longer exists;
- *   5. its spilled tool output;
- *   6. optionally, attachment objects no surviving session references.
- *
- * Liveness is a hard guard, not a warning. A session resident in this process
- * still holds a write handle and a checkpoint obligation, so deleting its files
- * under it would either fail silently (writes to an unlinked inode) or rebuild
- * the checkpoint on disposal. The purge refuses while any target is live here and
- * names them, so the Client can say what to do about it (restart, then delete).
+ * Nothing outside the targets changes before the commit, so a refused or failed
+ * fence needs no compensation. A crash is recovered on the next start from the
+ * manifests, forward only.
  *
  * @module @jedeiah/session-purge
  */
-import { rm, rmdir, stat } from 'node:fs/promises';
+import { open as openFile, readdir, realpath, rm, rmdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import {
@@ -41,11 +34,11 @@ import {
   readStoredTitle,
   removeAttachments,
   removeProjectionRecords,
-  removeSessionDirectories,
   removeSpillDirectories,
   scanResidue,
   unreferencedDigests,
 } from './engine.js';
+import * as txn from './txn.js';
 
 /*
  * Imported through `import()` rather than a static import: measured on dsh
@@ -59,6 +52,13 @@ import {
  */
 const RESIDUE_MIN_AGE_MS = 60_000;
 
+/** How long a finished run's manifest — and its tombstones — are kept (DESIGN.md §10.2). */
+const RETAIN_MANIFEST_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The projection checkpoint domain and table (`dsh-session-projection-cache:90`, `:100`). */
+const CHECKPOINT_DOMAIN = 'session_projcache';
+const CHECKPOINT_TABLE = 'sessions';
+
 let RemoteError;
 let TypertRemoteService;
 let resolveDshHome;
@@ -69,16 +69,29 @@ try {
   throw new Error('session-purge: could not import the dsh packages this bundle is built on', { cause: error });
 }
 
+/**
+ * `tryLockExclusive` for the global mutex and the lease probe. Optional: without
+ * it (Windows, or a dsh that stopped shipping the addon) the purge still fences
+ * through the persistence seam, it only loses the cross-process mutex and the
+ * root probe — and says so.
+ */
+let tryLockExclusive;
+try {
+  ({ tryLockExclusive } = await import('@deepseek-ai/node-addon-system/flock'));
+} catch {
+  tryLockExclusive = undefined;
+}
+
 /** Cordis plugin name, used by loader diagnostics. */
 export const name = 'session-purge';
 
 /**
- * Liveness is answered by the Agent and Session registries. Every other service
- * this plugin touches is looked up per call, so a composition without the
- * Schedule plugin or without a Workspace registry still loads and simply purges
- * less.
+ * The fence needs the persistence seam; liveness is answered by the Agent and
+ * Session registries. Every other service this plugin touches is looked up per
+ * call, so a composition without the Schedule plugin or without a Workspace
+ * registry still loads and simply purges (and verifies) less.
  */
-export const inject = ['agents', 'sessions'];
+export const inject = ['agents', 'sessions', 'sessionPersistence'];
 
 /** Row configuration. Volatile fields are the ones surfaced on the Plugins page. */
 export const Config = z.object({
@@ -88,6 +101,8 @@ export const Config = z.object({
   storagesRoot: z.string().default(''),
   /** Attachment object root; empty resolves `$DSH_HOME/attachments`. */
   attachmentsRoot: z.string().default(''),
+  /** Delay before the startup recovery pass; negative disables it (tests drive it by hand). */
+  recoveryDelayMs: z.number().default(1500),
   /** Extra spill roots to sweep besides the `dsh-spill-*` roots under the OS temp directory. */
   spillRoots: z.array(z.string()).default([]).volatile(),
   /** Delete subagent descendants of a deleted session in the same operation. */
@@ -154,7 +169,17 @@ function readConfigValue(value, fallback) {
   return value;
 }
 
-/** The Remote service: a read-only preview, and the purge itself. */
+/** Whether an error is the persistence seam's "another owner holds the write handle". */
+function isOwned(error) {
+  return error?.name === 'SessionAlreadyOwnedError';
+}
+
+/** A fresh removal counter set. */
+function emptyCounters() {
+  return { sessionDirectories: 0, projectDirectories: 0, projectionRecords: 0, spillDirectories: 0, schedules: 0, workspaceSlots: 0, attachmentObjects: 0, attachmentLinks: 0, bytesFreed: 0 };
+}
+
+/** The Remote service: preview, purge, residue sweep — and the recovery behind them. */
 class SessionPurgeService extends TypertRemoteService {
   /**
    * @param ctx - owning Cordis context.
@@ -170,6 +195,34 @@ class SessionPurgeService extends TypertRemoteService {
      * never be deleted without having been listed.
      */
     this.previewed = new Map();
+    /** Deleted logs whose checkpoint must not come back: id → `{ createdAt, cwd, expiresAt }`. */
+    this.tombstones = new Map();
+    /** Logged once: the lease addon is missing, so the mutex and root probe are off. */
+    this.warnedNoFlock = false;
+
+    this.ctx.on('domain/changed', (change) => this.onDomainChanged(change));
+    const delay = readConfigValue(this.config.recoveryDelayMs, 1500);
+    if (typeof delay === 'number' && delay >= 0) {
+      this.ctx.effect(() => {
+        const timer = setTimeout(() => {
+          this.recover().catch((error) => this.warn(`startup recovery failed: ${String(error?.stack ?? error)}`));
+        }, delay);
+        timer.unref?.();
+        return () => clearTimeout(timer);
+      }, 'session-purge: startup recovery');
+    }
+  }
+
+  /**
+   * Log a warning through the context logger.
+   * @param message - the message.
+   */
+  warn(message) {
+    try {
+      this.ctx.logger?.warn?.(`session-purge: ${message}`);
+    } catch {
+      /* a broken logger must not fail the operation */
+    }
   }
 
   /**
@@ -199,10 +252,8 @@ class SessionPurgeService extends TypertRemoteService {
 
   /**
    * Describe what deleting one session would remove, without writing anything.
-   * The dialog needs answers a browser cannot derive: whether a target is still
-   * live here (and therefore refuses deletion), which subagent descendants come
-   * with it, how much disk and how many reminders the operation would clear.
    * @param sessionId - the session the operator selected.
+   * @param signal - aborts the scan.
    * @returns the preview.
    */
   async inspect(sessionId, signal) {
@@ -221,7 +272,7 @@ class SessionPurgeService extends TypertRemoteService {
     }
     const live = plan.targetIds.filter((id) => this.isLive(id));
     const schedules = await this.scheduleTasks(plan.targetIds);
-    this.previewed.set(sessionId, { ids: [...plan.targetIds], at: Date.now() });
+    this.previewed.set(sessionId, { ids: [...plan.targetIds], liveIds: [...live], at: Date.now() });
     return {
       sessionId,
       root,
@@ -243,7 +294,7 @@ class SessionPurgeService extends TypertRemoteService {
         origin: target.header.origin === 'subagent' ? 'subagent' : 'root',
         delegationDepth: target.header.delegationDepth ?? 0,
         parentSession: typeof target.header.parentSession === 'string' ? target.header.parentSession : null,
-        live: this.isLive(target.id),
+        live: live.includes(target.id),
         sizeBytes: target.sizeBytes,
       }))),
     };
@@ -252,131 +303,810 @@ class SessionPurgeService extends TypertRemoteService {
   /**
    * Delete one session and, by configuration, its subagent descendants.
    * @param sessionId - the session the operator selected.
+   * @param signal - cancels the operation up to the commit; after it, the purge
+   *   finishes regardless (forward only).
    * @returns the report the Client half shows.
    */
   async purge(sessionId, signal) {
     assertSessionId(sessionId);
     const settings = this.settings();
     const root = this.sessionsRoot();
-    const plan = await planPurge({
-      root,
-      sessionId,
-      includeDescendants: settings.includeDescendants,
-      spillRoots: settings.spillRoots,
-      signal,
-    });
-    if (plan === undefined) {
+    let staging;
+    try {
+      staging = await txn.stagingRootFor(root);
+    } catch {
       throw new RemoteError('session-purge/session-unknown', `no stored session "${sessionId}" exists under the configured session root`, { sessionId, root });
     }
-    const live = plan.targetIds.filter((id) => this.isLive(id));
-    if (live.length > 0) {
-      throw new RemoteError(
-        'session-purge/session-live',
-        `session "${live[0]}" is still resident in this harness process; deleting it now would leave a live writer behind a removed log and rebuild its projection checkpoint on disposal`,
-        { sessionIds: live },
-      );
-    }
-
-    // The preview is the contract with the operator: if the set grew since the
-    // dialog rendered (a child was created), stop and make them look again.
     const previewed = this.previewed.get(sessionId);
     this.previewed.delete(sessionId);
-    if (previewed !== undefined) {
-      const before = new Set(previewed.ids);
-      const now = new Set(plan.targetIds);
-      const added = plan.targetIds.filter((id) => !before.has(id));
-      const gone = previewed.ids.filter((id) => !now.has(id));
-      if (added.length > 0 || gone.length > 0) {
-        throw new RemoteError(
-          'session-purge/target-set-changed',
-          `the set of sessions to delete changed since the dialog was rendered (+${String(added.length)} / -${String(gone.length)}); reopen the dialog to confirm the new list`,
-          { sessionId, added, removed: gone },
-        );
+    // Plan under the mutex: a second purge of the same session that queued behind
+    // the first must see the store as the first one left it, not as it was.
+    return this.exclusive(staging, async () => {
+      const plan = await planPurge({
+        root,
+        sessionId,
+        includeDescendants: settings.includeDescendants,
+        spillRoots: settings.spillRoots,
+        signal,
+      });
+      if (plan === undefined) {
+        throw new RemoteError('session-purge/session-unknown', `no stored session "${sessionId}" exists under the configured session root`, { sessionId, root });
+      }
+      const live = plan.targetIds.filter((id) => this.isLive(id));
+      if (live.length > 0) throw liveError(live);
+
+      // The preview is the contract with the operator: if the set grew since the
+      // dialog rendered (a child was created), stop and make them look again.
+      if (previewed !== undefined) {
+        const before = new Set(previewed.ids);
+        const now = new Set(plan.targetIds);
+        const added = plan.targetIds.filter((id) => !before.has(id));
+        const gone = previewed.ids.filter((id) => !now.has(id));
+        if (added.length > 0 || gone.length > 0) {
+          throw new RemoteError(
+            'session-purge/target-set-changed',
+            `the set of sessions to delete changed since the dialog was rendered (+${String(added.length)} / -${String(gone.length)}); reopen the dialog to confirm the new list`,
+            { sessionId, added, removed: gone },
+          );
+        }
+      }
+      return this.runImmediate({ staging, plan, settings, signal });
+    });
+  }
+
+  /**
+   * Run an operation under the global mutex, mapping contention to a stable code.
+   * @param staging - the staging root.
+   * @param operation - the work.
+   * @returns what the work returned.
+   */
+  async exclusive(staging, operation) {
+    if (tryLockExclusive === undefined && !this.warnedNoFlock) {
+      this.warnedNoFlock = true;
+      this.warn('@deepseek-ai/node-addon-system/flock is unavailable: the cross-process mutex and the lease probe are off; the persistence fence still applies');
+    }
+    try {
+      return await txn.withGlobalLock(staging, tryLockExclusive, operation);
+    } catch (error) {
+      if (error?.code === 'busy') throw new RemoteError('session-purge/busy', String(error.message), {});
+      throw error;
+    }
+  }
+
+  /**
+   * The immediate path (DESIGN.md §5.2): fence, commit, purge, verify.
+   * @param params.staging - the staging root.
+   * @param params.plan - the purge plan.
+   * @param params.settings - the settings snapshot.
+   * @param params.signal - cancels up to the commit.
+   * @returns the report.
+   */
+  async runImmediate({ staging, plan, settings, signal }) {
+    const warnings = [];
+    const removed = emptyCounters();
+    const records = plan.targets.flatMap((target) => [target, ...target.duplicates].map((record, index) => ({ target, record, primary: index === 0 })));
+
+    // prepare — refuse a layout the commit cannot rename atomically.
+    const stagingDevice = String((await stat(staging, { bigint: true })).dev);
+    for (const { record } of records) {
+      if ((await txn.parentDevice(record.directory)) !== stagingDevice) {
+        throw new RemoteError('session-purge/cross-device', `session directory "${record.directory}" is not on the same volume as the staging area "${staging}"; refusing rather than copying`, { directory: record.directory, staging });
+      }
+    }
+    throwIfAborted(signal);
+
+    const fence = await this.fence(plan.targets);
+    let manifest;
+    let digests;
+    try {
+      if (fence.owned.length > 0) throw liveError(fence.owned);
+      const liveNow = plan.targetIds.filter((id) => this.isLive(id));
+      if (liveNow.length > 0) throw liveError(liveNow);
+      // The last cancellation point: past here the purge only moves forward.
+      throwIfAborted(signal);
+
+      const runId = txn.newRunId();
+      const entries = [];
+      for (const { target, record, primary } of records) {
+        const linked = record.linked === true;
+        entries.push({
+          id: target.id,
+          primary,
+          source: record.directory,
+          projectDirectory: record.projectDirectory,
+          staged: txn.stagedPathFor(staging, runId, record.directory),
+          identity: await txn.entryIdentity(record.directory),
+          linked,
+          realTarget: linked ? await realpath(record.directory) : null,
+          realTargetIdentity: linked ? await txn.targetIdentity(record.directory) : null,
+          state: 'PLANNED',
+        });
+      }
+      manifest = {
+        version: txn.MANIFEST_VERSION,
+        runId,
+        path: 'immediate',
+        state: 'FENCED',
+        createdAt: new Date().toISOString(),
+        completedAt: null,
+        attempts: 0,
+        lastError: null,
+        settings: {
+          removeEmptyProjectDirectory: settings.removeEmptyProjectDirectory,
+          purgeSchedules: settings.purgeSchedules,
+          purgeSpill: settings.purgeSpill,
+          spillRoots: settings.spillRoots,
+        },
+        targets: plan.targets.map((target) => ({
+          id: target.id,
+          state: 'FENCED',
+          sizeBytes: target.sizeBytes,
+          checkpoint: fence.tombstones.get(target.id) ?? tombstoneOf(target.header),
+        })),
+        entries,
+        steps: { fence: 'done', commit: 'pending', workspace: 'pending', cache: 'pending', schedules: 'pending', spill: 'pending', cleanup: 'pending', verify: 'pending' },
+        outcome: null,
+        unverified: [],
+      };
+      await txn.writeManifest(staging, manifest);
+      // Armed before anything moves: a late write-back between the commit and the
+      // checkpoint delete must already meet the watcher.
+      this.armTombstones(manifest, Date.now() + RETAIN_MANIFEST_MS);
+
+      if (settings.purgeAttachments) {
+        try {
+          digests = await unreferencedDigests({
+            doomed: plan.targets.map((target) => target.directory),
+            survivors: [...plan.index.values()].filter((record) => !plan.targetIds.includes(record.id)).map((record) => record.directory),
+          });
+        } catch (error) {
+          // Nothing has moved yet: the sessions survive, so their tombstones must
+          // not outlive this attempt, and the run is not worth recovering.
+          this.disarmTombstones(manifest.targets.map((target) => target.id));
+          await txn.removeRun(staging, manifest.runId).catch(() => undefined);
+          throw error;
+        }
+      }
+
+      for (const entry of manifest.entries) {
+        try {
+          await txn.commitEntry(entry.source, entry.staged);
+          entry.state = 'COMMITTED';
+        } catch (error) {
+          entry.state = 'FAILED';
+          warnings.push(`could not move ${entry.source} out of the session tree: ${String(error)}`);
+        }
+      }
+      settleTargetStates(manifest);
+      // A target whose directory never left the tree is still a session: its
+      // checkpoint is its own again.
+      this.disarmTombstones(manifest.targets.filter((target) => target.state !== 'COMMITTED').map((target) => target.id));
+      manifest.steps.commit = 'done';
+      manifest.state = 'COMMITTED';
+      await txn.writeManifest(staging, manifest);
+    } finally {
+      await fence.release();
+    }
+
+    for (const target of manifest.targets) {
+      if (target.state === 'COMMITTED') removed.bytesFreed += target.sizeBytes;
+    }
+    removed.sessionDirectories = manifest.entries.filter((entry) => entry.state === 'COMMITTED').length;
+    await this.completeCommitted({ staging, manifest, digests, warnings, removed });
+    return this.reportOf(plan.sessionId, plan, manifest, removed, warnings);
+  }
+
+  /**
+   * Fence the targets: open each for write through the persistence seam.
+   *
+   * Holding the write handle means the in-process single-writer claim and the
+   * cross-process lease are ours (`dsh-session-persistence-jsonl:2488-2556`); a
+   * resident session refuses it with `SessionAlreadyOwnedError`. Before trusting
+   * that, the fence proves it guards *the directories this plugin will move*: the
+   * backend's root must be the configured one, and on POSIX each target's
+   * `session.lock` must be contended once the handle is held.
+   * @param targets - the plan's targets.
+   * @returns `{ owned, tombstones, release }`; `owned` lists live targets (all
+   *   handles are already released then).
+   */
+  async fence(targets) {
+    const persistence = this.ctx.get('sessionPersistence');
+    if (persistence === undefined || typeof persistence.open !== 'function') {
+      throw new RemoteError('session-purge/fence-unavailable', 'no session persistence service is mounted, so no write fence can be taken', {});
+    }
+    if (typeof persistence.root === 'string') {
+      const [ours, theirs] = await Promise.all([realpath(this.sessionsRoot()).catch(() => this.sessionsRoot()), realpath(persistence.root).catch(() => persistence.root)]);
+      if (ours !== theirs) {
+        throw new RemoteError('session-purge/fence-mismatch', `the configured session root "${ours}" is not the persistence backend's root "${theirs}"; a fence there would guard other files`, { configured: ours, backend: theirs });
+      }
+    }
+    const handles = [];
+    const leases = [];
+    const owned = [];
+    const tombstones = new Map();
+    const release = async () => {
+      for (const handle of handles.splice(0)) {
+        try {
+          await handle.close();
+        } catch (error) {
+          this.warn(`could not close a write handle: ${String(error)}`);
+        }
+      }
+      for (const lease of leases.splice(0)) await lease.close().catch(() => undefined);
+    };
+    try {
+      for (const target of [...targets].sort((left, right) => left.id.localeCompare(right.id))) {
+        let handle;
+        try {
+          handle = await persistence.open(target.id, 'write');
+        } catch (error) {
+          if (isOwned(error)) {
+            owned.push(target.id);
+            continue;
+          }
+          if (error?.name === 'SessionPersistenceNotFoundError') {
+            throw new RemoteError('session-purge/fence-mismatch', `the persistence backend does not know session "${target.id}", although its directory is under the configured root`, { sessionId: target.id });
+          }
+          if (error?.name === 'SessionPersistenceCorruptionError' || error?.name === 'SessionFormatUnsupportedError') {
+            // Nobody can open this log for write, so nobody writes it; on POSIX
+            // the same kernel lease the backend takes still excludes any process
+            // that would try (DESIGN.md §6.3).
+            const lease = await this.rawLease(target.directory);
+            if (lease === 'owned') {
+              owned.push(target.id);
+              continue;
+            }
+            if (lease === undefined) {
+              throw new RemoteError('session-purge/fence-unavailable', `session "${target.id}" cannot be opened for write (${String(error.name)}) and this platform has no lease to fall back on; use the residue sweep instead`, { sessionId: target.id });
+            }
+            leases.push(lease);
+            tombstones.set(target.id, tombstoneOf(target.header));
+            continue;
+          }
+          throw new RemoteError('session-purge/fence-unavailable', `session "${target.id}" could not be opened for write: ${String(error?.message ?? error)}`, { sessionId: target.id });
+        }
+        handles.push(handle);
+        tombstones.set(target.id, tombstoneOf(handle.header ?? target.header));
+        if (!(await this.leaseContended(target.directory))) {
+          throw new RemoteError('session-purge/fence-mismatch', `the write handle for session "${target.id}" does not hold the lease of "${target.directory}"; the backend is guarding another directory`, { sessionId: target.id, directory: target.directory });
+        }
+        // A second directory claiming the same id is not the one the backend
+        // opens; hold its lease too so no process can pick it up mid-commit.
+        for (const duplicate of target.duplicates) {
+          const lease = await this.rawLease(duplicate.directory);
+          if (lease === 'owned') {
+            owned.push(target.id);
+            break;
+          }
+          if (lease !== undefined) leases.push(lease);
+        }
+      }
+      if (owned.length > 0) await release();
+      return { owned, tombstones, release };
+    } catch (error) {
+      await release();
+      throw error;
+    }
+  }
+
+  /**
+   * Whether another descriptor holds a directory's `session.lock` — the check
+   * that a held write handle guards this very directory. Without flock (Windows)
+   * it cannot be asked; the root comparison is then the only check.
+   * @param directory - the session directory.
+   * @returns whether the lease is held elsewhere (true when it cannot be probed).
+   */
+  async leaseContended(directory) {
+    if (tryLockExclusive === undefined || process.platform === 'win32') return true;
+    let handle;
+    try {
+      handle = await openFile(join(directory, 'session.lock'), 'r+');
+    } catch {
+      return false;
+    }
+    try {
+      await tryLockExclusive(handle.fd);
+      return false;
+    } catch (error) {
+      if (error?.code === 'ERR_FLOCK_UNSUPPORTED_PLATFORM') return true;
+      return error?.code === 'EAGAIN' || error?.code === 'EWOULDBLOCK';
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * Take a session directory's kernel lease the way the backend does
+   * (`dsh-session-persistence-jsonl:692-712`): open, flock, and check the locked
+   * inode is still the file at the path.
+   * @param directory - the session directory.
+   * @returns the held file handle, `'owned'` under contention, or `undefined`
+   *   when this platform has no lease.
+   */
+  async rawLease(directory) {
+    if (tryLockExclusive === undefined || process.platform === 'win32') return undefined;
+    const path = join(directory, 'session.lock');
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const handle = await openFile(path, 'w', 0o600);
+      try {
+        await tryLockExclusive(handle.fd);
+      } catch (error) {
+        await handle.close();
+        if (error?.code === 'EAGAIN' || error?.code === 'EWOULDBLOCK') return 'owned';
+        if (error?.code === 'ERR_FLOCK_UNSUPPORTED_PLATFORM') return undefined;
+        throw error;
+      }
+      const held = await handle.stat({ bigint: true });
+      const current = await stat(path, { bigint: true }).catch(() => undefined);
+      if (current !== undefined && current.ino === held.ino && current.dev === held.dev) return handle;
+      await handle.close();
+    }
+    return 'owned';
+  }
+
+  /**
+   * Everything after the commit, shared by a fresh purge and by recovery: drop
+   * emptied project directories, clear the domains, remove the staged entries,
+   * verify, and record the outcome. Idempotent step by step.
+   * @param params.staging - the staging root.
+   * @param params.manifest - the run's manifest (mutated and persisted).
+   * @param params.digests - attachment digests to collect, when computed this run.
+   * @param params.warnings - the warning sink.
+   * @param params.removed - removal counters.
+   */
+  async completeCommitted({ staging, manifest, digests, warnings, removed }) {
+    const committedIds = manifest.targets.filter((target) => target.state === 'COMMITTED').map((target) => target.id);
+    const settings = manifest.settings ?? {};
+
+    if (settings.removeEmptyProjectDirectory !== false) {
+      const projects = new Set(manifest.entries.filter((entry) => entry.state === 'COMMITTED').map((entry) => entry.projectDirectory));
+      for (const project of projects) {
+        try {
+          await rmdir(project);
+          removed.projectDirectories += 1;
+        } catch {
+          /* a project directory that still holds sessions stays */
+        }
       }
     }
 
-    const warnings = [];
-    const removed = { sessionDirectories: 0, projectDirectories: 0, projectionRecords: 0, spillDirectories: 0, schedules: 0, workspaceSlots: 0, attachmentObjects: 0, attachmentLinks: 0, bytesFreed: 0 };
-    const digests = settings.purgeAttachments
-      ? await unreferencedDigests({
-        doomed: plan.targets.map((target) => target.directory),
-        survivors: [...plan.index.values()].filter((record) => !plan.targetIds.includes(record.id)).map((record) => record.directory),
-        signal,
-      })
-      : undefined;
-
-    // Workspace accounting first. Two reasons: the registry's `sessionIds` view is
-    // filtered by a header index, so detaching after the delete can skip the slot
-    // and strand a dangling id (0.2.0 behaviour), and dropping the row first is
-    // what makes the sidebar forget the session immediately. 0.2.1 documents that
-    // a missing directory now *retains* its account (`dsh-workspace` README,
-    // "Membership starts from the recorded account"), but `detachSession` writes
-    // the raw record either way, so this order stays correct on both — at the
-    // price that a failed delete must put the slot back, which is what follows.
-    throwIfAborted(signal);
-    const detached = await this.detachFromWorkspaces(plan.targetIds, warnings);
-    removed.workspaceSlots = detached.count;
-
-    const directories = await removeSessionDirectories({
-      plan,
-      removeEmptyProjectDirectory: settings.removeEmptyProjectDirectory,
-      warnings,
-      signal,
-    }).catch(async (error) => {
-      // Cancelled mid-sweep (or the sweep threw): the slots had to be dropped
-      // before the logs, so put back every one whose directory is still there.
-      // Otherwise a purge that deleted nothing leaves its targets unreachable.
-      await this.restoreSurvivingSlots(plan.targets, detached.restore, warnings);
-      throw error;
-    });
-    Object.assign(removed, directories);
-
-    // Everything below is keyed on the log directory really being gone. A session
-    // whose directory survived still owns its checkpoint, its spilled output and
-    // its reminders; clearing them around a surviving log is what turns a failed
-    // delete into an invisible orphan. Only the directories that came off the
-    // disk are followed up, and the slots that had to go first are put back.
-    const survivors = new Set(directories.failedIds);
-    if (survivors.size > 0) {
-      await this.reattachToWorkspaces(detached.restore.filter((entry) => survivors.has(entry.id)), warnings);
+    if (manifest.steps.workspace !== 'done') {
+      const workspace = await this.detachWorkspaces(committedIds, warnings);
+      removed.workspaceSlots += workspace.count;
+      manifest.steps.workspace = workspace.available ? 'done' : 'unavailable';
     }
-    removed.projectionRecords = await removeProjectionRecords({ storagesRoot: this.storagesRoot(), ids: directories.removedIds, warnings, signal });
-    if (settings.purgeSpill) {
-      removed.spillDirectories = await removeSpillDirectories({
-        ids: directories.removedIds,
-        roots: await discoverSpillRoots(settings.spillRoots),
-        warnings,
-        signal,
-      });
+    if (manifest.steps.cache !== 'done') {
+      const cache = await this.removeCheckpoints(committedIds, warnings);
+      removed.projectionRecords += cache.count;
+      manifest.steps.cache = cache.table ? 'done' : 'files-only';
     }
-    if (settings.purgeSchedules) removed.schedules = await this.removeSchedules(directories.removedIds, warnings);
+    if (manifest.steps.schedules !== 'done') {
+      if (settings.purgeSchedules === false) {
+        manifest.steps.schedules = 'skipped';
+      } else {
+        const schedules = await this.removeSchedules(committedIds, warnings);
+        removed.schedules += schedules.count;
+        manifest.steps.schedules = schedules.available ? 'done' : 'unavailable';
+      }
+    }
+    if (manifest.steps.spill !== 'done') {
+      if (settings.purgeSpill === false) {
+        manifest.steps.spill = 'skipped';
+      } else {
+        removed.spillDirectories += await removeSpillDirectories({ ids: committedIds, roots: await discoverSpillRoots(settings.spillRoots ?? []), warnings });
+        manifest.steps.spill = 'done';
+      }
+    }
     if (digests !== undefined) {
-      if (survivors.size > 0) {
+      if (manifest.targets.some((target) => target.state !== 'COMMITTED')) {
         // The surviving logs still reference their attachments, and the digests
         // were computed for the whole target set, so nothing is collected here.
         warnings.push('attachment objects were kept: the removal was incomplete, so a surviving log may still reference them');
       } else {
-        const attachments = await removeAttachments({ root: this.attachmentsRoot(), digests, warnings, signal });
-        removed.attachmentObjects = attachments.objects;
-        removed.attachmentLinks = attachments.links;
+        const attachments = await removeAttachments({ root: this.attachmentsRoot(), digests, warnings });
+        removed.attachmentObjects += attachments.objects;
+        removed.attachmentLinks += attachments.links;
+      }
+    }
+    await txn.writeManifest(staging, manifest);
+    announceRemoved(this.ctx, committedIds);
+
+    if (manifest.steps.cleanup !== 'done') {
+      for (const entry of manifest.entries) {
+        if (entry.state !== 'COMMITTED') continue;
+        try {
+          await txn.cleanupEntry({ stagedPath: entry.staged, linked: entry.linked, realTarget: entry.realTarget, realTargetIdentity: entry.realTargetIdentity }, warnings);
+          entry.state = 'CLEANED';
+        } catch (error) {
+          warnings.push(`could not clean up ${entry.staged}: ${String(error)}`);
+        }
+      }
+      const entriesDirectory = join(txn.runDirectory(staging, manifest.runId), 'entries');
+      if (manifest.entries.every((entry) => entry.state !== 'COMMITTED')) {
+        await rm(entriesDirectory, { recursive: true, force: true });
+        await txn.fsyncDirectory(txn.runDirectory(staging, manifest.runId));
+        manifest.steps.cleanup = 'done';
       }
     }
 
-    // Only sessions whose directory is really gone are announced; a partially
-    // failed sweep must not drop rows that still exist on disk.
-    for (const id of directories.failedIds) {
-      warnings.push(`session "${id}" was not fully removed; its log directory is still present, so its Workspace slot was restored and its checkpoint, spilled output and reminders were left in place`);
+    const verification = await this.verify(committedIds, staging, manifest);
+    manifest.steps.verify = 'done';
+    manifest.unverified = verification.unverified;
+    manifest.outcome = manifest.targets.some((target) => target.state !== 'COMMITTED')
+      ? 'failed-partial'
+      : verification.failures.length > 0 ? 'incomplete' : verification.unverified.length > 0 ? 'verified-with-gaps' : 'verified';
+    for (const failure of verification.failures) warnings.push(`verify: ${failure}`);
+    manifest.state = 'DONE';
+    manifest.completedAt = new Date().toISOString();
+    for (const target of manifest.targets) delete target.title;
+    await txn.writeManifest(staging, manifest);
+    this.armTombstones(manifest, Date.now() + RETAIN_MANIFEST_MS);
+    try {
+      await txn.appendAudit(staging, {
+        runId: manifest.runId,
+        path: manifest.path,
+        targets: manifest.targets.map((target) => ({ id: target.id, state: target.state, sizeBytes: target.sizeBytes })),
+        steps: manifest.steps,
+        outcome: manifest.outcome,
+        unverified: manifest.unverified,
+      });
+    } catch (error) {
+      warnings.push(`could not write the audit record: ${String(error)}`);
     }
-    announceRemoved(this.ctx, directories.removedIds);
-    return {
-      sessionId,
-      targets: plan.targetIds,
-      removedIds: directories.removedIds,
-      failedIds: directories.failedIds,
-      forkIds: plan.forkIds,
-      removed,
-      warnings,
-    };
+  }
+
+  /**
+   * Read every domain back after a purge (DESIGN.md §9.1).
+   * @param ids - the committed session ids.
+   * @param staging - the staging root.
+   * @param manifest - the run's manifest.
+   * @returns `{ failures, unverified }`.
+   */
+  async verify(ids, staging, manifest) {
+    const failures = [];
+    const unverified = new Set();
+    const persistence = this.ctx.get('sessionPersistence');
+    for (const id of ids) {
+      if (this.isLive(id)) failures.push(`session "${id}" is live again`);
+      if (persistence === undefined || typeof persistence.open !== 'function') {
+        unverified.add('persistence');
+        continue;
+      }
+      try {
+        const handle = await persistence.open(id, 'read');
+        await handle.close?.();
+        failures.push(`session "${id}" still opens through the persistence seam`);
+      } catch (error) {
+        if (error?.name !== 'SessionPersistenceNotFoundError') unverified.add('persistence');
+      }
+    }
+
+    const table = this.checkpointTable();
+    if (table === undefined) unverified.add('checkpoint-memory');
+    const checkpointDirectory = join(this.storagesRoot(), 'session_projcache', 'sessions');
+    let files = [];
+    try {
+      files = await readdir(checkpointDirectory);
+    } catch {
+      /* no checkpoint directory: nothing on disk to find */
+    }
+    for (const id of ids) {
+      if (table !== undefined) {
+        try {
+          if (table.get(id) !== undefined) failures.push(`checkpoint "${id}" is still in the projection cache`);
+        } catch {
+          unverified.add('checkpoint-memory');
+        }
+      }
+      if (files.some((file) => file === `${id}.json` || file.startsWith(`${id}.json.`))) failures.push(`checkpoint file of "${id}" is still on disk`);
+    }
+
+    const registry = this.ctx.get('workspaceRegistry');
+    if (registry === undefined || typeof registry.list !== 'function') {
+      unverified.add('workspace');
+    } else {
+      try {
+        for (const workspace of registry.list()) {
+          const raw = Array.isArray(workspace?.record?.sessionIds) ? workspace.record.sessionIds : undefined;
+          if (raw === undefined) unverified.add('workspace-raw');
+          const view = Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : [];
+          for (const id of ids) {
+            if ((raw ?? []).includes(id) || view.includes(id)) failures.push(`workspace "${String(workspace.id)}" still accounts "${id}"`);
+          }
+        }
+        const archived = Array.isArray(registry.archivedSessionIds) ? registry.archivedSessionIds : undefined;
+        const pinned = Array.isArray(registry.pinnedSessionIds) ? registry.pinnedSessionIds : undefined;
+        if (archived === undefined || pinned === undefined) unverified.add('workspace-sets');
+        for (const id of ids) {
+          if ((archived ?? []).includes(id)) failures.push(`"${id}" is still in the archive set`);
+          if ((pinned ?? []).includes(id)) failures.push(`"${id}" is still in the pin set`);
+        }
+      } catch {
+        unverified.add('workspace');
+      }
+    }
+
+    if ((manifest.settings ?? {}).purgeSchedules !== false) {
+      const schedule = this.ctx.get('schedule');
+      if (schedule === undefined || typeof schedule.catalog !== 'function') {
+        unverified.add('schedule');
+      } else {
+        try {
+          const wanted = new Set(ids);
+          for (const task of await schedule.catalog()) {
+            if (wanted.has(task.sessionId)) failures.push(`reminder "${String(task.id)}" is still bound to "${String(task.sessionId)}"`);
+          }
+        } catch {
+          unverified.add('schedule');
+        }
+      }
+    }
+
+    try {
+      await stat(join(txn.runDirectory(staging, manifest.runId), 'entries'));
+      failures.push('staged entries are still on disk');
+    } catch {
+      /* gone, as it should be */
+    }
+    return { failures, unverified: [...unverified] };
+  }
+
+  /**
+   * Recover the staging area: finish interrupted runs forward, forget expired
+   * ones, re-arm the tombstones of recent ones and re-check their checkpoints.
+   * Runs once at startup; tests call it directly.
+   * @returns what the pass did.
+   */
+  async recover() {
+    let staging;
+    try {
+      staging = await txn.stagingRootFor(this.sessionsRoot());
+      // Nothing was ever staged: do not create the staging area just to look.
+      await stat(staging);
+    } catch {
+      return { resumed: [], expired: [], abandoned: [], unknown: [], resurrections: 0 };
+    }
+    return this.exclusive(staging, async () => {
+      const report = { resumed: [], expired: [], abandoned: [], unknown: [], resurrections: 0 };
+      for (const run of await txn.listRuns(staging)) {
+        const manifest = run.manifest;
+        if (manifest === undefined) {
+          report.unknown.push(run.runId);
+          this.warn(`unknown residue in the staging area, left alone: ${run.directory}`);
+          continue;
+        }
+        if (manifest.outcome !== null) {
+          const completedAt = Date.parse(manifest.completedAt ?? manifest.createdAt);
+          if (!Number.isFinite(completedAt) || Date.now() - completedAt > RETAIN_MANIFEST_MS) {
+            await txn.removeRun(staging, run.runId);
+            report.expired.push(run.runId);
+            continue;
+          }
+          this.armTombstones(manifest, completedAt + RETAIN_MANIFEST_MS);
+          report.resurrections += await this.recheckCheckpoints(manifest);
+          if (manifest.steps?.cleanup !== 'done') await this.retryCleanup(staging, manifest);
+          continue;
+        }
+        const outcome = await this.resume(staging, manifest);
+        (outcome === 'abandoned' ? report.abandoned : report.resumed).push(run.runId);
+      }
+      return report;
+    });
+  }
+
+  /**
+   * Finish one interrupted run, trusting the filesystem over the manifest: an
+   * entry is committed when its staged path carries the recorded identity.
+   * @param staging - the staging root.
+   * @param manifest - the run's manifest.
+   * @returns `'abandoned'` when nothing had moved, else `'resumed'`.
+   */
+  async resume(staging, manifest) {
+    const warnings = [];
+    const removed = emptyCounters();
+    const relocate = [];
+    for (const entry of manifest.entries) {
+      if (entry.state === 'CLEANED') continue;
+      const staged = await txn.entryIdentity(entry.staged);
+      const source = await txn.entryIdentity(entry.source);
+      if (staged !== undefined && staged === entry.identity) {
+        entry.state = 'COMMITTED';
+      } else if (source !== undefined && source === entry.identity) {
+        // Still in the tree. When the manifest says the commit finished, the
+        // rename did not survive (its directory entry was never flushed): redo it.
+        if (manifest.steps.commit === 'done' && entry.state === 'COMMITTED') relocate.push(entry);
+        else entry.state = 'FAILED';
+      } else if (source !== undefined || staged !== undefined) {
+        entry.state = 'DRIFT';
+        warnings.push(`identity-drift: ${entry.source} is no longer the directory this run recorded; left alone`);
+      } else if (entry.state === 'COMMITTED') {
+        entry.state = 'CLEANED';
+      } else {
+        entry.state = 'FAILED';
+      }
+    }
+    if (relocate.length > 0) {
+      const ids = [...new Set(relocate.map((entry) => entry.id))];
+      const targets = ids.map((id) => ({ id, directory: relocate.find((entry) => entry.id === id && entry.primary)?.source ?? relocate.find((entry) => entry.id === id).source, header: {}, duplicates: [] }));
+      let fence;
+      try {
+        fence = await this.fence(targets);
+        for (const entry of relocate) {
+          if (fence.owned.includes(entry.id)) {
+            entry.state = 'FAILED';
+            warnings.push(`session "${entry.id}" came back to life before its interrupted commit could be redone; left in place`);
+            continue;
+          }
+          try {
+            await txn.commitEntry(entry.source, entry.staged);
+            entry.state = 'COMMITTED';
+          } catch (error) {
+            entry.state = 'FAILED';
+            warnings.push(`could not redo the commit of ${entry.source}: ${String(error)}`);
+          }
+        }
+      } catch (error) {
+        for (const entry of relocate) entry.state = 'FAILED';
+        warnings.push(`could not fence the interrupted commit: ${String(error?.message ?? error)}`);
+      } finally {
+        await fence?.release();
+      }
+    }
+    settleTargetStates(manifest);
+    this.disarmTombstones(manifest.targets.filter((target) => target.state !== 'COMMITTED').map((target) => target.id));
+    if (!manifest.targets.some((target) => target.state === 'COMMITTED')) {
+      // Nothing left the tree: the run never passed its commit point, and the
+      // handles it held died with its process. There is nothing to undo.
+      await txn.removeRun(staging, manifest.runId);
+      try {
+        await txn.appendAudit(staging, { runId: manifest.runId, path: manifest.path, outcome: 'abandoned', targets: manifest.targets.map((target) => ({ id: target.id })) });
+      } catch {
+        /* the audit is best effort */
+      }
+      return 'abandoned';
+    }
+    manifest.steps.commit = 'done';
+    manifest.state = 'COMMITTED';
+    this.armTombstones(manifest, Date.now() + RETAIN_MANIFEST_MS);
+    await txn.writeManifest(staging, manifest);
+    await this.completeCommitted({ staging, manifest, digests: undefined, warnings, removed });
+    for (const warning of warnings) this.warn(`recovery of ${manifest.runId}: ${warning}`);
+    return 'resumed';
+  }
+
+  /**
+   * Retry the cleanup of a finished run whose staged entries could not all be
+   * removed the first time.
+   * @param staging - the staging root.
+   * @param manifest - the finished run's manifest.
+   */
+  async retryCleanup(staging, manifest) {
+    const warnings = [];
+    for (const entry of manifest.entries) {
+      if (entry.state !== 'COMMITTED') continue;
+      try {
+        await txn.cleanupEntry({ stagedPath: entry.staged, linked: entry.linked, realTarget: entry.realTarget, realTargetIdentity: entry.realTargetIdentity }, warnings);
+        entry.state = 'CLEANED';
+      } catch (error) {
+        warnings.push(`could not clean up ${entry.staged}: ${String(error)}`);
+      }
+    }
+    if (manifest.entries.every((entry) => entry.state !== 'COMMITTED')) {
+      await rm(join(txn.runDirectory(staging, manifest.runId), 'entries'), { recursive: true, force: true });
+      manifest.steps.cleanup = 'done';
+    }
+    await txn.writeManifest(staging, manifest);
+    for (const warning of warnings) this.warn(`cleanup retry of ${manifest.runId}: ${warning}`);
+  }
+
+  /**
+   * Arm the tombstones of a run's committed targets.
+   * @param manifest - the run's manifest.
+   * @param expiresAt - when the tombstones lapse.
+   */
+  armTombstones(manifest, expiresAt) {
+    for (const target of manifest.targets) {
+      if (target.state === 'FAILED' || target.checkpoint === undefined || target.checkpoint === null) continue;
+      if (typeof target.checkpoint.createdAt !== 'number') continue;
+      this.tombstones.set(target.id, { createdAt: target.checkpoint.createdAt, cwd: target.checkpoint.cwd, expiresAt });
+    }
+  }
+
+  /**
+   * Forget tombstones whose sessions turned out not to be deleted.
+   * @param ids - the session ids.
+   */
+  disarmTombstones(ids) {
+    for (const id of ids) this.tombstones.delete(id);
+  }
+
+  /**
+   * Delete a checkpoint written back for a deleted log (DESIGN.md §10.2). The
+   * event arrives after durability in write-chain order, so the delete lands
+   * after the write it answers. Identity decides, not the id: a new session that
+   * reuses the id keeps its checkpoint.
+   * @param change - the `domain/changed` payload.
+   */
+  onDomainChanged(change) {
+    if (change?.domain !== CHECKPOINT_DOMAIN || change.operation !== 'put') return;
+    const tombstone = this.tombstones.get(change.key);
+    if (tombstone === undefined) return;
+    if (tombstone.expiresAt < Date.now()) {
+      this.tombstones.delete(change.key);
+      return;
+    }
+    if (!txn.checkpointIdentityMatches(tombstone, change.value?.identity)) return;
+    const table = this.checkpointTable();
+    if (table === undefined) return;
+    table.delete(change.key).then(
+      () => this.warn(`removed a checkpoint written back for deleted session "${String(change.key)}"`),
+      (error) => this.warn(`could not remove a written-back checkpoint of "${String(change.key)}": ${String(error)}`),
+    );
+  }
+
+  /**
+   * Startup half of the convergence: a write-back that landed after the
+   * watcher's process died is still on disk; delete it.
+   * @param manifest - a finished run's manifest.
+   * @returns how many checkpoints were removed.
+   */
+  async recheckCheckpoints(manifest) {
+    const table = this.checkpointTable();
+    if (table === undefined) return 0;
+    let removed = 0;
+    for (const target of manifest.targets) {
+      const tombstone = this.tombstones.get(target.id);
+      if (tombstone === undefined) continue;
+      try {
+        const record = table.get(target.id);
+        if (record !== undefined && txn.checkpointIdentityMatches(tombstone, record.identity) && await table.delete(target.id)) removed += 1;
+      } catch (error) {
+        this.warn(`could not re-check the checkpoint of "${target.id}": ${String(error)}`);
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * The projection checkpoint table, through the storage facility's documented
+   * diagnostic lookup (`docs:reference/subsystems/storage`, "get(name) is an
+   * untyped diagnostic lookup"). The handle is the same stable table the cache
+   * writes (`dsh-storage-domain:187-191`), so a delete shares its write chain.
+   * @returns the table, or `undefined` when it cannot be reached.
+   */
+  checkpointTable() {
+    try {
+      const table = this.ctx.get('storageDomain')?.get?.(CHECKPOINT_DOMAIN)?.table?.(CHECKPOINT_TABLE);
+      return typeof table?.delete === 'function' && typeof table?.get === 'function' ? table : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Delete the checkpoints of the committed sessions: through the table when it
+   * is reachable (memory and disk change together), then whatever backup or
+   * temporary file the table does not track.
+   * @param ids - the session ids.
+   * @param warnings - the warning sink.
+   * @returns `{ count, table }`.
+   */
+  async removeCheckpoints(ids, warnings) {
+    const table = this.checkpointTable();
+    let count = 0;
+    if (table === undefined) {
+      warnings.push('the projection checkpoint table is unreachable: checkpoint files are removed directly, and a cached row may stay in memory until restart');
+    } else {
+      for (const id of ids) {
+        try {
+          if (await table.delete(id)) count += 1;
+        } catch (error) {
+          warnings.push(`could not delete the checkpoint of "${id}": ${String(error)}`);
+        }
+      }
+    }
+    count += await removeProjectionRecords({ storagesRoot: this.storagesRoot(), ids, warnings });
+    return { count, table: table !== undefined };
   }
 
   /**
@@ -385,14 +1115,9 @@ class SessionPurgeService extends TypertRemoteService {
    *
    * dsh's persistence backend omits an unreadable header from discovery and
    * `list()`, so these directories are invisible in the interface and can never
-   * be selected for deletion, yet they keep their bytes. Two kinds land here: a
-   * log damaged after the fact (checksum, decompression or structural failure is
-   * reported as corruption rather than silently truncated), and a directory left
-   * behind by a crash before the header was written.
-   *
-   * The call is its own preview: `apply: false` reports exactly what `apply:
-   * true` would remove, and the deletion recomputes the set on the Host — the
-   * browser never supplies a path.
+   * be selected for deletion, yet they keep their bytes. The call is its own
+   * preview: `apply: false` reports exactly what `apply: true` would remove, and
+   * the deletion recomputes the set on the Host — the browser never supplies a path.
    *
    * @param apply - whether to delete the reported directories.
    * @param signal - aborts between directories.
@@ -455,9 +1180,8 @@ class SessionPurgeService extends TypertRemoteService {
   }
 
   /**
-   * Whether this process still holds a live Agent or Session for an id. That is
-   * what makes a purge unsafe: a resident Agent owns the write handle and the
-   * checkpoint obligation.
+   * Whether this process holds a live Agent or Session for an id. Advisory: the
+   * preview shows it, and the fence re-checks it under the write handle.
    * @param sessionId - the candidate.
    * @returns whether the id is live here.
    */
@@ -479,7 +1203,9 @@ class SessionPurgeService extends TypertRemoteService {
 
   /**
    * Read every task bound to the targets through the Schedule service, which
-   * owns the durable rows.
+   * owns the durable rows. `catalog()` lists every row whatever its status
+   * (`dsh-schedule:2129-2136`); an inactive row still carries its delivery
+   * history and instruction snapshots, so it is just as much the session's.
    * @param ids - the session ids.
    * @returns the matching task records, each carrying its own session binding.
    */
@@ -498,48 +1224,55 @@ class SessionPurgeService extends TypertRemoteService {
    * Delete the reminders bound to the targets.
    * @param ids - the session ids.
    * @param warnings - the operation's warning sink.
-   * @returns how many tasks were deleted.
+   * @returns `{ count, available }`.
    */
   async removeSchedules(ids, warnings) {
     const schedule = this.ctx.get('schedule');
-    if (schedule === undefined || typeof schedule.delete !== 'function') return 0;
-    let removed = 0;
+    if (schedule === undefined || typeof schedule.delete !== 'function' || typeof schedule.catalog !== 'function') return { count: 0, available: false };
+    let count = 0;
     for (const task of await this.scheduleTasks(ids)) {
       try {
         const result = await schedule.delete({ sessionId: task.sessionId, id: task.id });
-        if (result?.deleted === true) removed += 1;
+        if (result?.deleted === true) count += 1;
       } catch (error) {
-        warnings.push(`could not delete reminder ${task.id}: ${String(error)}`);
+        warnings.push(`could not delete reminder ${String(task.id)}: ${String(error)}`);
       }
     }
-    return removed;
+    return { count, available: true };
   }
 
   /**
-   * Drop every id from the Workspace registry's accounting slot, its archive set
-   * and its pin set. All three go through registry methods, so the durable
-   * document keeps its invariants.
+   * Drop every id from the Workspace registry's accounting slots, archive set and
+   * pin set, through the registry's own methods.
+   *
+   * After the commit the filtered `sessionIds` view may already hide the id
+   * (`dsh-workspace:102-104`): it only lists ids whose header the index still
+   * maps to a path. The raw record keeps the slot until the next mutation prunes
+   * it. So a workspace is selected by either, and `detachSession` — which
+   * rewrites the raw record and is idempotent (`dsh-workspace:148-152`) — is
+   * called only on workspaces that actually account the id, never on the others.
    * @param ids - the session ids.
    * @param warnings - the operation's warning sink.
-   * @returns how many membership slots were dropped, and what to restore if the
-   *   log turns out to be undeletable.
+   * @returns `{ count, available }`.
    */
-  async detachFromWorkspaces(ids, warnings) {
+  async detachWorkspaces(ids, warnings) {
     const registry = this.ctx.get('workspaceRegistry');
-    if (registry === undefined) return { count: 0, restore: [] };
-    const restore = [];
-    let dropped = 0;
-    for (const id of ids) {
-      for (const workspace of registry.list()) {
-        if (!workspace.sessionIds.includes(id)) continue;
+    if (registry === undefined || typeof registry.list !== 'function') return { count: 0, available: false };
+    let count = 0;
+    for (const workspace of registry.list()) {
+      const raw = Array.isArray(workspace?.record?.sessionIds) ? workspace.record.sessionIds : [];
+      const view = Array.isArray(workspace?.sessionIds) ? workspace.sessionIds : [];
+      for (const id of ids) {
+        if (!raw.includes(id) && !view.includes(id)) continue;
         try {
           await workspace.detachSession(id);
-          dropped += 1;
-          restore.push({ workspace, id });
+          count += 1;
         } catch (error) {
-          warnings.push(`could not detach "${id}" from workspace "${workspace.id}": ${String(error)}`);
+          warnings.push(`could not detach "${id}" from workspace "${String(workspace.id)}": ${String(error)}`);
         }
       }
+    }
+    for (const id of ids) {
       for (const [label, operation] of [['archive', 'unarchiveSession'], ['pin', 'unpinSession']]) {
         if (typeof registry[operation] !== 'function') continue;
         try {
@@ -549,63 +1282,74 @@ class SessionPurgeService extends TypertRemoteService {
         }
       }
     }
-    return { count: dropped, restore };
+    return { count, available: true };
   }
 
   /**
-   * Put back the slots of every target whose log directory is still on disk.
-   *
-   * Used when the sweep itself throws — cancellation, or a filesystem error the
-   * engine did not absorb. The directory is the truth: a target that is gone
-   * stays detached, a target that is still there gets its slot back.
-   * @param targets - the plan's targets.
-   * @param restore - the pairs {@link detachFromWorkspaces} reported.
-   * @param warnings - the operation's warning sink.
-   * @returns how many slots were restored.
+   * The report the Client half renders.
+   * @param sessionId - the selected session.
+   * @param plan - the purge plan.
+   * @param manifest - the finished run's manifest.
+   * @param removed - removal counters.
+   * @param warnings - the warning sink.
+   * @returns the report.
    */
-  async restoreSurvivingSlots(targets, restore, warnings) {
-    const survived = new Set();
-    for (const target of targets) {
-      try {
-        await stat(target.directory);
-        survived.add(target.id);
-      } catch {
-        /* the directory is gone: that target really was deleted */
-      }
-    }
-    return this.reattachToWorkspaces(restore.filter((entry) => survived.has(entry.id)), warnings);
-  }
-
-  /**
-   * Put back the Workspace slots a failed purge had to drop first.
-   *
-   * The slot has to go before the log directory does, so the registry's filtered
-   * view still sees the id. When the log turns out to be undeletable, that order
-   * would otherwise leave a session with its data intact and no way to reach it
-   * from the interface — an orphan no dialog can ever offer again.
-   * @param entries - the pairs {@link detachFromWorkspaces} reported.
-   * @param warnings - the operation's warning sink.
-   * @returns how many slots were restored.
-   */
-  async reattachToWorkspaces(entries, warnings) {
-    let restored = 0;
-    for (const { workspace, id } of entries) {
-      if (typeof workspace.attachSession !== 'function') {
-        warnings.push(`could not restore "${id}" in workspace "${workspace.id}": this build exposes no attachSession`);
-        continue;
-      }
-      try {
-        await workspace.attachSession(id);
-        restored += 1;
-      } catch (error) {
-        warnings.push(`could not restore "${id}" in workspace "${workspace.id}": ${String(error)}`);
-      }
-    }
-    return restored;
+  reportOf(sessionId, plan, manifest, removed, warnings) {
+    const removedIds = manifest.targets.filter((target) => target.state === 'COMMITTED').map((target) => target.id);
+    const failedIds = manifest.targets.filter((target) => target.state !== 'COMMITTED').map((target) => target.id);
+    for (const id of failedIds) warnings.push(`session "${id}" was not removed: its directory could not be moved out of the session tree, so nothing else about it was changed`);
+    return {
+      sessionId,
+      runId: manifest.runId,
+      path: manifest.path,
+      targets: plan.targetIds,
+      removedIds,
+      failedIds,
+      forkIds: plan.forkIds,
+      removed,
+      outcome: manifest.outcome,
+      unverified: manifest.unverified,
+      warnings,
+    };
   }
 }
 
 markRemoteMethods(SessionPurgeService.prototype, ['inspect', 'purge', 'sweepResidue']);
+
+/**
+ * The checkpoint identity a stored header witnesses, reduced to what tells two
+ * lives of one id apart (see `txn.checkpointIdentityMatches`).
+ * @param header - a session header.
+ * @returns `{ createdAt, cwd? }`, or `null` without a usable `createdAt`.
+ */
+function tombstoneOf(header) {
+  if (typeof header?.createdAt !== 'number') return null;
+  return typeof header.cwd === 'string' ? { createdAt: header.createdAt, cwd: header.cwd } : { createdAt: header.createdAt };
+}
+
+/**
+ * A target is committed when its primary directory left the tree.
+ * @param manifest - the manifest whose target states are derived from its entries.
+ */
+function settleTargetStates(manifest) {
+  for (const target of manifest.targets) {
+    const primary = manifest.entries.find((entry) => entry.id === target.id && entry.primary);
+    target.state = primary !== undefined && (primary.state === 'COMMITTED' || primary.state === 'CLEANED') ? 'COMMITTED' : 'FAILED';
+  }
+}
+
+/**
+ * The refusal for targets that are live in this process.
+ * @param ids - the live session ids.
+ * @returns the Remote error.
+ */
+function liveError(ids) {
+  return new RemoteError(
+    'session-purge/session-live',
+    `session "${ids[0]}" is still resident in this harness process; it can only be deleted once it is cold`,
+    { sessionIds: ids },
+  );
+}
 
 /**
  * Notify connected browsers that a session is gone, so rows and dependent panels

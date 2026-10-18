@@ -17,6 +17,7 @@
   "files": [
     "index.js",
     "engine.js",
+    "txn.js",
     "client.js",
     "typert.js",
     "cordis.patch.yml",
@@ -28,6 +29,7 @@
   "peerDependencies": {
     "@deepseek-ai/dsh-home-paths": "*",
     "@deepseek-ai/dsh-typert-protocol": "*",
+    "@deepseek-ai/node-addon-system": "*",
     "@deepseek-ai/schemastery": "*"
   },
   "dsh": {

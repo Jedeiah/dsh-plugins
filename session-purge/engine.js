@@ -299,7 +299,7 @@ export async function indexStoredSessions(root) {
     return records;
   }
   for (const project of projects) {
-    if (!project.isDirectory()) continue;
+    if (!(await isDirectoryEntry(root, project))) continue;
     const projectDirectory = join(root, project.name);
     let entries;
     try {
@@ -308,7 +308,10 @@ export async function indexStoredSessions(root) {
       continue;
     }
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      // A session directory may itself be a link to a folder elsewhere (a layout
+      // some users build to keep logs on another disk). It is indexed like any
+      // other, and marked so the commit moves the link rather than its target.
+      if (!(await isDirectoryEntry(projectDirectory, entry))) continue;
       const directory = join(projectDirectory, entry.name);
       const header = await readSessionHeader(directory);
       if (header === undefined || typeof header.id !== 'string') continue;
@@ -322,12 +325,28 @@ export async function indexStoredSessions(root) {
         /* a directory that vanished mid-scan keeps its zero size */
       }
       const existing = records.get(header.id);
-      const record = { id: header.id, directory, projectDirectory, header, sizeBytes, duplicates: [] };
+      const record = { id: header.id, directory, projectDirectory, header, sizeBytes, linked: entry.isSymbolicLink(), duplicates: [] };
       if (existing === undefined) records.set(header.id, record);
       else existing.duplicates.push(record);
     }
   }
   return records;
+}
+
+/**
+ * Whether a directory entry is a directory, following a symbolic link.
+ * @param parent - the directory the entry was read from.
+ * @param entry - the `Dirent`.
+ * @returns whether it names a directory.
+ */
+async function isDirectoryEntry(parent, entry) {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+  try {
+    return (await stat(join(parent, entry.name))).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /**

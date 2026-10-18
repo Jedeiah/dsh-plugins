@@ -28,7 +28,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -190,6 +190,11 @@ async function buildStore(root, options = {}) {
   return { root, sessionsRoot, storagesRoot, attachmentsRoot, spillRoot, project, survivorProject, nestedProject, parentId, childId, grandId, forkId, keptId, doomedDigest, keptDigest, sharedDigest };
 }
 
+/** @returns the canonical path (the temp directory is a symlink on macOS). */
+async function realpathOf(path) {
+  return realpath(path);
+}
+
 /** @returns whether a path exists. */
 async function exists(path) {
   try {
@@ -275,6 +280,96 @@ async function testEngine(store) {
 }
 
 /**
+ * Part A3: the transaction store on its own — no dsh installation needed.
+ * @param root - a scratch directory.
+ */
+async function testTransactionStore(root) {
+  console.log('\nPart A3 — transaction store (txn.js)');
+  const txn = await import(join(here, 'txn.js'));
+  const engine = await import(join(here, 'engine.js'));
+
+  check('session artifacts are recognised', ['session.lock', 'session.jsonl', 'session.v4.jsonl.zstd', 'session.migration.ab12.jsonl.zstd.tmp'].every((name) => txn.isSessionArtifact(name)));
+  check('anything else is not a session artifact', !['notes.txt', 'session.md', 'sessions.json', 'report.png'].some((name) => txn.isSessionArtifact(name)));
+
+  check('a checkpoint of the deleted log matches its tombstone', txn.checkpointIdentityMatches({ createdAt: 5, cwd: '/a' }, { createdAt: 5, cwd: '/a', formatVersion: 4 }));
+  check('a new session under the same id does not', !txn.checkpointIdentityMatches({ createdAt: 5, cwd: '/a' }, { createdAt: 6, cwd: '/a' }));
+  check('another cwd does not', !txn.checkpointIdentityMatches({ createdAt: 5, cwd: '/a' }, { createdAt: 5, cwd: '/b' }));
+  check('a record without an identity does not', !txn.checkpointIdentityMatches({ createdAt: 5 }, undefined));
+
+  const sessions = join(root, 'sessions');
+  await mkdir(sessions, { recursive: true });
+  const staging = await txn.stagingRootFor(sessions);
+  check('the staging root is a sibling of the session root', staging === join(await realpathOf(root), txn.STAGING_DIRECTORY), staging);
+  await txn.ensureStagingRoot(staging);
+
+  const manifest = { version: txn.MANIFEST_VERSION, runId: txn.newRunId(), path: 'immediate', targets: [], entries: [], outcome: null };
+  await txn.writeManifest(staging, manifest);
+  const runs = await txn.listRuns(staging);
+  check('a manifest round-trips', runs.length === 1 && runs[0].manifest?.runId === manifest.runId);
+  check('no temporary file is left next to it', (await readdir(runs[0].directory)).every((name) => !name.endsWith('.tmp')));
+  await mkdir(join(staging, 'runs', 'zz-garbage'), { recursive: true });
+  await writeFile(join(staging, 'runs', 'zz-garbage', 'manifest.json'), '{"version":1,"runId":"zz-garbage","targets":[]}');
+  const withGarbage = await txn.listRuns(staging);
+  check('a manifest of another version is unknown residue, never acted on', withGarbage.length === 2 && withGarbage.find((run) => run.runId === 'zz-garbage')?.manifest === undefined);
+
+  // Commit and identity: a rename keeps the inode, so identity follows the move.
+  const project = join(sessions, '--project--');
+  const source = join(project, 'session-x');
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, 'session.jsonl'), '{}\n');
+  const before = await txn.entryIdentity(source);
+  const staged = txn.stagedPathFor(staging, manifest.runId, source);
+  await txn.commitEntry(source, staged);
+  check('the commit moves the entry out of the tree', !existsSync(source) && existsSync(join(staged, 'session.jsonl')));
+  check('identity follows the moved entry', before !== undefined && (await txn.entryIdentity(staged)) === before);
+  await txn.cleanupEntry({ stagedPath: staged, linked: false }, []);
+  check('a committed directory is removed whole', !existsSync(staged));
+
+  // A linked entry whose target was swapped after the commit is left alone.
+  if (process.platform !== 'win32') {
+    const outside = join(root, 'outside');
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, 'session.jsonl'), '{}\n');
+    const link = join(project, 'session-linked');
+    await symlink(outside, link, 'dir');
+    const recorded = await txn.targetIdentity(link);
+    const linkStaged = txn.stagedPathFor(staging, manifest.runId, link);
+    await txn.commitEntry(link, linkStaged);
+    await rm(outside, { recursive: true, force: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, 'session.jsonl'), 'someone else\'s\n');
+    const warnings = [];
+    await txn.cleanupEntry({ stagedPath: linkStaged, linked: true, realTarget: outside, realTargetIdentity: recorded }, warnings);
+    check('a linked target swapped since the commit is not touched', existsSync(join(outside, 'session.jsonl')) && warnings.some((line) => line.includes('identity-drift')), JSON.stringify(warnings));
+    check('the moved link itself is removed', !existsSync(linkStaged));
+  }
+
+  // The engine indexes a linked session directory and marks it.
+  if (process.platform !== 'win32') {
+    const store = join(root, 'linked-store');
+    const real = join(root, 'linked-real', 'session-l');
+    await mkdir(real, { recursive: true });
+    await writeFile(join(real, 'session.jsonl'), `${JSON.stringify({ type: 'session', version: 2, id: 'session-l', createdAt: 1 })}\n`);
+    await mkdir(join(store, '--p--'), { recursive: true });
+    await symlink(real, join(store, '--p--', 'session-l'), 'dir');
+    const index = await engine.indexStoredSessions(store);
+    check('a linked session directory is indexed and marked linked', index.get('session-l')?.linked === true, JSON.stringify([...index.keys()]));
+  }
+
+  // In-process serialization holds without flock (Windows' situation).
+  const order = [];
+  const slow = txn.withGlobalLock(staging, undefined, async () => { order.push('a-start'); await new Promise((resolve) => setTimeout(resolve, 30)); order.push('a-end'); });
+  const fast = txn.withGlobalLock(staging, undefined, async () => { order.push('b'); });
+  await Promise.all([slow, fast]);
+  check('two operations on one staging root never overlap', order.join(',') === 'a-start,a-end,b', order.join(','));
+
+  // The audit rotates instead of growing without bound.
+  await writeFile(join(staging, 'audit.jsonl'), Buffer.alloc(8 * 1024 * 1024, 0x20));
+  await txn.appendAudit(staging, { runId: 'r', outcome: 'verified' });
+  check('a full audit file is rotated', existsSync(join(staging, 'audit.1.jsonl')) && (await readFile(join(staging, 'audit.jsonl'), 'utf8')).trim().split('\n').length === 1);
+}
+
+/**
  * Spill-root discovery must accept only the backend's own root shape and must
  * never treat a look-alike directory as its own.
  */
@@ -319,11 +414,12 @@ async function testGateway(app, workroot) {
   await mkdir(join(modules, 'node_modules', '@deepseek-ai'), { recursive: true });
   await cp(join(here, 'index.js'), join(bundle, 'index.js'));
   await cp(join(here, 'engine.js'), join(bundle, 'engine.js'));
+  await cp(join(here, 'txn.js'), join(bundle, 'txn.js'));
   await cp(join(here, 'typert.js'), join(bundle, 'typert.js'));
   // Windows cannot create directory symlinks without Developer Mode or elevation,
   // so the shim uses a junction there; every other platform takes a plain symlink.
   const linkType = process.platform === 'win32' ? 'junction' : 'dir';
-  for (const name of ['schemastery', 'dsh-typert-protocol', 'dsh-home-paths']) {
+  for (const name of ['schemastery', 'dsh-typert-protocol', 'dsh-home-paths', 'node-addon-system']) {
     await symlink(join(app, name), join(modules, 'node_modules', '@deepseek-ai', name), linkType);
   }
 
@@ -351,6 +447,8 @@ async function testGateway(app, workroot) {
     storagesRoot: store.storagesRoot,
     attachmentsRoot: store.attachmentsRoot,
     spillRoots: [store.spillRoot],
+    // Recovery is driven by hand below; a timer would race the tests.
+    recoveryDelayMs: -1,
   });
   if (config.issues !== undefined) {
     check('row configuration validates', false, JSON.stringify(config.issues));
@@ -360,213 +458,430 @@ async function testGateway(app, workroot) {
   check('row configuration validates and fills defaults', plain(config.value.includeDescendants) === true && plain(config.value.purgeAttachments) === false, JSON.stringify([plain(config.value.includeDescendants), plain(config.value.purgeAttachments)]));
   check('volatile fields arrive as live references', typeof config.value.includeDescendants?.get === 'function');
 
-  const boot = (settings) => {
+  const { tryLockExclusive } = await import(join(app, 'node-addon-system', 'lib', 'flock.js'));
+  const engine = await import(join(here, 'engine.js'));
+  const txn = await import(join(here, 'txn.js'));
+  const named = (name, message) => Object.assign(new Error(message), { name });
+  const leases = process.platform !== 'win32';
+
+  /**
+   * The persistence seam the fence talks to, backed by a synthetic store: a write
+   * open is refused for an owned id and otherwise takes the same kernel lease the
+   * JSONL backend takes on `session.lock`. Part B2 shows dsh's real seam behaves
+   * this way; here it lets Part B drive the plugin's own logic over synthetic logs
+   * (the real backend insists on its own cwd-derived layout).
+   * @param root - the synthetic session root.
+   * @param options - `reportedRoot` to lie about the root, `lease: false` to skip the lock.
+   * @returns the stub.
+   */
+  const stubPersistence = (root, options = {}) => ({
+    root: options.reportedRoot ?? root,
+    owned: new Set(),
+    async open(id, access) {
+      if (access === 'write' && this.owned.has(id)) throw named('SessionAlreadyOwnedError', `session "${id}" is already owned by an active write handle`);
+      const record = (await engine.indexStoredSessions(root)).get(id);
+      if (record === undefined) throw named('SessionPersistenceNotFoundError', `session "${id}" not found`);
+      if (access !== 'write') return { header: record.header, close: async () => undefined };
+      let lease;
+      if (options.lease !== false && leases) {
+        lease = await openFile(join(record.directory, 'session.lock'), 'w');
+        await tryLockExclusive(lease.fd);
+      }
+      return { header: record.header, inheritedEventCount: 0, close: async () => { await lease?.close(); } };
+    },
+  });
+
+  const boot = (settings, persistence) => {
     const ctx = new Context();
     new TypertRegistry(ctx);
     ctx.typert.register(manifest.TYPERT);
     const gateway = new TypertGatewayService(ctx, {});
+    const seam = persistence ?? stubPersistence(settings.sessionsRoot);
+    ctx.provide('sessionPersistence', seam);
     host.apply(ctx, settings);
-    return { ctx, gateway, peer: new Peer(ctx, { principal: { kind: 'owner' } }) };
+    const peer = new Peer(ctx, { principal: { kind: 'owner' } });
+    const invoke = (method, args, signal = new AbortController().signal) => gateway.invoke({ namespace: 'sessionPurge', method, args, signal, peer });
+    const attempt = async (method, args, signal) => {
+      try {
+        return { value: await invoke(method, args, signal) };
+      } catch (error) {
+        return { error };
+      }
+    };
+    return { ctx, gateway, peer, seam, invoke, attempt, service: () => ctx.get('sessionPurge') };
   };
-  const { gateway, peer } = boot(config.value);
+  const rooted = (target) => ({ ...config.value, sessionsRoot: target.sessionsRoot, storagesRoot: target.storagesRoot, attachmentsRoot: target.attachmentsRoot, spillRoots: [target.spillRoot] });
+  const runsOf = async (target) => txn.listRuns(await txn.stagingRootFor(target.sessionsRoot));
+  const allThere = (target) => existsSync(join(target.project, target.parentId)) && existsSync(join(target.project, target.childId)) && existsSync(join(target.nestedProject, target.grandId));
 
-  const inspect = await gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: store.parentId }, signal: new AbortController().signal, peer });
+  // ── The immediate path, end to end ─────────────────────────────────────────
+  const main = boot(config.value);
+  check('the Remote service is reachable for recovery', typeof main.service()?.recover === 'function');
+  const inspect = await main.invoke('inspect', { sessionId: store.parentId });
   check('inspect returns every lineage target with titles', inspect.targets.length === 3 && inspect.targets[0].title === 'Synthetic parent' && inspect.targets.some((target) => target.sessionId === store.grandId && target.title === 'Synthetic grandchild'), JSON.stringify(inspect.targets.map((target) => [target.sessionId, target.title])));
   check('inspect reports the fork that will be kept', (inspect.forkIds ?? []).includes(store.forkId), JSON.stringify(inspect.forkIds));
   check('inspect reports no blocking liveness', inspect.blocked === null);
   check('inspect counts the spilled directory', inspect.spillDirectoryCount === 1, String(inspect.spillDirectoryCount));
   check('inspect totals the disk size', inspect.sizeBytes > 0, String(inspect.sizeBytes));
 
-  const report = await gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: store.parentId }, signal: new AbortController().signal, peer });
-  check('purge deletes the session, its child and its grandchild', report.targets.length === 3 && report.removedIds.length === 3, report.targets.join(','));
+  const report = await main.invoke('purge', { sessionId: store.parentId });
+  check('purge removes the session, its child and its grandchild', report.removedIds.length === 3 && report.failedIds.length === 0, JSON.stringify([report.removedIds, report.failedIds]));
   check('purge reports every removed artifact', report.removed.sessionDirectories === 3 && report.removed.projectionRecords === 5 && report.removed.spillDirectories === 1, JSON.stringify(report.removed));
+  check('the logs left the session tree', !allThere(store) && !existsSync(join(store.project, store.parentId)) && !existsSync(join(store.nestedProject, store.grandId)));
   check('purge leaves the survivor readable', await exists(join(store.survivorProject, store.keptId, 'session.v4.jsonl.zstd')));
   check('purge leaves the fork untouched', await exists(join(store.project, store.forkId)));
   check('purge keeps unreferenced attachments (default off)', await exists(join(store.attachmentsRoot, 'v1', 'objects', store.doomedDigest.slice(0, 2), store.doomedDigest)));
-
-  const second = await buildStore(join(workroot, 'gateway-store-live'));
-  const liveHost = boot({ ...config.value, sessionsRoot: second.sessionsRoot, storagesRoot: second.storagesRoot, attachmentsRoot: second.attachmentsRoot, spillRoots: [second.spillRoot], purgeAttachments: true });
-  // One service instance per context: flip the stub's answer instead of replacing it.
-  const live = { sessionId: second.parentId };
-  liveHost.ctx.provide('agents', { get: (id) => (live.sessionId === id ? { id } : undefined) });
-  let refusal;
-  try {
-    await liveHost.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: second.parentId }, signal: new AbortController().signal, peer: liveHost.peer });
-  } catch (error) {
-    refusal = error;
+  check('the report names its run and an honest outcome', typeof report.runId === 'string' && report.outcome === 'verified-with-gaps' && ['checkpoint-memory', 'workspace', 'schedule'].every((gap) => report.unverified.includes(gap)), JSON.stringify([report.outcome, report.unverified]));
+  {
+    const staging = await txn.stagingRootFor(store.sessionsRoot);
+    const runs = await txn.listRuns(staging);
+    const run = runs.find((entry) => entry.runId === report.runId);
+    check('the finished run keeps its manifest (for the tombstones) and nothing else', runs.length === 1 && run?.manifest?.outcome === report.outcome && !existsSync(join(run.directory, 'entries')), JSON.stringify(runs.map((entry) => entry.runId)));
+    check('the manifest records no titles', run !== undefined && !(await readFile(join(run.directory, 'manifest.json'), 'utf8')).includes('Synthetic'));
+    const audit = await readFile(join(staging, 'audit.jsonl'), 'utf8');
+    check('one audit record names the run, without titles', audit.trim().split('\n').length === 1 && audit.includes(report.runId) && !audit.includes('Synthetic'), audit);
+    check('the staging area is outside the session tree', !staging.startsWith(`${await realpathOf(store.sessionsRoot)}/`), staging);
   }
-  check('a live target is refused with a stable code', refusal?.code === 'session-purge/session-live', String(refusal?.code));
-  check('the refusal names the live session', Array.isArray(refusal?.details?.sessionIds) && refusal.details.sessionIds.includes(second.parentId), JSON.stringify(refusal?.details));
-  check('the live session survives the refusal', await exists(join(second.project, second.parentId)));
-  live.sessionId = null;
-  const retry = await liveHost.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: second.parentId }, signal: new AbortController().signal, peer: liveHost.peer });
-  check('once cold, the same purge succeeds and clears the unreferenced attachment', retry.removed.attachmentObjects === 1, JSON.stringify(retry.removed));
 
-  // ── Live guard, error codes, and the Host-side reference bookkeeping ──────
+  // ── Liveness: by registry, and by another owner of the write handle ─────────
+  {
+    const second = await buildStore(join(workroot, 'gateway-store-live'));
+    const seam = stubPersistence(second.sessionsRoot);
+    const liveHost = boot({ ...rooted(second), purgeAttachments: true }, seam);
+    const live = { sessionId: second.parentId };
+    liveHost.ctx.provide('agents', { get: (id) => (live.sessionId === id ? { id } : undefined) });
+    const refused = await liveHost.attempt('purge', { sessionId: second.parentId });
+    check('a live target is refused with a stable code', refused.error?.code === 'session-purge/session-live', String(refused.error?.code));
+    check('the refusal names the live session', refused.error?.details?.sessionIds?.includes(second.parentId) === true, JSON.stringify(refused.error?.details));
+    check('the live session survives the refusal', allThere(second));
+
+    // The registry says cold, but someone else holds the write handle: the fence
+    // is what decides, and it refuses before anything is written.
+    live.sessionId = null;
+    seam.owned.add(second.childId);
+    const fenced = await liveHost.attempt('purge', { sessionId: second.parentId });
+    check('a target owned by another writer is refused by the fence', fenced.error?.code === 'session-purge/session-live' && fenced.error?.details?.sessionIds?.includes(second.childId) === true, `${String(fenced.error?.code)} ${JSON.stringify(fenced.error?.details)}`);
+    check('a refused fence changes nothing and leaves no run behind', allThere(second) && (await runsOf(second)).length === 0);
+    if (leases) {
+      // Every lease the fence took was released: taking them again works.
+      const probe = await openFile(join(second.project, second.parentId, 'session.lock'), 'r+');
+      let free = true;
+      try {
+        await tryLockExclusive(probe.fd);
+      } catch {
+        free = false;
+      } finally {
+        await probe.close();
+      }
+      check('a refused fence releases the leases it had taken', free);
+    }
+    seam.owned.clear();
+    const retry = await liveHost.invoke('purge', { sessionId: second.parentId });
+    check('once nobody owns it, the same purge succeeds and clears the unreferenced attachment', retry.removedIds.length === 3 && retry.removed.attachmentObjects === 1, JSON.stringify(retry.removed));
+  }
+
+  // ── Bookkeeping through the owners' services ───────────────────────────────
   {
     const third = await buildStore(join(workroot, 'gateway-store-bookkeeping'));
-    const host3 = boot({ ...config.value, sessionsRoot: third.sessionsRoot, storagesRoot: third.storagesRoot, attachmentsRoot: third.attachmentsRoot, spillRoots: [third.spillRoot] });
+    const host3 = boot(rooted(third));
     const calls = [];
     const live = { sessionId: third.childId };
     host3.ctx.provide('agents', { get: (id) => (live.sessionId === id ? { id } : undefined) });
     host3.ctx.effect(() => host3.ctx.on('api-session/removed', (id) => calls.push(`removed:${id}`)), 'selftest: announce listener');
+    // The raw record still accounts the parent while the filtered view already
+    // hides it — the state dsh is in once its header index forgets a deleted log.
+    const accounts = { 'ws-1': [third.parentId, third.forkId], 'ws-2': [third.keptId] };
+    const archived = [third.childId];
+    const pinned = [third.parentId];
     host3.ctx.provide('workspaceRegistry', {
-      list: () => [{
-        id: 'ws-1',
-        sessionIds: [third.parentId],
-        detachSession: (id) => {
-          // Ordering: the accounting slot must be dropped while the log is still
-          // there, or the registry's filtered view skips it and the slot strands.
-          calls.push(`detach:${id}:log-${existsSync(join(third.project, id)) ? 'present' : 'gone'}`);
+      list: () => Object.entries(accounts).map(([id, ids]) => ({
+        id,
+        record: { sessionIds: ids },
+        get sessionIds() { return ids.filter((entry) => entry !== third.parentId); },
+        detachSession: (sessionId) => {
+          calls.push(`detach:${id}:${sessionId}:log-${existsSync(join(third.project, sessionId)) ? 'present' : 'gone'}`);
+          accounts[id] = accounts[id].filter((entry) => entry !== sessionId);
           return Promise.resolve();
         },
-      }],
-      unarchiveSession: (id) => calls.push(`unarchive:${id}`),
-      unpinSession: (id) => calls.push(`unpin:${id}`),
+      })),
+      get archivedSessionIds() { return [...archived]; },
+      get pinnedSessionIds() { return [...pinned]; },
+      unarchiveSession: (id) => { calls.push(`unarchive:${id}`); archived.splice(0, archived.length, ...archived.filter((entry) => entry !== id)); },
+      unpinSession: (id) => { calls.push(`unpin:${id}`); pinned.splice(0, pinned.length, ...pinned.filter((entry) => entry !== id)); },
     });
+    const rows = [
+      { id: 'task-1', sessionId: third.parentId, status: 'active' },
+      { id: 'task-2', sessionId: 'unrelated', status: 'active' },
+      { id: 'task-3', sessionId: third.childId, status: 'inactive' },
+    ];
     host3.ctx.provide('schedule', {
-      catalog: async () => [{ id: 'task-1', sessionId: third.parentId }, { id: 'task-2', sessionId: 'unrelated' }],
-      delete: async ({ id, sessionId }) => { calls.push(`schedule:${sessionId}/${id}`); return { deleted: true }; },
+      catalog: async () => rows.map((row) => ({ ...row })),
+      delete: async ({ id, sessionId }) => {
+        calls.push(`schedule:${sessionId}/${id}`);
+        const at = rows.findIndex((row) => row.id === id && row.sessionId === sessionId);
+        if (at === -1) return { id, deleted: false };
+        rows.splice(at, 1);
+        return { id, deleted: true };
+      },
     });
 
-    const blockedInspection = await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: third.parentId }, signal: new AbortController().signal, peer: host3.peer });
+    const blockedInspection = await host3.invoke('inspect', { sessionId: third.parentId });
     check('a live *child* is reported as blocking the preview', blockedInspection.blocked?.sessionIds?.includes(third.childId) === true, JSON.stringify(blockedInspection.blocked));
-    let childRefusal;
-    try {
-      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: third.parentId }, signal: new AbortController().signal, peer: host3.peer });
-    } catch (error) {
-      childRefusal = error;
-    }
-    check('a live child refuses the purge with the stable code', childRefusal?.code === 'session-purge/session-live', String(childRefusal?.code));
+    const childRefusal = await host3.attempt('purge', { sessionId: third.parentId });
+    check('a live child refuses the purge with the stable code', childRefusal.error?.code === 'session-purge/session-live', String(childRefusal.error?.code));
 
     live.sessionId = null;
-    const bookkeeping = await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: third.parentId }, signal: new AbortController().signal, peer: host3.peer });
-    check('the purge drops the Workspace slot before the log disappears', calls.includes(`detach:${third.parentId}:log-present`), calls.join(' | '));
-    check('archive and pin entries are cleared through the registry', calls.includes(`unarchive:${third.parentId}`) && calls.includes(`unpin:${third.parentId}`), calls.join(' | '));
-    check('only reminders bound to the targets are deleted', calls.includes(`schedule:${third.parentId}/task-1`) && !calls.some((entry) => entry.includes('task-2')), calls.join(' | '));
-    check('the report counts the schedule and workspace work', bookkeeping.removed.schedules === 1 && bookkeeping.removed.workspaceSlots === 1, JSON.stringify(bookkeeping.removed));
+    const bookkeeping = await host3.invoke('purge', { sessionId: third.parentId });
+    check('the Workspace slot is dropped after the log left the tree', calls.includes(`detach:ws-1:${third.parentId}:log-gone`), calls.join(' | '));
+    check('a workspace is selected by its raw record, not the filtered view', calls.some((entry) => entry.startsWith(`detach:ws-1:${third.parentId}`)));
+    check('a workspace that does not account the target is never mutated', !calls.some((entry) => entry.startsWith('detach:ws-2')), calls.join(' | '));
+    check('archive and pin entries are cleared through the registry', calls.includes(`unarchive:${third.childId}`) && calls.includes(`unpin:${third.parentId}`), calls.join(' | '));
+    check('reminders of every status bound to the targets are deleted, and only those', calls.includes(`schedule:${third.parentId}/task-1`) && calls.includes(`schedule:${third.childId}/task-3`) && !calls.some((entry) => entry.includes('task-2')), calls.join(' | '));
+    check('the report counts the schedule and workspace work', bookkeeping.removed.schedules === 2 && bookkeeping.removed.workspaceSlots === 1, JSON.stringify(bookkeeping.removed));
     check('every removed session is announced once', bookkeeping.removedIds.every((id) => calls.includes(`removed:${id}`)) && calls.filter((entry) => entry.startsWith('removed:')).length === bookkeeping.removedIds.length, calls.join(' | '));
+    check('with Workspace and Schedule readable, only the checkpoint memory stays unverified', bookkeeping.outcome === 'verified-with-gaps' && bookkeeping.unverified.length === 1 && bookkeeping.unverified[0] === 'checkpoint-memory', JSON.stringify([bookkeeping.outcome, bookkeeping.unverified]));
 
-    let unknownRefusal;
-    try {
-      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: 'session-does-not-exist' }, signal: new AbortController().signal, peer: host3.peer });
-    } catch (error) {
-      unknownRefusal = error;
-    }
-    check('an unknown session is refused with its own code', unknownRefusal?.code === 'session-purge/session-unknown', String(unknownRefusal?.code));
-    let invalidRefusal;
-    try {
-      await host3.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: '../evil' }, signal: new AbortController().signal, peer: host3.peer });
-    } catch (error) {
-      invalidRefusal = error;
-    }
+    const unknownRefusal = await host3.attempt('inspect', { sessionId: 'session-does-not-exist' });
+    check('an unknown session is refused with its own code', unknownRefusal.error?.code === 'session-purge/session-unknown', String(unknownRefusal.error?.code));
+    const invalidRefusal = await host3.attempt('inspect', { sessionId: '../evil' });
     // Either layer may answer first: the manifest codec rejects at the wire
     // boundary (`gateway/input-invalid`) and the service re-checks with its own
     // stable code. Both mean "refused before any path use".
-    check('a traversal-shaped id is refused before any path use', invalidRefusal !== undefined && (invalidRefusal.code === 'session-purge/invalid-session-id' || invalidRefusal.code === 'gateway/input-invalid' || String(invalidRefusal.message).includes('path-safe')), `${String(invalidRefusal?.code)} ${String(invalidRefusal?.message)}`);
+    check('a traversal-shaped id is refused before any path use', invalidRefusal.error !== undefined && (invalidRefusal.error.code === 'session-purge/invalid-session-id' || invalidRefusal.error.code === 'gateway/input-invalid' || String(invalidRefusal.error.message).includes('path-safe')), `${String(invalidRefusal.error?.code)} ${String(invalidRefusal.error?.message)}`);
+  }
 
-    // A target set that grew between preview and confirmation must be refused,
-    // not silently deleted.
+  // ── The preview is the contract ─────────────────────────────────────────────
+  {
     const fourth = await buildStore(join(workroot, 'gateway-store-drift'));
-    const host4 = boot({ ...config.value, sessionsRoot: fourth.sessionsRoot, storagesRoot: fourth.storagesRoot, attachmentsRoot: fourth.attachmentsRoot, spillRoots: [fourth.spillRoot] });
-    await host4.gateway.invoke({ namespace: 'sessionPurge', method: 'inspect', args: { sessionId: fourth.parentId }, signal: new AbortController().signal, peer: host4.peer });
-    await mkdir(join(fourth.project, '99999999-8888-7777-6666-555555555555'), { recursive: true });
-    await writeFile(join(fourth.project, '99999999-8888-7777-6666-555555555555', 'session.v4.jsonl.zstd'), storedLog(
-      { type: 'session', version: 4, id: '99999999-8888-7777-6666-555555555555', createdAt: 9, cwd: '/Users/example/projects/demo', parentSession: fourth.parentId, isSeeded: false, origin: 'subagent', delegationDepth: 1 },
+    const host4 = boot(rooted(fourth));
+    await host4.invoke('inspect', { sessionId: fourth.parentId });
+    const lateId = '99999999-8888-7777-6666-555555555555';
+    await mkdir(join(fourth.project, lateId), { recursive: true });
+    await writeFile(join(fourth.project, lateId, 'session.v4.jsonl.zstd'), storedLog(
+      { type: 'session', version: 4, id: lateId, createdAt: 9, cwd: '/Users/example/projects/demo', parentSession: fourth.parentId, isSeeded: false, origin: 'subagent', delegationDepth: 1 },
       [{ type: 'session/title', seq: 1, time: 9, data: { title: 'Late child' } }],
     ));
-    let driftRefusal;
-    try {
-      await host4.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: fourth.parentId }, signal: new AbortController().signal, peer: host4.peer });
-    } catch (error) {
-      driftRefusal = error;
-    }
-    check('a target set that grew since the preview is refused', driftRefusal?.code === 'session-purge/target-set-changed', String(driftRefusal?.code));
-    check('the late child survives the refusal', existsSync(join(fourth.project, '99999999-8888-7777-6666-555555555555')));
-    // A failed log removal must leave the session whole. Its Workspace slot, its
-    // projection record and its reminders are what keep it reachable and
-    // configurable; clearing them around a surviving log turns a failed delete
-    // into an invisible orphan that no dialog can ever reach again.
+    const drift = await host4.attempt('purge', { sessionId: fourth.parentId });
+    check('a target set that grew since the preview is refused', drift.error?.code === 'session-purge/target-set-changed', String(drift.error?.code));
+    check('the late child survives the refusal', existsSync(join(fourth.project, lateId)));
+  }
+
+  // ── A commit that fails leaves its target whole ─────────────────────────────
+  {
+    // Without write permission on the project directory the rename out of it
+    // fails, so the parent and its child stay; the grandchild lives in another
+    // project directory and is removed. The failed ones keep everything.
     const fifth = await buildStore(join(workroot, 'gateway-store-fail'));
-    const host5 = boot({ ...config.value, sessionsRoot: fifth.sessionsRoot, storagesRoot: fifth.storagesRoot, attachmentsRoot: fifth.attachmentsRoot, spillRoots: [fifth.spillRoot] });
-    const detachedAgain = [];
-    const reattached = [];
+    const host5 = boot(rooted(fifth));
+    const detached = [];
     host5.ctx.provide('workspaceRegistry', {
-      list: () => [{
-        id: 'ws-fail',
-        sessionIds: [fifth.parentId],
-        detachSession: (id) => { detachedAgain.push(id); return Promise.resolve(); },
-        attachSession: (id) => { reattached.push(id); return Promise.resolve(); },
-      }],
+      list: () => [{ id: 'ws-fail', record: { sessionIds: [fifth.parentId, fifth.childId, fifth.grandId] }, sessionIds: [fifth.parentId, fifth.childId, fifth.grandId], detachSession: (id) => { detached.push(id); return Promise.resolve(); } }],
+      archivedSessionIds: [],
+      pinnedSessionIds: [],
       unarchiveSession: () => undefined,
       unpinSession: () => undefined,
     });
-    // A session directory without write permission cannot have its entries
-    // unlinked, so `rm -r` fails before touching a single byte: the log survives
-    // intact. (A half-deleted directory is a different, unrecoverable story.)
-    const sessionDirectory = join(fifth.project, fifth.parentId);
-    const sessionMode = (await stat(sessionDirectory)).mode;
-    await chmod(sessionDirectory, 0o500);
-    let failureReport;
+    const projectMode = (await stat(fifth.project)).mode;
+    await chmod(fifth.project, 0o500);
+    let failure;
     try {
-      failureReport = await host5.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: fifth.parentId }, signal: new AbortController().signal, peer: host5.peer });
+      failure = await host5.attempt('purge', { sessionId: fifth.parentId });
     } finally {
-      await chmod(sessionDirectory, sessionMode);
+      await chmod(fifth.project, projectMode);
     }
-    check('the failed directory still holds its log', existsSync(join(sessionDirectory, 'session.v4.jsonl.zstd')));
-    check('a directory that cannot be removed is reported as failed',
-      failureReport?.failedIds?.includes(fifth.parentId) === true, JSON.stringify(failureReport?.failedIds));
-    check('the failed session is not announced as removed',
-      failureReport?.removedIds?.includes(fifth.parentId) !== true, JSON.stringify(failureReport?.removedIds));
-    check('its projection record survives the failed purge',
-      existsSync(join(fifth.storagesRoot, 'session_projcache', 'sessions', `${fifth.parentId}.json`)));
-    check('its Workspace slot is put back after the failure',
-      detachedAgain.includes(fifth.parentId) && reattached.includes(fifth.parentId),
-      `detached=[${detachedAgain.join(',')}] reattached=[${reattached.join(',')}]`);
-    check('the failure names the session in a warning',
-      Array.isArray(failureReport?.warnings) && failureReport.warnings.some((line) => line.includes(fifth.parentId)),
-      JSON.stringify(failureReport?.warnings));
+    const value = failure.value;
+    check('a target whose directory cannot be moved is reported as failed', value?.failedIds?.includes(fifth.parentId) === true && value.failedIds.includes(fifth.childId) && value.removedIds.includes(fifth.grandId), JSON.stringify([value?.removedIds, value?.failedIds, String(failure.error)]));
+    check('the outcome says the purge was partial', value?.outcome === 'failed-partial', String(value?.outcome));
+    check('the failed directory still holds its log', existsSync(join(fifth.project, fifth.parentId, 'session.v4.jsonl.zstd')));
+    check('the failed session keeps its projection record', existsSync(join(fifth.storagesRoot, 'session_projcache', 'sessions', `${fifth.parentId}.json`)));
+    check('the failed session keeps its Workspace slot', !detached.includes(fifth.parentId) && !detached.includes(fifth.childId) && detached.includes(fifth.grandId), JSON.stringify(detached));
+    check('the failure names the session in a warning', Array.isArray(value?.warnings) && value.warnings.some((line) => line.includes(fifth.parentId)), JSON.stringify(value?.warnings));
+    // A surviving session must not keep a tombstone, or the watcher would delete
+    // its own checkpoint the next time it is written.
+    const tombstones = host5.service().tombstones;
+    check('a failed target is not left with a tombstone; a removed one is', !tombstones.has(fifth.parentId) && !tombstones.has(fifth.childId) && tombstones.has(fifth.grandId), JSON.stringify([...tombstones.keys()]));
+  }
 
-    // Cancellation inside the sweep is the same hazard as a filesystem failure:
-    // the slots are dropped before the logs, so a cancel must put back the ones
-    // whose directory never came off the disk.
-    const sixth = await buildStore(join(workroot, 'gateway-store-cancel'));
-    const host6 = boot({ ...config.value, sessionsRoot: sixth.sessionsRoot, storagesRoot: sixth.storagesRoot, attachmentsRoot: sixth.attachmentsRoot, spillRoots: [sixth.spillRoot] });
-    const restoredOnCancel = [];
-    host6.ctx.provide('workspaceRegistry', {
-      list: () => [{
-        id: 'ws-cancel',
-        sessionIds: [sixth.parentId, sixth.childId, sixth.grandId],
-        detachSession: () => Promise.resolve(),
-        attachSession: (id) => { restoredOnCancel.push(id); return Promise.resolve(); },
-      }],
-      unarchiveSession: () => undefined,
-      unpinSession: () => undefined,
+  // ── Cancellation is all or nothing: never half a purge ──────────────────────
+  {
+    // Abort at the n-th look at the signal, for every n. Each run must end in one
+    // of two states: refused with every target on disk and no run left behind,
+    // or finished with every target gone. Nothing in between.
+    let aborted = 0;
+    let finished = 0;
+    let halfway = 0;
+    for (let n = 1; n <= 6; n += 1) {
+      const target = await buildStore(join(workroot, `gateway-store-cancel-${String(n)}`));
+      const cancelHost = boot(rooted(target));
+      let reads = 0;
+      const reason = new Error('selftest: cancelled');
+      const signal = { get aborted() { reads += 1; return reads >= n; }, get reason() { return reason; } };
+      const outcome = await cancelHost.attempt('purge', { sessionId: target.parentId }, signal);
+      const gone = !existsSync(join(target.project, target.parentId)) && !existsSync(join(target.project, target.childId)) && !existsSync(join(target.nestedProject, target.grandId));
+      const runs = await runsOf(target);
+      if (outcome.error !== undefined && allThere(target) && runs.length === 0) aborted += 1;
+      else if (outcome.value !== undefined && gone && outcome.value.removedIds.length === 3) finished += 1;
+      else halfway += 1;
+    }
+    check('a cancel either changes nothing or lets the purge finish — never half', halfway === 0 && aborted > 0 && finished > 0, JSON.stringify({ aborted, finished, halfway }));
+  }
+
+  // ── Two windows deleting the same session at once ───────────────────────────
+  {
+    const twice = await buildStore(join(workroot, 'gateway-store-twice'));
+    const twiceHost = boot(rooted(twice));
+    const [first, second] = await Promise.all([
+      twiceHost.attempt('purge', { sessionId: twice.parentId }),
+      twiceHost.attempt('purge', { sessionId: twice.parentId }),
+    ]);
+    const outcomes = [first, second];
+    const succeeded = outcomes.filter((entry) => entry.value?.removedIds?.length === 3).length;
+    const unknown = outcomes.filter((entry) => entry.error?.code === 'session-purge/session-unknown').length;
+    check('two concurrent purges of one session: one deletes it, the other is told it is gone', succeeded === 1 && unknown === 1, JSON.stringify(outcomes.map((entry) => entry.error?.code ?? entry.value?.removedIds?.length)));
+  }
+
+  // ── The fence proves it guards these directories ────────────────────────────
+  {
+    const mismatch = await buildStore(join(workroot, 'gateway-store-mismatch'));
+    const wrongRoot = boot(rooted(mismatch), stubPersistence(mismatch.sessionsRoot, { reportedRoot: join(workroot, 'elsewhere') }));
+    const refused = await wrongRoot.attempt('purge', { sessionId: mismatch.parentId });
+    check('a backend rooted elsewhere is refused before anything moves', refused.error?.code === 'session-purge/fence-mismatch' && allThere(mismatch), String(refused.error?.code));
+    if (leases) {
+      const lockless = boot(rooted(mismatch), stubPersistence(mismatch.sessionsRoot, { lease: false }));
+      const unguarded = await lockless.attempt('purge', { sessionId: mismatch.parentId });
+      check('a write handle that does not hold this directory\'s lease is refused', unguarded.error?.code === 'session-purge/fence-mismatch' && allThere(mismatch), String(unguarded.error?.code));
+    }
+  }
+
+  // ── Another process running a purge on the same root ────────────────────────
+  if (leases) {
+    const busy = await buildStore(join(workroot, 'gateway-store-busy'));
+    const staging = await txn.stagingRootFor(busy.sessionsRoot);
+    await txn.ensureStagingRoot(staging);
+    const child = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { open } from 'node:fs/promises';
+      const { tryLockExclusive } = await import(${JSON.stringify(join(app, 'node-addon-system', 'lib', 'flock.js'))});
+      const handle = await open(${JSON.stringify(join(staging, '.lock'))}, 'a');
+      await tryLockExclusive(handle.fd);
+      process.stdout.write('locked\\n');
+      process.stdin.resume();
+      process.stdin.on('end', () => process.exit(0));
+    `], { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['pipe', 'pipe', 'inherit'] });
+    const exited = new Promise((resolve) => child.on('exit', resolve));
+    const locked = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 10_000);
+      child.stdout.on('data', (chunk) => {
+        if (!String(chunk).includes('locked')) return;
+        clearTimeout(timer);
+        resolve(true);
+      });
+      void exited.then(() => { clearTimeout(timer); resolve(false); });
     });
-    // Abort on the fourth `aborted` read: the plan checks once, the step boundary
-    // before the sweep checks again, and each removal step checks once more. That
-    // leaves the first target deleted and the rest untouched — exactly the
-    // half-finished state a cancel produces.
-    const abortReason = new Error('selftest: cancelled mid-sweep');
-    let reads = 0;
-    const cancelling = {
-      get aborted() { reads += 1; return reads >= 4; },
-      get reason() { return abortReason; },
-    };
-    let cancelError;
-    try {
-      await host6.gateway.invoke({ namespace: 'sessionPurge', method: 'purge', args: { sessionId: sixth.parentId }, signal: cancelling, peer: host6.peer });
-    } catch (error) {
-      cancelError = error;
-    }
-    check('a cancelled sweep reports the cancellation', cancelError !== undefined && /abort/i.test(String(cancelError.message ?? cancelError)), String(cancelError?.message ?? cancelError));
-    check('the target removed before the cancel stays deleted', !existsSync(join(sixth.project, sixth.parentId)));
-    check('the targets left on disk are still there',
-      existsSync(join(sixth.project, sixth.childId)) && existsSync(join(sixth.nestedProject, sixth.grandId)));
-    check('the cancel puts the surviving slots back',
-      restoredOnCancel.includes(sixth.childId) && restoredOnCancel.includes(sixth.grandId) && !restoredOnCancel.includes(sixth.parentId),
-      JSON.stringify(restoredOnCancel));
+    const busyHost = boot(rooted(busy));
+    const refused = await busyHost.attempt('purge', { sessionId: busy.parentId });
+    check('a purge already running in another process is reported as busy', locked && refused.error?.code === 'session-purge/busy' && allThere(busy), `${String(locked)} ${String(refused.error?.code)}`);
+    child.stdin.end();
+    await exited;
+    const afterwards = await busyHost.attempt('purge', { sessionId: busy.parentId });
+    check('once that process is gone the purge runs', afterwards.value?.removedIds?.length === 3, String(afterwards.error));
+  }
 
+  // ── Linked session directories: the link goes, other people's files stay ────
+  if (leases) {
+    const linked = await buildStore(join(workroot, 'gateway-store-linked'));
+    const external = join(linked.root, 'external');
+    // The child's folder lives elsewhere and also holds a file that is not ours;
+    // the grandchild's folder holds only session artifacts.
+    for (const [id, project, extra] of [[linked.childId, linked.project, true], [linked.grandId, linked.nestedProject, false]]) {
+      const outside = join(external, id);
+      await mkdir(dirname(outside), { recursive: true });
+      await rename(join(project, id), outside);
+      if (extra) await writeFile(join(outside, 'notes.txt'), 'mine, not the session\'s\n');
+      await symlink(outside, join(project, id), 'dir');
+    }
+    const linkHost = boot(rooted(linked));
+    const linkedReport = await linkHost.invoke('purge', { sessionId: linked.parentId });
+    check('linked targets are indexed and removed', linkedReport.removedIds.length === 3, JSON.stringify(linkedReport.removedIds));
+    check('the links are gone from the session tree', !existsSync(join(linked.project, linked.childId)) && !existsSync(join(linked.nestedProject, linked.grandId)));
+    check('a linked folder that held only session artifacts is removed', !existsSync(join(external, linked.grandId)));
+    check('a linked folder keeps a file that is not the session\'s', existsSync(join(external, linked.childId, 'notes.txt')) && !existsSync(join(external, linked.childId, 'session.v4.jsonl.zstd')));
+    check('the kept file is reported as leftover', linkedReport.warnings.some((line) => line.includes('leftover')), JSON.stringify(linkedReport.warnings));
+  }
+
+  // ── Recovery from a crash, forward only ─────────────────────────────────────
+  {
+    /**
+     * Write the manifest a run would have written, optionally move some entries
+     * as its commit would have, and leave the rest of the run "crashed".
+     */
+    const craft = async (target, { commit = [], commitDone = false, claimCommitted = [] } = {}) => {
+      const staging = await txn.stagingRootFor(target.sessionsRoot);
+      await txn.ensureStagingRoot(staging);
+      const index = await engine.indexStoredSessions(target.sessionsRoot);
+      const ids = [target.parentId, target.childId];
+      const runId = txn.newRunId();
+      const entries = [];
+      for (const id of ids) {
+        const record = index.get(id);
+        entries.push({ id, primary: true, source: record.directory, projectDirectory: record.projectDirectory, staged: txn.stagedPathFor(staging, runId, record.directory), identity: await txn.entryIdentity(record.directory), linked: false, realTarget: null, realTargetIdentity: null, state: claimCommitted.includes(id) ? 'COMMITTED' : 'PLANNED' });
+      }
+      const manifest = {
+        version: txn.MANIFEST_VERSION, runId, path: 'immediate', state: 'FENCED', createdAt: new Date().toISOString(), completedAt: null, attempts: 0, lastError: null,
+        settings: { removeEmptyProjectDirectory: true, purgeSchedules: true, purgeSpill: true, spillRoots: [target.spillRoot] },
+        targets: ids.map((id) => ({ id, state: 'FENCED', sizeBytes: index.get(id).sizeBytes, checkpoint: { createdAt: index.get(id).header.createdAt, cwd: index.get(id).header.cwd } })),
+        entries,
+        steps: { fence: 'done', commit: commitDone ? 'done' : 'pending', workspace: 'pending', cache: 'pending', schedules: 'pending', spill: 'pending', cleanup: 'pending', verify: 'pending' },
+        outcome: null, unverified: [],
+      };
+      await txn.writeManifest(staging, manifest);
+      for (const entry of entries) if (commit.includes(entry.id)) await txn.commitEntry(entry.source, entry.staged);
+      return { staging, runId };
+    };
+
+    const abandoned = await buildStore(join(workroot, 'gateway-store-recover-abandoned'));
+    const abandonedRun = await craft(abandoned);
+    const report1 = await boot(rooted(abandoned)).service().recover();
+    check('recovery abandons a run that never moved anything', report1.abandoned.includes(abandonedRun.runId) && !existsSync(txn.runDirectory(abandonedRun.staging, abandonedRun.runId)) && allThere(abandoned), JSON.stringify(report1));
+
+    const midway = await buildStore(join(workroot, 'gateway-store-recover-midway'));
+    const midwayRun = await craft(midway, { commit: [midway.parentId] });
+    const report2 = await boot(rooted(midway)).service().recover();
+    const midwayManifest = await txn.readManifest(txn.runDirectory(midwayRun.staging, midwayRun.runId));
+    check('recovery finishes a commit that a crash cut short — forward, not back', report2.resumed.includes(midwayRun.runId) && !existsSync(join(midway.project, midway.parentId)) && midwayManifest?.outcome === 'failed-partial', JSON.stringify([report2, midwayManifest?.outcome]));
+    check('the part the crash never reached stays whole', existsSync(join(midway.project, midway.childId)) && existsSync(join(midway.storagesRoot, 'session_projcache', 'sessions', `${midway.childId}.json`)));
+    check('the moved part is purged after recovery', !existsSync(join(midway.storagesRoot, 'session_projcache', 'sessions', `${midway.parentId}.json`)) && !existsSync(join(txn.runDirectory(midwayRun.staging, midwayRun.runId), 'entries')));
+
+    const lost = await buildStore(join(workroot, 'gateway-store-recover-lost'));
+    const lostRun = await craft(lost, { commitDone: true, claimCommitted: [lost.parentId, lost.childId] });
+    const report3 = await boot(rooted(lost)).service().recover();
+    const lostManifest = await txn.readManifest(txn.runDirectory(lostRun.staging, lostRun.runId));
+    check('a commit whose rename did not survive is redone under a new fence', report3.resumed.includes(lostRun.runId) && !existsSync(join(lost.project, lost.parentId)) && !existsSync(join(lost.project, lost.childId)) && lostManifest?.targets?.every((target) => target.state === 'COMMITTED'), JSON.stringify([report3, lostManifest?.targets]));
+
+    const drifted = await buildStore(join(workroot, 'gateway-store-recover-drift'));
+    const driftRun = await craft(drifted, { commitDone: true, claimCommitted: [drifted.parentId] });
+    // The directory was replaced by a different one under the same name (a
+    // restore from backup, say): same path, other inode. It must not be touched.
+    const replacement = join(drifted.project, drifted.parentId);
+    await rename(replacement, `${replacement}.old`);
+    await cp(`${replacement}.old`, replacement, { recursive: true });
+    await rm(`${replacement}.old`, { recursive: true, force: true });
+    await boot(rooted(drifted)).service().recover();
+    check('a directory that is not the one the run recorded is left alone', existsSync(join(replacement, 'session.v4.jsonl.zstd')));
+
+    // A finished run: its tombstones are re-armed until it expires, then it goes.
+    const finishedRun = await txn.listRuns(await txn.stagingRootFor(store.sessionsRoot));
+    const reborn = boot(config.value);
+    await reborn.service().recover();
+    check('a recent finished run re-arms its tombstones after a restart', reborn.service().tombstones.has(store.parentId) && finishedRun.length === 1);
+    const expired = finishedRun[0].manifest;
+    expired.completedAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    await txn.writeManifest(await txn.stagingRootFor(store.sessionsRoot), expired);
+    const report4 = await boot(config.value).service().recover();
+    check('a finished run past its retention is removed', report4.expired.includes(expired.runId) && (await txn.listRuns(await txn.stagingRootFor(store.sessionsRoot))).length === 0, JSON.stringify(report4));
+  }
+
+  // ── The residue sweep ───────────────────────────────────────────────────────
+  {
     // A session whose header cannot be read is omitted by dsh's own backend —
     // "Unreadable or unsupported headers … are omitted from discovery and list()"
     // — so it can never be selected in the interface and its bytes stay forever.
@@ -595,46 +910,155 @@ async function testGateway(app, workroot) {
     const old = new Date(Date.now() - 3_600_000);
     for (const directory of [brokenDirectory, emptyDirectory, renamedDirectory, foreignDirectory]) await utimes(directory, old, old);
 
-    const { scanResidue } = await import(join(here, 'engine.js'));
-    const unfiltered = await scanResidue({ root: seventh.sessionsRoot });
+    const unfiltered = await engine.scanResidue({ root: seventh.sessionsRoot });
     check('the residue scan finds every headerless session directory',
       unfiltered.directories.length === 4, JSON.stringify(unfiltered.directories.map((entry) => entry.directory.split('/').pop())));
     check('a folder that is neither a session id nor a stored log is never reported',
       !unfiltered.directories.some((entry) => entry.directory === foreignDirectory),
       JSON.stringify(unfiltered.directories.map((entry) => entry.directory.split('/').pop())));
-    const aged = await scanResidue({ root: seventh.sessionsRoot, minimumAgeMs: 60_000 });
+    const aged = await engine.scanResidue({ root: seventh.sessionsRoot, minimumAgeMs: 60_000 });
     check('the age guard spares a directory that was just created',
       aged.directories.length === 3 && !aged.directories.some((entry) => entry.directory === freshDirectory),
       JSON.stringify(aged.directories.map((entry) => entry.directory.split('/').pop())));
     check('the scan reports the bytes it would reclaim', aged.bytes === 16, String(aged.bytes));
 
-    const host7 = boot({ ...config.value, sessionsRoot: seventh.sessionsRoot, storagesRoot: seventh.storagesRoot, attachmentsRoot: seventh.attachmentsRoot, spillRoots: [seventh.spillRoot] });
-    const preview = await host7.gateway.invoke({ namespace: 'sessionPurge', method: 'sweepResidue', args: { apply: false }, signal: new AbortController().signal, peer: host7.peer });
+    const host7 = boot(rooted(seventh));
+    const preview = await host7.invoke('sweepResidue', { apply: false });
     check('the preview lists the leftovers and removes nothing',
       preview.directories.length === 3 && preview.removed === 0 && preview.bytes === 16, JSON.stringify([preview.directories.length, preview.removed]));
     check('the preview really does not touch the disk',
       existsSync(brokenDirectory) && existsSync(emptyDirectory) && existsSync(renamedDirectory));
-
-    let rejectedFlag;
-    try {
-      await host7.gateway.invoke({ namespace: 'sessionPurge', method: 'sweepResidue', args: { apply: 'yes' }, signal: new AbortController().signal, peer: host7.peer });
-    } catch (error) {
-      rejectedFlag = error;
-    }
+    const rejectedFlag = await host7.attempt('sweepResidue', { apply: 'yes' });
     check('a non-boolean apply is refused before any path use',
-      rejectedFlag !== undefined && (rejectedFlag.code === 'gateway/input-invalid' || String(rejectedFlag.message).includes('boolean')),
-      `${String(rejectedFlag?.code)} ${String(rejectedFlag?.message)}`);
-
-    const swept = await host7.gateway.invoke({ namespace: 'sessionPurge', method: 'sweepResidue', args: { apply: true }, signal: new AbortController().signal, peer: host7.peer });
+      rejectedFlag.error !== undefined && (rejectedFlag.error.code === 'gateway/input-invalid' || String(rejectedFlag.error.message).includes('boolean')),
+      `${String(rejectedFlag.error?.code)} ${String(rejectedFlag.error?.message)}`);
+    const swept = await host7.invoke('sweepResidue', { apply: true });
     check('the sweep removes exactly what the preview listed',
       swept.removed === 3 && !existsSync(brokenDirectory) && !existsSync(emptyDirectory) && !existsSync(renamedDirectory), JSON.stringify(swept.removed));
     check('the fresh directory survives the sweep', existsSync(freshDirectory));
     check('the foreign folder survives the sweep', existsSync(join(foreignDirectory, 'todo.md')));
     check('healthy sessions are untouched by the sweep', existsSync(join(seventh.project, seventh.parentId)));
-
   }
   await testDesignPremises(app, join(workroot, 'premises'));
+  await testRealTree(app, join(workroot, 'real-tree'), { host, manifest: manifest.TYPERT, Context, TypertRegistry, TypertGatewayService, Peer });
   return true;
+}
+
+/**
+ * Part B3: the plugin itself, end to end, on dsh's real services.
+ *
+ * Part B drives the plugin over synthetic logs through a stub seam; Part B2 shows
+ * the real seam behaves like that stub. This part closes the loop: real sessions
+ * (created and persisted by dsh's own agent loop), the real JSONL backend as the
+ * fence, the real projection cache table as the checkpoint store — and the
+ * plugin's own tombstone watcher against a real late write-back.
+ * @param app - the installation's package directory.
+ * @param workroot - an empty scratch directory for this part.
+ * @param parts - the modules Part B already loaded.
+ */
+async function testRealTree(app, workroot, { host, manifest, Context, TypertRegistry, TypertGatewayService, Peer }) {
+  console.log('\nPart B3 — the plugin end to end on dsh\'s real services');
+  const sessionsRoot = join(workroot, 'sessions');
+  const storagesRoot = join(workroot, 'storages');
+  await mkdir(workroot, { recursive: true });
+  const imported = (name) => import(join(app, name, 'lib', 'index.js'));
+  const ctx = new Context();
+  const fibers = [];
+  const mount = async (name, config) => {
+    const module = await imported(name);
+    const fiber = ctx.plugin(module.default ?? module, config);
+    fibers.push(fiber);
+    await fiber;
+  };
+  await mount('dsh-storage');
+  await mount('dsh-storage-json', { root: storagesRoot });
+  await mount('dsh-storage-domain', { backend: 'json', routes: {} });
+  await mount('dsh-session-projection');
+  await mount('dsh-session');
+  await mount('dsh-session-persistence-jsonl', { root: sessionsRoot, compression: 'zstd', listConcurrency: 4 });
+  await mount('dsh-session-projection-cache', { writeEveryEvents: 200, writeIntervalMs: 5000 });
+  for (const name of ['dsh-llm', 'dsh-tools', 'dsh-system-prompt', 'dsh-agent']) await mount(name);
+  await mount('dsh-agent-loop', { maxParallelToolCalls: 10, agents: [] });
+  new TypertRegistry(ctx);
+  ctx.typert.register(manifest);
+  const gateway = new TypertGatewayService(ctx, {});
+  const config = host.Config['~standard'].validate({ sessionsRoot, storagesRoot, attachmentsRoot: join(workroot, 'attachments'), spillRoots: [], recoveryDelayMs: -1 });
+  host.apply(ctx, config.value);
+  const peer = new Peer(ctx, { principal: { kind: 'owner' } });
+  const attempt = async (method, args) => {
+    try {
+      return { value: await gateway.invoke({ namespace: 'sessionPurge', method, args, signal: new AbortController().signal, peer }) };
+    } catch (error) {
+      return { error };
+    }
+  };
+  const nextChange = (key, operation) => new Promise((resolve) => {
+    const timer = setTimeout(() => { off(); resolve(false); }, 5_000);
+    const off = ctx.on('domain/changed', (change) => {
+      if (change.domain !== 'session_projcache' || change.key !== key || change.operation !== operation) return;
+      clearTimeout(timer);
+      off();
+      resolve(true);
+    });
+  });
+  // The detach checkpoint reaches memory only after it reached the disk
+  // ("durability first, then memory", `dsh-session-projection-cache`), so a
+  // session counts as cold once its checkpoint is readable.
+  const cold = async (id, meta = {}) => {
+    const handle = await ctx.agents.create({ sessionId: id, meta: { cwd: workroot, ...meta } });
+    await ctx.sessions.flush(handle.agent.session);
+    await handle.dispose();
+    const table = ctx.storageDomain.get('session_projcache').table('sessions');
+    for (let waited = 0; table.get(id) === undefined && waited < 2_000; waited += 20) await new Promise((resolve) => setTimeout(resolve, 20));
+  };
+
+  try {
+    const parent = 'session-aaaaaaaa-1111-4222-8333-444444444444';
+    const child = 'bbbbbbbb-1111-4222-8333-444444444444';
+    const resident = 'session-cccccccc-1111-4222-8333-444444444444';
+    await cold(parent);
+    await cold(child, { parentSession: parent, origin: 'subagent', delegationDepth: 1 });
+    const table = ctx.storageDomain.get('session_projcache').table('sessions');
+    const recordFile = (id) => join(storagesRoot, 'session_projcache', 'sessions', `${id}.json`);
+    check('setup: two real cold sessions with their checkpoints', table.get(parent) !== undefined && table.get(child) !== undefined && existsSync(recordFile(parent)), JSON.stringify([table.get(parent) !== undefined, table.get(child) !== undefined, existsSync(recordFile(parent)), existsSync(join(storagesRoot, 'session_projcache')) ? readdirSync(join(storagesRoot, 'session_projcache'), { recursive: true }) : 'no domain dir']));
+
+    // A resident session is refused, by the fence as well as the registry.
+    const live = await ctx.agents.resume({ resumeSessionId: (await cold(resident), resident) });
+    const refused = await attempt('purge', { sessionId: resident });
+    check('a resident real session is refused', refused.error?.code === 'session-purge/session-live', String(refused.error?.code));
+    await live.dispose();
+
+    const inspection = await attempt('inspect', { sessionId: parent });
+    check('the preview finds the real subagent child', inspection.value?.targets?.length === 2 && inspection.value.targets.some((target) => target.sessionId === child), JSON.stringify(inspection.value?.targets?.map((target) => target.sessionId) ?? String(inspection.error)));
+
+    // Read the log the way a cold reader would, before the commit.
+    const reader = await ctx.sessionPersistence.open(parent, 'read');
+    const { header, inheritedEventCount } = reader;
+    const { events } = await reader.read();
+    await reader.close();
+
+    const purged = await attempt('purge', { sessionId: parent });
+    const report = purged.value;
+    check('the real purge removes both sessions', report?.removedIds?.length === 2 && report.failedIds.length === 0, JSON.stringify(report ?? String(purged.error)));
+    check('the backend no longer lists them', !(await ctx.sessionPersistence.list()).some((snapshot) => snapshot.header.id === parent || snapshot.header.id === child));
+    check('their checkpoints are gone from the table and the disk', table.get(parent) === undefined && table.get(child) === undefined && !existsSync(recordFile(parent)) && !existsSync(recordFile(child)));
+    check('with the real table only Workspace and Schedule stay unverified', report?.outcome === 'verified-with-gaps' && JSON.stringify([...report.unverified].sort()) === JSON.stringify(['schedule', 'workspace']), JSON.stringify([report?.outcome, report?.unverified]));
+
+    // The late cold read lands after the purge; the plugin's watcher removes it.
+    const deleted = nextChange(parent, 'deleted');
+    ctx.sessionProjectionCache.coldSnapshot(header, inheritedEventCount, events);
+    check('the plugin\'s watcher deletes a real late write-back', (await deleted) && table.get(parent) === undefined && !existsSync(recordFile(parent)));
+
+    // The same id, created anew, keeps its checkpoint.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await cold(parent);
+    await new Promise((resolve) => setTimeout(resolve, 200)); // room for a (wrong) watcher reaction
+    check('a new session under a deleted id keeps its checkpoint', table.get(parent) !== undefined && existsSync(recordFile(parent)));
+  } catch (error) {
+    check('Part B3 ran to completion', false, error?.stack ?? String(error));
+  } finally {
+    for (const fiber of fibers.reverse()) await fiber.dispose();
+  }
 }
 
 /**
@@ -1159,6 +1583,7 @@ try {
   const store = await buildStore(join(root, 'store'));
   await testEngine(store);
   await testSpillDiscovery();
+  await testTransactionStore(join(root, 'txn'));
   await testClientHalf(appDirectory());
   await testGateway(appDirectory(), root);
 } finally {
