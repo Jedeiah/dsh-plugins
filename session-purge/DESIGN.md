@@ -1,5 +1,8 @@
 # 设计 v8：会话删除
 
+> **状态：已落地**（2026-10-18，`b69f428` 立即路径 / `2e67431` 延期路径 / `cd2b692` 附件回收）。落地时对本稿的
+> 修正都已改进正文，并汇总在 §17 的"实现"一行。
+>
 > v8 是**换路线**，不是给 v7 打补丁。前五轮（v3–v7）都在"驱逐 → 围栏 → 检测复活"这条路上修洞，
 > 每修一处就冒出新的竞态；根子在于**我们去抢一个不归我们管的生命周期**。v8 只走 dsh 给的门：
 > 会话冷着就用官方写句柄把它围住再删；活着就登记意图、停活归档，等它冷了再删。
@@ -265,7 +268,7 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 
 | 域 | 怎么清 | 依据 / 注意 |
 |---|---|---|
-| 工作区记账 | 对**每个**工作区无条件 `detachSession(id)`；再 `unarchiveSession(id)`、`unpinSession(id)` | `detachSession` 改原始记录且幂等（`dsh-workspace:148-152`）；不要用过滤视图 `sessionIds`（`:102-104`）先判断包不包含；unarchive/unpin 对已不存在的 id 也能用（`:553-562`、`:597-606`） |
+| 工作区记账 | 对**原始记录或过滤视图里含该 id** 的工作区调用 `detachSession(id)`；再 `unarchiveSession(id)`、`unpinSession(id)` | `detachSession` 改原始记录且幂等（`dsh-workspace:148-152`）；只看过滤视图 `sessionIds`（`:102-104`）会漏掉日志已删、索引已忘的槽位；但也**不能**对每个工作区无条件调用——每次变更都会顺手修剪该工作区里所有失效的槽位（`:176-180`），无条件调用等于替别的会话做了一次修剪；unarchive/unpin 对已不存在的 id 也能用（`:553-562`、`:597-606`） |
 | 投影检查点 | `table.delete(id)`；再删 `<id>.json.bak.*` 这类表不追踪的备份文件 | 与所有写回同一条 FIFO 链，内存与磁盘一起变（`dsh-storage-domain:222-225`、`:264-276`）；拿不到表 → 删文件 + 告警 |
 | 提醒 | `catalog()` 里 `sessionId` 等于目标的**所有**行（任何 status）逐条 `delete({sessionId, id})` | `delete` 不看 status（`dsh-schedule:2164-2181`）；非活跃行还留着投递历史与指令快照（`docs:reference/subsystems/schedule`）——隐私上必须删 |
 | spill | 在本实例活动根与 `discoverDefaultRoots` 发现的根里，只删 `session-<sha256(id)[:12]>` | 目录名由目标 id 精确算出（`dsh-spill-local:70`），不会碰别的实例的会话（I3） |
@@ -292,7 +295,7 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 
 ### 9.2 审计
 
-`<DSH_HOME>/session-purge/audit.jsonl`，追加、8 MiB 滚动。每条：runId、路径（立即 / 延期）、目标 **id 与字节数**、每步结果、`outcome`、`unverified`。
+`<stagingRoot>/audit.jsonl`（与清单同卷、同生命周期，测试也能定位），追加、8 MiB 滚动到 `audit.1.jsonl`。每条：runId、路径（立即 / 延期）、目标 **id 与字节数**、每步结果、`outcome`、`unverified`。
 **不记标题、不记内容**——审计不能成为被删会话的残留。
 
 ---
@@ -311,9 +314,11 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 - **监听**：`ctx.on('domain/changed', c => c.domain === 'session_projcache' && c.operation === 'put' && matches(c.key, c.value.identity) && table.delete(c.key))`。
   事件在持久化确认之后、按写链顺序发出（`docs:reference/subsystems/storage`），并带着写入的记录（`dsh-storage-domain:288-295`），
   删除排在那次写回之后——**确定性删回**。
-- **按身份认人，不按 id**：`matches` 要求 id 在墓碑集里，**且**记录的 `identity` 等于被删日志的身份。
-  身份只由 header 字段推出（`formatVersion`/`createdAt`/`cwd`/`isSeeded` + `inheritedEventCount`，`dsh-session-projection-cache:372-379`），
-  prepare 时就能算好存进清单。不一致说明有人用同一个 id **新建**了会话——那不是复活，不碰。
+- **按身份认人，不按 id**：`matches` 要求 id 在墓碑集里，**且**记录的 `identity` 属于被删的那份日志。
+  身份只由 header 字段推出（`formatVersion`/`createdAt`/`cwd`/`isSeeded` + `inheritedEventCount`，`dsh-session-projection-cache:372-379`）。
+  落地时只比 `createdAt`（两边都有 `cwd` 时再比 `cwd`）：`formatVersion` 会因为 `open('write')` 发布新代际而变，
+  而同 id 的新会话一定带新的 `createdAt`（`txn.js` 的 `checkpointIdentityMatches`）。不一致说明有人用同一个 id
+  **新建**了会话——那不是复活，不碰。
 - **启动复检**：插件启动时，对保留期内每份清单的目标 id 查表，身份一致就删。覆盖"写回发生在进程退出前、监听来不及"的窗口。
 - **保留期**：墓碑随清单保留 7 天（`retainManifestDays`），过期即删清单。7 天远大于任何一次冷读的时长。
 
@@ -372,6 +377,10 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 | `verify-failed` | 完成后有残留 | 已提交，附差异 |
 | `identity-drift` | 恢复时身份不符 | 该条不动 |
 | `compensation-drift` | 取消后回读与快照不一致 | 上报项，不是异常 |
+| `already-pending` | 这批会话已有等待中的延期删除（落地时补） | 无；预览里给出 `pendingRunId` |
+| `fence-mismatch` | 后端根目录与配置不符，或持有写句柄后目标的 `session.lock` 并未被占 | 无 |
+| `run-unknown` / `not-pending` / `invalid-run-id` | 取消 / 重试一个不存在或已不在等待的延期删除 | 无 |
+| `gc-no-candidates` / `gc-too-early` / `invalid-gc-mode` | 附件回收的两轮门槛 | 无 |
 
 ---
 
@@ -449,6 +458,7 @@ Part B2 验证的是**dsh 的行为**（设计前提），不是插件——墓�
 | 终审 v6 | 8 条成立 6 条（链接不递归删、提醒验收、gc 两轮等） | 采纳 |
 | 源码复核 v7 | 围栏在驱逐前会自锁、`stopActivity` 删提醒、过滤视图不能作证据、Windows 信号量不挡 rename 等 13 处 | 采纳；但复核后又发现 v7 自己的"可排序消除"漏了在途写回 |
 | **换路线 v8** | 驱逐路线的洞是结构性的：生命周期不归插件管（文档 + 会话控制器丢弃 handle） | 改为"官方写句柄围栏 + 延期到冷 + 墓碑收敛"；去掉全部 `store`/`detach`/私有字段依赖 |
+| **实现（落地）** | ① 工作区不能无条件 `detachSession`（会替别的会话修剪，见 §8）；② 墓碑只比 `createdAt`+`cwd`（`formatVersion` 会变）；③ 同批会话重复删 → `already-pending`；④ 计划要在互斥锁**内**计算，否则排队的第二次删除会拿过期计划报误导性的错；⑤ 延期完成中途失败时先回读清单，已推进到围栏之后的交给恢复、不把 PENDING 写回；⑥ 存储域"先落盘再改内存"、真实后端要求 cwd 派生布局——都是测试侧的时序/布局事实；⑦ 索引原先跳过软链接会话目录，§7.3 的链接规则落地前根本走不到 | 全部改进正文与代码；252 项自测 + 9 处变异测试 |
 | **v8 实测** | Part B2：I4 的四条前提 + 跨进程租约 + 持句柄 rename，26 项在真实服务上通过；对照证实冷读写回确会复活检查点；变异测试证实只按 id 认人会误删 | 前提成立；§14 标注 ✅ |
 
 **仍未解决（写在明处）**：活会话只能延期到下次启动；延期期间内容仍在磁盘上；取消延期时提醒只能以新 id 重建；
@@ -456,7 +466,7 @@ Part B2 验证的是**dsh 的行为**（设计前提），不是插件——墓�
 
 ---
 
-## 18. 落地影响（相对当前 `index.js` / `engine.js`）
+## 18. 落地影响（相对 v7 时的 `index.js` / `engine.js`；已全部完成）
 
 | 现状 | v8 | 备注 |
 |---|---|---|

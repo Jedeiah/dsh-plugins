@@ -1772,7 +1772,9 @@ async function testClientHalf(app) {
 
   const dictionaryBlock = (name) => {
     const start = source.indexOf(`const ${name} = {`);
-    const end = source.indexOf('};', start);
+    // The dictionary closes on its own line at its own indentation; a `};` inside
+    // a string (an English sentence ending "{size};") must not end it early.
+    const end = source.indexOf('\n    };', start);
     return new Set([...source.slice(start, end).matchAll(/^ {6}([a-zA-Z][A-Za-z0-9_]*):/gm)].map((match) => match[1]));
   };
   const zh = dictionaryBlock('zh');
