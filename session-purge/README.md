@@ -18,6 +18,24 @@
 | 6 | `<DSH_HOME>/attachments/` | 附件对象与引用链接，**默认不删**（见下） |
 | 7 | 浏览器 Local Storage | 由客户端半边清理 `dsh.conversation.<id>`、`dsh.sidebar-right.v1.<id>`、`dsh.user-questions.drafts.v1.<id>`，并在 `dsh.sessions.current` 指向被删会话时移除它 |
 
+### 日志头读不出来的目录（残留）
+
+dsh 自己的后端遇到读不出的日志头会**直接从发现和 `list()` 里跳过**（`dsh-session-persistence-jsonl` README：
+"Unreadable or unsupported headers … are omitted from discovery and `list()`"）。也就是说这类目录**界面上永远看不到**，
+自然也永远选不中删除——但字节一直占着盘。两种来源：日志事后写坏（校验和/解压/结构失败会报 corruption，不会静默截断），
+以及崩溃在「建了目录、还没写头」那一刻。
+
+**设置页最下面有「残留目录」一栏**：先「扫描」（`sweepResidue(false)`，只报告不动盘），看到数量与体积再决定「删除这些目录」
+（`sweepResidue(true)`，宿主**重新算一遍**再删，浏览器从不传路径）。60 秒内新建的目录会被放过——刚创建的会话还没有头，
+误判成残留就会删掉你正打开的那个会话。
+
+### 索引这类「派生数据」不用管
+
+`dsh-session-query-sqlite` 的全文索引是派生的：每次搜索前它会先跟存储对账，把**已删除**的会话行一并清掉再执行查询
+（"observing new, changed, deleted … reconciles on the next stable observation"）。所以删掉日志之后索引会自己变干净，
+本插件**不需要**去碰别人的数据库——碰了反而危险（那条路径可配，且属于另一个包）。
+
+
 删除后会向所有已连接窗口广播官方事件 `api-session/removed`（只广播**确实删净**的那些），侧栏立即掉行，不必刷新。
 
 三个安全阀：

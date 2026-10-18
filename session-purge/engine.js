@@ -325,6 +325,66 @@ export async function indexStoredSessions(root) {
 }
 
 /**
+ * Find session directories whose header cannot be read.
+ *
+ * dsh's own backend omits an unreadable header from discovery and `list()`
+ * (`dsh-session-persistence-jsonl` README, "Unreadable or unsupported headers …
+ * are omitted from discovery and `list()`"), so such a directory never appears in
+ * the interface and can never be selected for deletion — while its bytes stay on
+ * disk forever. This scan is the only way back to them.
+ *
+ * A session that is being created right now has no header yet, so a directory
+ * modified within `minimumAgeMs` is left alone: mistaking a fresh session for
+ * residue would delete a conversation the operator is opening.
+ *
+ * @param params.root - the session log root.
+ * @param params.minimumAgeMs - skip directories modified more recently than this.
+ * @param params.signal - aborts the scan between directories.
+ * @returns the residue, largest first, with its total size.
+ */
+export async function scanResidue({ root, minimumAgeMs = 0, signal }) {
+  const found = [];
+  let projects;
+  try {
+    projects = await readdir(root, { withFileTypes: true });
+  } catch {
+    return { directories: [], bytes: 0 };
+  }
+  for (const project of projects) {
+    if (!project.isDirectory()) continue;
+    const projectDirectory = join(root, project.name);
+    let entries;
+    try {
+      entries = await readdir(projectDirectory, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      throwIfAborted(signal);
+      if (!entry.isDirectory()) continue;
+      const directory = join(projectDirectory, entry.name);
+      // A readable header means a real session; the index already covers those.
+      if (await readSessionHeader(directory) !== undefined) continue;
+      let info;
+      try {
+        info = await stat(directory);
+      } catch {
+        continue;
+      }
+      if (minimumAgeMs > 0 && Date.now() - info.mtimeMs < minimumAgeMs) continue;
+      found.push({
+        directory,
+        projectDirectory,
+        sizeBytes: await directorySize(directory),
+        modifiedAt: info.mtimeMs,
+      });
+    }
+  }
+  found.sort((left, right) => right.sizeBytes - left.sizeBytes);
+  return { directories: found, bytes: found.reduce((total, entry) => total + entry.sizeBytes, 0) };
+}
+
+/**
  * Collect a session and every descendant recorded through `parentSession`,
  * breadth-first from the selected session.
  * @param index - the stored-session index.

@@ -30,7 +30,7 @@
  *
  * @module @jedeiah/session-purge
  */
-import { stat } from 'node:fs/promises';
+import { rm, rmdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import {
@@ -43,6 +43,7 @@ import {
   removeProjectionRecords,
   removeSessionDirectories,
   removeSpillDirectories,
+  scanResidue,
   unreferencedDigests,
 } from './engine.js';
 
@@ -51,6 +52,13 @@ import {
  * 0.2.0-rc.2, a static import of a dsh package inside a profile-linked bundle can
  * fail to resolve, and the loader then reports only "failed to import".
  */
+/**
+ * How old a directory with no readable header must be before the residue sweep
+ * offers it. A session created a moment ago has no header yet (`create()` writes
+ * nothing until its first append), so a young directory is not residue.
+ */
+const RESIDUE_MIN_AGE_MS = 60_000;
+
 let RemoteError;
 let TypertRemoteService;
 let resolveDshHome;
@@ -371,6 +379,63 @@ class SessionPurgeService extends TypertRemoteService {
     };
   }
 
+  /**
+   * List — and, on request, delete — session directories whose header cannot be
+   * read.
+   *
+   * dsh's persistence backend omits an unreadable header from discovery and
+   * `list()`, so these directories are invisible in the interface and can never
+   * be selected for deletion, yet they keep their bytes. Two kinds land here: a
+   * log damaged after the fact (checksum, decompression or structural failure is
+   * reported as corruption rather than silently truncated), and a directory left
+   * behind by a crash before the header was written.
+   *
+   * The call is its own preview: `apply: false` reports exactly what `apply:
+   * true` would remove, and the deletion recomputes the set on the Host — the
+   * browser never supplies a path.
+   *
+   * @param apply - whether to delete the reported directories.
+   * @param signal - aborts between directories.
+   * @returns the residue, its total size, and what the call removed.
+   */
+  async sweepResidue(apply, signal) {
+    const root = this.sessionsRoot();
+    const scan = await scanResidue({ root, minimumAgeMs: RESIDUE_MIN_AGE_MS, signal });
+    const warnings = [];
+    const report = {
+      root,
+      apply: apply === true,
+      bytes: scan.bytes,
+      removed: 0,
+      failed: 0,
+      directories: scan.directories.map((entry) => ({ directory: entry.directory, sizeBytes: entry.sizeBytes })),
+      warnings,
+    };
+    if (apply !== true) return report;
+    const projects = new Set();
+    for (const entry of scan.directories) {
+      throwIfAborted(signal);
+      projects.add(entry.projectDirectory);
+      try {
+        await rm(entry.directory, { recursive: true, force: true });
+        report.removed += 1;
+      } catch (error) {
+        report.failed += 1;
+        warnings.push(`could not remove residue ${entry.directory}: ${String(error)}`);
+      }
+    }
+    if (this.setting('removeEmptyProjectDirectory', true) !== false) {
+      for (const project of projects) {
+        try {
+          await rmdir(project);
+        } catch {
+          /* the project directory still holds something */
+        }
+      }
+    }
+    return report;
+  }
+
   /** Resolve the configured session log root, defaulting to the shipped layout. */
   sessionsRoot() {
     const configured = this.setting('sessionsRoot', '');
@@ -540,7 +605,7 @@ class SessionPurgeService extends TypertRemoteService {
   }
 }
 
-markRemoteMethods(SessionPurgeService.prototype, ['inspect', 'purge']);
+markRemoteMethods(SessionPurgeService.prototype, ['inspect', 'purge', 'sweepResidue']);
 
 /**
  * Notify connected browsers that a session is gone, so rows and dependent panels

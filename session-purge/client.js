@@ -137,6 +137,25 @@ window.__ModuleLoader__.load({
      */
     const passthroughCodec = () => ({ parse: (value) => value });
 
+    /**
+     * The Client mirror of `typert.js`'s `apply` codec. Same shape rule as
+     * {@link sessionIdCodec}: `mode` + `typeSymbol` + `create()` or the method
+     * never mounts.
+     * @returns the codec.
+     */
+    function applyFlagCodec() {
+      return {
+        mode: 'strict',
+        typeSymbol: `${BUNDLE_NAME}#ResidueApply`,
+        create: () => ({
+          parse(value) {
+            if (typeof value !== 'boolean') throw new Error('session-purge: apply must be a boolean');
+            return value;
+          },
+        }),
+      };
+    }
+
     /** Hand-written Client manifest, mirroring `typert.js`. */
     const TYPERT_REMOTE = {
       package: BUNDLE_NAME,
@@ -160,6 +179,16 @@ window.__ModuleLoader__.load({
           parameters: [{ name: 'sessionId', wire: 'sessionId', source: 'json', codec: sessionIdCodec() }],
           cancellation: { parameter: 'signal' },
           result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurgeReport`, create: passthroughCodec },
+        },
+        {
+          id: `${BUNDLE_NAME}#sessionPurge/sweepResidue`,
+          service: 'sessionPurge',
+          namespace: 'sessionPurge',
+          method: 'sweepResidue',
+          invocation: { kind: 'direct' },
+          parameters: [{ name: 'apply', wire: 'apply', source: 'json', codec: applyFlagCodec() }],
+          cancellation: { parameter: 'signal' },
+          result: { mode: 'strict', typeSymbol: `${BUNDLE_NAME}#SessionPurgeResidue`, create: passthroughCodec },
         },
       ],
     };
@@ -209,6 +238,15 @@ window.__ModuleLoader__.load({
       statsSize: '占用磁盘（日志 + 落盘）',
       forksKept: '另有 {count} 个从该会话分叉出来的独立会话不会被删除：',
       toastPartial: '；{count} 个会话未能删净，磁盘上仍留有日志',
+      residueTitle: '残留目录',
+      residueHint: '有些会话目录的日志头读不出来（写坏了，或者崩溃在写头之前）——dsh 自己也会跳过它们，界面上根本看不到，但字节一直留在磁盘上。这里能扫出来并清掉；60 秒内新建的目录会被放过，以免误删正在打开的会话。',
+      residueScan: '扫描残留目录',
+      residueRescan: '重新扫描',
+      residueClean: '删除这些目录',
+      residueCount: '{count} 个目录，共 {size}',
+      residueDone: '已删除 {count} 个目录，回收 {size}',
+      residueFailed: '{count} 个目录删不掉，详情见宿主日志',
+      residueUnavailable: '宿主没有提供清理接口（版本不匹配？）',
       settingsSaveFailed: '这次改动没有被宿主接受（可能被另一个窗口改过），请重试。',
       statsSchedules: '绑定的提醒',
       statsAttachments: '清理无引用附件',
@@ -255,6 +293,15 @@ window.__ModuleLoader__.load({
       statsSize: 'On disk (logs + spill)',
       forksKept: '{count} forked conversation(s) are independent and will not be deleted:',
       toastPartial: '; {count} session(s) could not be fully removed and still have logs on disk',
+      residueTitle: 'Leftover directories',
+      residueHint: 'Some session directories have an unreadable header (damaged, or the process died before writing one). dsh skips them too, so they never appear anywhere — but their bytes stay on disk. Scan here to find and remove them; a directory created in the last 60 seconds is left alone so a session being opened is never mistaken for residue.',
+      residueScan: 'Scan for leftovers',
+      residueRescan: 'Scan again',
+      residueClean: 'Delete these directories',
+      residueCount: '{count} directories, {size} in total',
+      residueDone: 'Removed {count} directories, freeing {size}',
+      residueFailed: '{count} directories could not be removed; see the host log',
+      residueUnavailable: 'The host exposes no cleanup method (version mismatch?)',
       settingsSaveFailed: 'The host rejected this change (another window may have edited it). Try again.',
       statsSchedules: 'Bound reminders',
       statsAttachments: 'Purge unreferenced attachments',
@@ -574,11 +621,27 @@ window.__ModuleLoader__.load({
      * composition that never mounts the plugin shows no page at all.
      */
     function PurgeSettingsCard(props) {
-      const { t, view, form } = props;
+      const { t, view, form, service } = props;
       // The draft lives above every early return: a hook after a conditional
       // return would change the hook order between renders.
       const [draft, setDraft] = React.useState(null);
       const [saveFailed, setSaveFailed] = React.useState(false);
+      // `null` = not scanned yet, so the page never offers a delete it has not
+      // previewed: `sweepResidue(false)` reports exactly what `true` would remove.
+      const [residue, setResidue] = React.useState(null);
+      const [residueBusy, setResidueBusy] = React.useState(false);
+      const [residueError, setResidueError] = React.useState(null);
+      const runResidue = (apply) => {
+        if (typeof service?.sweepResidue !== 'function') {
+          setResidueError(t('residueUnavailable'));
+          return;
+        }
+        setResidueBusy(true);
+        setResidueError(null);
+        Promise.resolve(service.sweepResidue(apply))
+          .then((report) => { setResidue(report); setResidueBusy(false); })
+          .catch((error) => { setResidueError(String(error?.message ?? error)); setResidueBusy(false); });
+      };
       if (view === 'summary') return t('settingsSummary');
       const state = form?.state;
       if (state === undefined) return null;
@@ -634,6 +697,45 @@ window.__ModuleLoader__.load({
             style: { width: '100%', marginTop: 4, padding: '4px 6px', background: 'transparent', color: 'inherit', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 4 },
           }),
           h('div', { key: 'hint', style: { opacity: 0.7, fontSize: 12, lineHeight: 1.5 } }, t('hintSpillRoots')),
+        ]),
+        h('div', { key: 'residue', style: { marginTop: 18, paddingTop: 12, borderTop: '1px solid var(--dsw-alias-border-l1)' } }, [
+          h('div', { key: 'label', style: { fontWeight: 600, marginBottom: 4 } }, t('residueTitle')),
+          h('div', { key: 'hint', style: { opacity: 0.7, fontSize: 12, lineHeight: 1.5, marginBottom: 8 } }, t('residueHint')),
+          residue === null
+            ? h(primitives.Button, {
+              key: 'scan',
+              variant: 'outline',
+              disabled: residueBusy,
+              onClick: () => runResidue(false),
+            }, t('residueScan'))
+            : h('div', { key: 'body' }, [
+              h('div', { key: 'count', style: { fontSize: 12, marginBottom: 8 } },
+                residue.removed > 0
+                  ? t('residueDone').replace('{count}', String(residue.removed)).replace('{size}', formatBytes(residue.bytes))
+                  : t('residueCount').replace('{count}', String(residue.directories.length)).replace('{size}', formatBytes(residue.bytes))),
+              residue.failed > 0
+                ? h('div', { key: 'failed', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, marginBottom: 8 } }, t('residueFailed').replace('{count}', String(residue.failed)))
+                : null,
+              h('div', { key: 'actions', style: { display: 'flex', gap: 8 } }, [
+                residue.directories.length > 0 && residue.removed === 0
+                  ? h(primitives.Button, {
+                    key: 'clean',
+                    variant: 'solid',
+                    disabled: residueBusy,
+                    onClick: () => runResidue(true),
+                  }, t('residueClean'))
+                  : null,
+                h(primitives.Button, {
+                  key: 'rescan',
+                  variant: 'outline',
+                  disabled: residueBusy,
+                  onClick: () => runResidue(false),
+                }, t('residueRescan')),
+              ]),
+            ]),
+          residueError !== null
+            ? h('div', { key: 'error', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12, marginTop: 8 } }, residueError)
+            : null,
         ]),
         saveFailed ? h('div', { key: 'save-failed', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)', fontSize: 12 } }, t('settingsSaveFailed')) : null,
       ]);
@@ -696,7 +798,8 @@ window.__ModuleLoader__.load({
               name: 'plugins.row.config',
               key: `${BUNDLE_NAME}#${ROW_ID}`,
               locale: LOCALE_NS,
-            }, PurgeSettingsCard))), 'session-purge: settings page'));
+              inject: () => ({ service: child.get('remote.sessionPurge') }),
+          }, PurgeSettingsCard))), 'session-purge: settings page'));
           }
 
           prune.push(child.slots.inject(OVERLAY_SLOT, function* () {

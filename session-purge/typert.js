@@ -50,6 +50,19 @@ function sessionIdCodec() {
   };
 }
 
+/**
+ * A strict codec for the residue sweep's `apply` flag.
+ * @returns the codec.
+ */
+function applyFlagCodec() {
+  return {
+    parse(value) {
+      if (typeof value !== 'boolean') throw new Error('session-purge: apply must be a boolean');
+      return value;
+    },
+  };
+}
+
 /** Endpoint ids, spelled `<package>#<namespace>/<method>` like the generated ones. */
 const PACKAGE = '@jedeiah/session-purge';
 
@@ -106,6 +119,31 @@ export const TYPERT = {
       result: {
         mode: 'strict',
         typeSymbol: `${PACKAGE}#SessionPurgeReport`,
+        create: passthroughCodec,
+      },
+    },
+    {
+      id: `${PACKAGE}#sessionPurge/sweepResidue`,
+      service: 'sessionPurge',
+      namespace: 'sessionPurge',
+      method: 'sweepResidue',
+      invocation: { kind: 'direct' },
+      parameters: [
+        {
+          name: 'apply',
+          wire: 'apply',
+          source: 'json',
+          codec: {
+            mode: 'strict',
+            typeSymbol: `${PACKAGE}#ResidueApply`,
+            create: applyFlagCodec,
+          },
+        },
+      ],
+      cancellation: { parameter: 'signal' },
+      result: {
+        mode: 'strict',
+        typeSymbol: `${PACKAGE}#SessionPurgeResidue`,
         create: passthroughCodec,
       },
     },
