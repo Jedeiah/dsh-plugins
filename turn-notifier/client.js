@@ -771,6 +771,7 @@ const en = {
   invalidPattern: 'Use frequencyHz:durationMs, separated by commas.',
   preview: 'Preview',
   playing: 'Playing',
+  resetDefault: 'Reset to default',
   repeatCount: 'Rings',
   repeatCountHint: 'Including the first one. 1–10.',
   intervalSeconds: 'Interval',
@@ -833,6 +834,7 @@ const zh = {
   invalidPattern: '请按「频率Hz:时长ms」书写，用逗号分隔。',
   preview: '试听',
   playing: '播放中',
+  resetDefault: '恢复默认',
   repeatCount: '响几声',
   repeatCountHint: '含第一次。1–10。',
   intervalSeconds: '间隔',
@@ -1023,7 +1025,7 @@ const STYLE = Object.freeze({
      * @returns the field element.
      */
     function patternRow(props) {
-      const { key, t, label, hint, value, disabled, invalid, playing, onEdit, onCommit, onPreview } = props;
+      const { key, t, label, hint, value, disabled, invalid, playing, onEdit, onCommit, onPreview, isDefault, onReset } = props;
       return h('div', { key, style: LAYOUT.field }, [
         h('label', { key: 'label', style: LAYOUT.label }, label),
         h('div', { key: 'row', style: LAYOUT.row }, [
@@ -1050,6 +1052,13 @@ const STYLE = Object.freeze({
             disabled: disabled || invalid,
             onClick: onPreview,
           }, playing ? t('playing') : t('preview')),
+          h(primitives.Button, {
+            key: 'reset',
+            variant: 'outline',
+            // Nothing to restore when the row already holds the default.
+            disabled: disabled || isDefault,
+            onClick: onReset,
+          }, t('resetDefault')),
         ]),
         h('span', { key: 'hint', style: invalid ? { ...LAYOUT.hint, color: 'var(--dsw-alias-state-error-primary)' } : LAYOUT.hint },
           invalid ? t('invalidPattern') : hint),
@@ -1284,6 +1293,15 @@ const STYLE = Object.freeze({
         play(['finished'], { volume: next });
       };
       const isClassic = settings.voice === 'classic';
+      /**
+       * Put one melody back to the factory default: drop any draft (even an
+       * invalid one), write the default, and let it be heard.
+       */
+      const resetPattern = (field, reason) => {
+        drop(field);
+        if (settings[field] !== DEFAULTS[field]) write(field, DEFAULTS[field]);
+        play([reason], { [field]: DEFAULTS[field] });
+      };
 
       return h('div', { style: LAYOUT.page }, [
         section('when', t('groupWhen'), [
@@ -1343,7 +1361,9 @@ const STYLE = Object.freeze({
                 h('span', { key: 'hint', style: LAYOUT.hint }, isClassic ? t('waveformHint') : t('waveformClassicOnly')),
               ]),
             ]),
-            h('div', { key: 'melodies', style: LAYOUT.grid }, [
+            // Stacked, not side by side: each row is an input plus two buttons, and
+            // a melody is a long line of numbers that needs the width.
+            h('div', { key: 'melodies', style: LAYOUT.section }, [
               patternRow({
                 key: 'finished',
                 t,
@@ -1356,6 +1376,8 @@ const STYLE = Object.freeze({
                 onEdit: (text) => edit('finishedPattern', text),
                 onCommit: () => commit('finishedPattern'),
                 onPreview: () => play(['finished']),
+                isDefault: finished === DEFAULTS.finishedPattern,
+                onReset: () => resetPattern('finishedPattern', 'finished'),
               }),
               patternRow({
                 key: 'interaction',
@@ -1369,6 +1391,8 @@ const STYLE = Object.freeze({
                 onEdit: (text) => edit('interactionPattern', text),
                 onCommit: () => commit('interactionPattern'),
                 onPreview: () => play(['interaction']),
+                isDefault: interaction === DEFAULTS.interactionPattern,
+                onReset: () => resetPattern('interactionPattern', 'interaction'),
               }),
             ]),
           ]) : null,

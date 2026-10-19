@@ -699,6 +699,8 @@ async function pageStory(value) {
     menu: (labelKey) => walk(tree).find((node) => node.props?.label === labelKey && Array.isArray(node.props?.items)),
     /** The button whose text is one of `texts`. */
     button: (...texts) => walk(tree).find((node) => kindOf(node) === 'Button' && texts.includes(textOf(node))),
+    buttons: (text) => walk(tree).filter((node) => kindOf(node) === 'Button' && textOf(node) === text),
+    inputs: () => walk(tree).filter((node) => node.type === 'input' && node.props?.type === 'text'),
     slider: () => walk(tree).find((node) => node.type === 'input' && node.props?.type === 'range'),
     rerender: () => view.render(groupsElement().props),
     settle,
@@ -769,6 +771,42 @@ const DOORBELL = { voice: 'bell', waveform: 'square', volume: 2, finishedPattern
     JSON.stringify(fields));
   check('picking a preset closes the panel and names the preset',
     page.menu('voice') === undefined && page.menu('tone')?.props.current === 'tone_bright');
+}
+{
+  // Reset to default, one melody at a time.
+  const page = await pageStory(DOORBELL);
+  page.menu('tone').props.onSelect('custom');
+  page.rerender();
+  const [resetFinished, resetWaiting] = page.buttons('resetDefault');
+  check('each melody row has its own Reset button, live while it differs from the default',
+    resetFinished?.props.disabled === false && resetWaiting?.props.disabled === false);
+  const start = page.client.rings.length;
+  resetFinished.props.onClick();
+  await page.settle();
+  check('Reset on "done" writes only that melody, back to the default, and plays it',
+    JSON.stringify(page.writes.at(-1)) === JSON.stringify([{ op: 'set', path: ['finishedPattern'], value: '880:170, 1318.5:300' }])
+      && page.stored().interactionPattern === DOORBELL.interactionPattern && page.client.rings.length === start + 1,
+    JSON.stringify(page.writes));
+  check('after the reset that row\'s button is disabled, the other stays live',
+    page.buttons('resetDefault')[0]?.props.disabled === true && page.buttons('resetDefault')[1]?.props.disabled === false);
+  check('resetting a melody keeps the panel open', page.menu('voice') !== undefined && page.menu('tone')?.props.current === 'tone_custom');
+
+  // An invalid draft is thrown away by Reset, not left behind.
+  page.inputs()[1].props.onChange({ target: { value: 'not a melody' } });
+  page.rerender();
+  check('an invalid draft disables Preview for that row', page.buttons('preview').at(-1)?.props.disabled === true);
+  page.buttons('resetDefault')[1].props.onClick();
+  await page.settle();
+  check('Reset clears an invalid draft and writes the default',
+    page.inputs()[1]?.props.value === '1046.5:140, 1318.5:140, 1046.5:200' && page.stored().interactionPattern === '1046.5:140, 1318.5:140, 1046.5:200',
+    String(page.inputs()[1]?.props.value));
+  const writesSoFar = page.writes.length;
+  page.inputs()[0].props.onChange({ target: { value: 'oops' } });
+  page.rerender();
+  page.buttons('resetDefault')[0].props.onClick();
+  await page.settle();
+  check('Reset on a row already at the default only drops the draft, writing nothing',
+    page.writes.length === writesSoFar && page.inputs()[0]?.props.value === '880:170, 1318.5:300');
 }
 {
   // A classic set played with another waveform is not that set any more.
