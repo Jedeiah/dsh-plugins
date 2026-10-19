@@ -498,12 +498,21 @@ window.__ModuleLoader__.load({
      */
     const DESTRUCTIVE_STYLE = { color: 'var(--dsw-alias-state-error-primary)' };
 
-    /** Clear the browser-local keys that name the deleted sessions. */
-    function clearBrowserState(sessionIds) {
+    /**
+     * Clear the browser-local keys that name the deleted sessions.
+     * @param sessionIds - the sessions.
+     * @param options.pointerOnly - forget only the "current session" pointer, so
+     *   the shell does not reopen a session waiting to be deleted, while its view
+     *   state and unsent drafts survive a cancel. The rest goes once the Host
+     *   reports the session removed.
+     */
+    function clearBrowserState(sessionIds, { pointerOnly = false } = {}) {
       const doomed = new Set(sessionIds);
       try {
-        for (const sessionId of doomed) {
-          for (const prefix of UI_STATE_PREFIXES) window.localStorage.removeItem(prefix + sessionId);
+        if (!pointerOnly) {
+          for (const sessionId of doomed) {
+            for (const prefix of UI_STATE_PREFIXES) window.localStorage.removeItem(prefix + sessionId);
+          }
         }
         const raw = window.localStorage.getItem(CURRENT_SESSION_KEY);
         if (raw !== null) {
@@ -600,10 +609,10 @@ window.__ModuleLoader__.load({
           store.setRequest({ ...current, busy: true, error: null });
           try {
             const report = await call('purge', current.sessionId);
-            // A deferred delete is still a delete the operator confirmed: the
-            // browser-local state goes now, and the shell must not reopen the
-            // session on the next start.
-            clearBrowserState(report?.deferred === true ? (report.pendingIds ?? []) : (report?.removedIds ?? report?.targets ?? [current.sessionId]));
+            // A deferred delete must not be reopened by the shell on the next
+            // start, but it can still be cancelled: only the pointer goes now.
+            if (report?.deferred === true) clearBrowserState(report.pendingIds ?? [], { pointerOnly: true });
+            else clearBrowserState(report?.removedIds ?? report?.targets ?? [current.sessionId]);
             store.setRequest(null);
             if (report?.deferred === true) {
               store.setToast({ kind: 'deferred', tone: 'success', holdMs: ERROR_TOAST_HOLD_MS, count: report.pendingIds?.length ?? 1 });
@@ -1029,6 +1038,26 @@ window.__ModuleLoader__.load({
         const prune = [];
 
         prune.push(child.effect(() => child.locale.register(LOCALE_NS, { zh, en }), 'session-purge: dictionaries'));
+
+        // Browser state of a deferred delete goes when the Host completes it: on
+        // the removal it broadcasts (a forwarded event, `api-session/removed`), or,
+        // when no window was open then, from the completed list `pending()` keeps.
+        try {
+          const off = child.remote.$on?.('api-session/removed', (sessionId) => {
+            if (typeof sessionId === 'string') clearBrowserState([sessionId]);
+          });
+          if (typeof off === 'function') prune.push(off);
+        } catch (error) {
+          console.warn('[session-purge] could not subscribe to api-session/removed; browser state of deferred deletes is cleared on the next start instead', error);
+        }
+        try {
+          Promise.resolve(purge.pending()).then(
+            (answer) => { if (Array.isArray(answer?.completed) && answer.completed.length > 0) clearBrowserState(answer.completed); },
+            () => undefined,
+          );
+        } catch {
+          /* a Host without pending() only leaves the old keys behind */
+        }
 
         // Every entry below renders with a shared primitive, and a throwing slot
         // entry blanks the whole slot. With one missing, register none of them:

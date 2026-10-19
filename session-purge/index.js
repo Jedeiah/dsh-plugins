@@ -139,9 +139,10 @@ export const Config = z.object({
   /**
    * Retired. A delete no longer touches attachment bytes (DESIGN.md §6.1); the
    * separate two-round gc on the settings page reclaims them. Kept in the schema
-   * so an existing configuration still validates, and named in the report when on.
+   * so an existing configuration — including a value the settings service stored
+   * for this live field — still validates, and named in the report when on.
    */
-  purgeAttachments: z.boolean().default(false),
+  purgeAttachments: z.boolean().default(false).volatile(),
 });
 
 /** Prototype key the Typert Remote markers live under. */
@@ -192,6 +193,15 @@ function readConfigValue(value, fallback) {
   return value;
 }
 
+/**
+ * Whether a run is a deferred delete still waiting (pending or stuck).
+ * @param manifest - a run manifest, or `undefined` for unknown residue.
+ * @returns whether it waits.
+ */
+function isWaitingRun(manifest) {
+  return manifest !== undefined && manifest.outcome === null && (manifest.state === 'PENDING' || manifest.state === 'STUCK');
+}
+
 /** Whether an error is the persistence seam's "another owner holds the write handle". */
 function isOwned(error) {
   return error?.name === 'SessionAlreadyOwnedError';
@@ -222,6 +232,8 @@ class SessionPurgeService extends TypertRemoteService {
     this.tombstones = new Map();
     /** Logged once: the lease addon is missing, so the mutex and root probe are off. */
     this.warnedNoFlock = false;
+    /** Logged once: the checkpoint table is unreachable, so the tombstone watcher cannot act. */
+    this.warnedNoTable = false;
     /** Session ids a deferred delete is waiting on; an agent disposal for one of them wakes it. */
     this.pendingIds = new Set();
     /** Pending deferred-delete timers, cleared when the row unmounts. */
@@ -354,8 +366,10 @@ class SessionPurgeService extends TypertRemoteService {
     } catch {
       throw new RemoteError('session-purge/session-unknown', `no stored session "${sessionId}" exists under the configured session root`, { sessionId, root });
     }
+    // The preview stays until a purge succeeds: a retry from the same dialog after
+    // a failure (busy, a transient error) keeps both the target-set guard and the
+    // consent the dialog asked for.
     const previewed = this.previewed.get(sessionId);
-    this.previewed.delete(sessionId);
     // Plan under the mutex: a second purge of the same session that queued behind
     // the first must see the store as the first one left it, not as it was.
     return this.exclusive(staging, async () => {
@@ -391,26 +405,62 @@ class SessionPurgeService extends TypertRemoteService {
         throw new RemoteError('session-purge/already-pending', `a deletion of these sessions is already waiting (run "${pendingRun.runId}"); retry or cancel it from the plugin settings page`, { runId: pendingRun.runId });
       }
 
-      // A live target defers the delete — but only when the operator saw that in
-      // the dialog. A session that came to life after a "cold" preview is not
-      // something they agreed to stop.
-      const consented = (previewed?.liveIds ?? []).length > 0;
-      const refuseLive = (ids) => {
-        throw previewed === undefined ? liveError(ids) : becameLiveError(ids);
+      // A live target defers the delete — but only a target the dialog showed as
+      // in use. Stopping a session that came to life after the preview (or one
+      // another process holds) is not something the operator agreed to.
+      const consented = new Set(previewed?.liveIds ?? []);
+      const deferIfConsented = (ids) => {
+        const unconsented = ids.filter((id) => !consented.has(id));
+        if (ids.length === 0 || unconsented.length > 0) {
+          throw previewed === undefined ? liveError(ids) : becameLiveError(unconsented.length > 0 ? unconsented : ids);
+        }
+        return this.runDeferred({ staging, plan, settings });
       };
+      let report;
       const live = plan.targetIds.filter((id) => this.isLive(id));
       if (live.length > 0) {
-        if (!consented) refuseLive(live);
-        return this.runDeferred({ staging, plan, settings });
+        report = await deferIfConsented(live);
+      } else {
+        try {
+          report = await this.runImmediate({ staging, plan, settings, signal });
+        } catch (error) {
+          if (error?.code !== 'session-purge/session-live') throw error;
+          report = await deferIfConsented(error.details?.sessionIds ?? []);
+        }
       }
-      try {
-        return await this.runImmediate({ staging, plan, settings, signal });
-      } catch (error) {
-        if (error?.code !== 'session-purge/session-live') throw error;
-        if (!consented) refuseLive(error.details?.sessionIds ?? []);
-        return this.runDeferred({ staging, plan, settings });
-      }
+      if (this.previewed.get(sessionId) === previewed) this.previewed.delete(sessionId);
+      return report;
     });
+  }
+
+  /**
+   * The checks a commit needs that cost nothing to make up front: every target
+   * directory sits on the staging area's volume (a rename, not a copy), and the
+   * persistence backend's root is the configured one (a fence there guards
+   * these files). Run before the immediate path and before a deferral, so a
+   * delete that could never complete is refused before it stops anything.
+   * @param staging - the staging root.
+   * @param plan - the purge plan.
+   */
+  async preflight(staging, plan) {
+    const stagingDevice = String((await stat(staging, { bigint: true })).dev);
+    for (const target of plan.targets) {
+      for (const record of [target, ...target.duplicates]) {
+        if ((await txn.parentDevice(record.directory)) !== stagingDevice) {
+          throw new RemoteError('session-purge/cross-device', `session directory "${record.directory}" is not on the same volume as the staging area "${staging}"; refusing rather than copying`, { directory: record.directory, staging });
+        }
+      }
+    }
+    const persistence = this.ctx.get('sessionPersistence');
+    if (persistence === undefined || typeof persistence.open !== 'function') {
+      throw new RemoteError('session-purge/fence-unavailable', 'no session persistence service is mounted, so no write fence can be taken', {});
+    }
+    if (typeof persistence.root === 'string') {
+      const [ours, theirs] = await Promise.all([realpath(this.sessionsRoot()).catch(() => this.sessionsRoot()), realpath(persistence.root).catch(() => persistence.root)]);
+      if (ours !== theirs) {
+        throw new RemoteError('session-purge/fence-mismatch', `the configured session root "${ours}" is not the persistence backend's root "${theirs}"; a fence there would guard other files`, { configured: ours, backend: theirs });
+      }
+    }
   }
 
   /**
@@ -433,6 +483,29 @@ class SessionPurgeService extends TypertRemoteService {
   }
 
   /**
+   * Move one entry out of the session tree and record what happened. The file
+   * system decides, not the error: an entry whose staged path carries its
+   * recorded identity is committed, whatever was thrown on the way.
+   * @param entry - a manifest entry (its `state` is updated).
+   * @param warnings - the warning sink.
+   */
+  async commitOne(entry, warnings) {
+    try {
+      const committed = await txn.commitEntry(entry.source, entry.staged);
+      entry.state = 'COMMITTED';
+      if (!committed.durable) warnings.push(`moved ${entry.source} out of the session tree, but its directory entries could not be flushed (${String(committed.error)}); after a crash, recovery redoes the move`);
+    } catch (error) {
+      if (entry.identity !== undefined && (await txn.entryIdentity(entry.staged)) === entry.identity) {
+        entry.state = 'COMMITTED';
+        warnings.push(`moved ${entry.source} out of the session tree, but the move reported: ${String(error)}`);
+      } else {
+        entry.state = 'FAILED';
+        warnings.push(`could not move ${entry.source} out of the session tree: ${String(error)}`);
+      }
+    }
+  }
+
+  /**
    * The immediate path (DESIGN.md §5.2): fence, commit, purge, verify.
    * @param params.staging - the staging root.
    * @param params.plan - the purge plan.
@@ -449,13 +522,7 @@ class SessionPurgeService extends TypertRemoteService {
     const removed = emptyCounters();
     const records = plan.targets.flatMap((target) => [target, ...target.duplicates].map((record, index) => ({ target, record, primary: index === 0 })));
 
-    // prepare — refuse a layout the commit cannot rename atomically.
-    const stagingDevice = String((await stat(staging, { bigint: true })).dev);
-    for (const { record } of records) {
-      if ((await txn.parentDevice(record.directory)) !== stagingDevice) {
-        throw new RemoteError('session-purge/cross-device', `session directory "${record.directory}" is not on the same volume as the staging area "${staging}"; refusing rather than copying`, { directory: record.directory, staging });
-      }
-    }
+    await this.preflight(staging, plan);
     throwIfAborted(signal);
 
     if (settings.purgeAttachments) {
@@ -523,23 +590,14 @@ class SessionPurgeService extends TypertRemoteService {
         unverified: [],
       };
       await txn.writeManifest(staging, manifest);
-      // Armed before anything moves: a late write-back between the commit and the
-      // checkpoint delete must already meet the watcher.
-      this.armTombstones(manifest, Date.now() + RETAIN_MANIFEST_MS);
 
-      for (const entry of manifest.entries) {
-        try {
-          await txn.commitEntry(entry.source, entry.staged);
-          entry.state = 'COMMITTED';
-        } catch (error) {
-          entry.state = 'FAILED';
-          warnings.push(`could not move ${entry.source} out of the session tree: ${String(error)}`);
-        }
-      }
+      for (const entry of manifest.entries) await this.commitOne(entry, warnings);
       settleTargetStates(manifest);
-      // A target whose directory never left the tree is still a session: its
-      // checkpoint is its own again.
-      this.disarmTombstones(manifest.targets.filter((target) => target.state !== 'COMMITTED').map((target) => target.id));
+      // Armed for the committed targets only, before their checkpoints are
+      // deleted: a write-back that landed before this is removed by that delete,
+      // one that lands after meets the watcher. A target that stayed in the tree
+      // is still a session, and its checkpoint stays its own.
+      this.armTombstones(manifest, Date.now() + RETAIN_MANIFEST_MS);
       manifest.steps.commit = 'done';
       manifest.state = 'COMMITTED';
       await txn.writeManifest(staging, manifest);
@@ -566,6 +624,9 @@ class SessionPurgeService extends TypertRemoteService {
    */
   async runDeferred({ staging, plan, settings }) {
     const warnings = [];
+    // Nothing irreversible before this: a delete that could never complete is
+    // refused before any session is stopped.
+    await this.preflight(staging, plan);
     const registry = this.ctx.get('workspaceRegistry');
     const archived = new Set(Array.isArray(registry?.archivedSessionIds) ? registry.archivedSessionIds : []);
     const pinned = new Set(Array.isArray(registry?.pinnedSessionIds) ? registry.pinnedSessionIds : []);
@@ -607,9 +668,10 @@ class SessionPurgeService extends TypertRemoteService {
       unverified: [],
     };
     await txn.writeManifest(staging, manifest);
+    // Listening before stopping: a disposal the stop causes must wake the run.
+    for (const id of plan.targetIds) this.pendingIds.add(id);
     manifest.steps.quiesce = await this.quiesce(manifest.targets, warnings);
     await txn.writeManifest(staging, manifest);
-    for (const id of plan.targetIds) this.pendingIds.add(id);
     return {
       sessionId: plan.sessionId,
       runId: manifest.runId,
@@ -649,7 +711,13 @@ class SessionPurgeService extends TypertRemoteService {
         warnings.push(`could not stop "${target.id}": ${String(error?.message ?? error)}`);
       }
     }
-    return registry === undefined || typeof registry.archiveSession !== 'function' ? 'stop-only' : 'done';
+    if (registry === undefined || typeof registry.archiveSession !== 'function') {
+      const message = 'no Workspace registry is mounted: the sessions were asked to stop but could not be archived, so a wake is not blocked until the delete completes';
+      warnings.push(message);
+      this.warn(message);
+      return 'stop-only';
+    }
+    return 'done';
   }
 
   /**
@@ -686,7 +754,7 @@ class SessionPurgeService extends TypertRemoteService {
       // If the completion got as far as its own manifest, the run belongs to
       // recovery now: never write the pending manifest back over it.
       const current = await txn.readManifest(txn.runDirectory(staging, manifest.runId));
-      if (current !== undefined && current.state !== 'PENDING' && current.state !== 'STUCK') {
+      if (current !== undefined && !isWaitingRun(current)) {
         this.warn(`deferred delete ${manifest.runId} stopped after its fence: ${String(error?.message ?? error)}; recovery finishes it`);
         return { status: 'failed', error: String(error?.message ?? error) };
       }
@@ -753,12 +821,18 @@ class SessionPurgeService extends TypertRemoteService {
     try {
       staging = await txn.stagingRootFor(this.sessionsRoot());
     } catch {
-      return { runs: [] };
+      return { runs: [], completed: [] };
     }
     const runs = [];
+    // Deferred deletes that completed while no window was there to hear the
+    // removal: the Client clears their browser state from this list.
+    const completed = [];
     for (const run of await txn.listRuns(staging)) {
       const manifest = run.manifest;
-      if (manifest === undefined || manifest.outcome !== null || (manifest.state !== 'PENDING' && manifest.state !== 'STUCK')) continue;
+      if (manifest?.outcome !== null && manifest?.outcome !== undefined && manifest.path === 'deferred') {
+        for (const target of manifest.targets) if (target.state === 'COMMITTED') completed.push(target.id);
+      }
+      if (!isWaitingRun(manifest)) continue;
       runs.push({
         runId: manifest.runId,
         state: manifest.state,
@@ -770,7 +844,7 @@ class SessionPurgeService extends TypertRemoteService {
         targets: manifest.targets.map((target) => ({ sessionId: target.id, title: typeof target.title === 'string' ? target.title : '' })),
       });
     }
-    return { runs };
+    return { runs, completed };
   }
 
   /**
@@ -783,12 +857,21 @@ class SessionPurgeService extends TypertRemoteService {
     const { staging, manifest } = await this.pendingRun(runId);
     return this.exclusive(staging, async () => {
       const current = await txn.readManifest(txn.runDirectory(staging, runId));
-      if (current === undefined || current.outcome !== null || (current.state !== 'PENDING' && current.state !== 'STUCK')) {
+      if (!isWaitingRun(current)) {
         throw new RemoteError('session-purge/not-pending', `run "${runId}" is no longer waiting; it cannot be cancelled`, { runId, state: current?.state ?? manifest.state });
       }
       const registry = this.ctx.get('workspaceRegistry');
       const schedule = this.ctx.get('schedule');
-      const report = { runId, restored: [], reminders: { recreated: 0, failed: [] }, drift: [], warnings: [] };
+      const report = { runId, restored: [], reminders: { recreated: 0, kept: 0, failed: [] }, drift: [], warnings: [] };
+      // A reminder the stop did not delete (the stop failed, or never ran) is
+      // still there: recreating it would duplicate it. Without a readable catalog
+      // that cannot be told, so nothing is recreated.
+      let existing;
+      try {
+        existing = typeof schedule?.catalog === 'function' ? new Set((await schedule.catalog()).map((row) => `${String(row.sessionId)}/${String(row.id)}`)) : undefined;
+      } catch {
+        existing = undefined;
+      }
       for (const target of current.targets) {
         const prior = target.prior ?? {};
         try {
@@ -800,8 +883,12 @@ class SessionPurgeService extends TypertRemoteService {
           report.warnings.push(`could not restore "${target.id}": ${String(error?.message ?? error)}`);
         }
         for (const snapshot of prior.reminders ?? []) {
+          if (existing?.has(`${target.id}/${String(snapshot.id)}`)) {
+            report.reminders.kept += 1;
+            continue;
+          }
           const request = reminderRequest(snapshot);
-          if (request === undefined || typeof schedule?.create !== 'function') {
+          if (request === undefined || typeof schedule?.create !== 'function' || existing === undefined) {
             report.reminders.failed.push({ sessionId: target.id, title: String(snapshot.title ?? ''), reason: request === undefined ? 'cannot-recreate' : 'schedule-unavailable' });
             continue;
           }
@@ -824,7 +911,7 @@ class SessionPurgeService extends TypertRemoteService {
       }
       await txn.removeRun(staging, runId);
       try {
-        await txn.appendAudit(staging, { runId, path: 'deferred', outcome: 'cancelled', targets: current.targets.map((target) => ({ id: target.id })), reminders: { recreated: report.reminders.recreated, failed: report.reminders.failed.length }, drift: report.drift.length });
+        await txn.appendAudit(staging, { runId, path: 'deferred', outcome: 'cancelled', targets: current.targets.map((target) => ({ id: target.id })), reminders: { recreated: report.reminders.recreated, kept: report.reminders.kept, failed: report.reminders.failed.length }, drift: report.drift.length });
       } catch {
         /* the audit is best effort */
       }
@@ -841,7 +928,7 @@ class SessionPurgeService extends TypertRemoteService {
     const { staging } = await this.pendingRun(runId);
     return this.exclusive(staging, async () => {
       const current = await txn.readManifest(txn.runDirectory(staging, runId));
-      if (current === undefined || current.outcome !== null || (current.state !== 'PENDING' && current.state !== 'STUCK')) {
+      if (!isWaitingRun(current)) {
         throw new RemoteError('session-purge/not-pending', `run "${runId}" is no longer waiting`, { runId });
       }
       if (current.state === 'STUCK') {
@@ -870,7 +957,7 @@ class SessionPurgeService extends TypertRemoteService {
     const wanted = new Set(ids);
     for (const run of await txn.listRuns(staging)) {
       const manifest = run.manifest;
-      if (manifest === undefined || manifest.outcome !== null || (manifest.state !== 'PENDING' && manifest.state !== 'STUCK')) continue;
+      if (!isWaitingRun(manifest)) continue;
       if (manifest.targets.some((target) => wanted.has(target.id))) return manifest;
     }
     return undefined;
@@ -903,8 +990,9 @@ class SessionPurgeService extends TypertRemoteService {
    * cross-process lease are ours (`dsh-session-persistence-jsonl:2488-2556`); a
    * resident session refuses it with `SessionAlreadyOwnedError`. Before trusting
    * that, the fence proves it guards *the directories this plugin will move*: the
-   * backend's root must be the configured one, and on POSIX each target's
-   * `session.lock` must be contended once the handle is held.
+   * backend's root must be the configured one ({@link preflight}, which every
+   * caller runs first), and on POSIX each target's `session.lock` must be
+   * contended once the handle is held.
    * @param targets - the plan's targets.
    * @returns `{ owned, tombstones, release }`; `owned` lists live targets (all
    *   handles are already released then).
@@ -913,12 +1001,6 @@ class SessionPurgeService extends TypertRemoteService {
     const persistence = this.ctx.get('sessionPersistence');
     if (persistence === undefined || typeof persistence.open !== 'function') {
       throw new RemoteError('session-purge/fence-unavailable', 'no session persistence service is mounted, so no write fence can be taken', {});
-    }
-    if (typeof persistence.root === 'string') {
-      const [ours, theirs] = await Promise.all([realpath(this.sessionsRoot()).catch(() => this.sessionsRoot()), realpath(persistence.root).catch(() => persistence.root)]);
-      if (ours !== theirs) {
-        throw new RemoteError('session-purge/fence-mismatch', `the configured session root "${ours}" is not the persistence backend's root "${theirs}"; a fence there would guard other files`, { configured: ours, backend: theirs });
-      }
     }
     const handles = [];
     const leases = [];
@@ -1099,23 +1181,7 @@ class SessionPurgeService extends TypertRemoteService {
     await txn.writeManifest(staging, manifest);
     announceRemoved(this.ctx, committedIds);
 
-    if (manifest.steps.cleanup !== 'done') {
-      for (const entry of manifest.entries) {
-        if (entry.state !== 'COMMITTED') continue;
-        try {
-          await txn.cleanupEntry({ stagedPath: entry.staged, linked: entry.linked, realTarget: entry.realTarget, realTargetIdentity: entry.realTargetIdentity }, warnings);
-          entry.state = 'CLEANED';
-        } catch (error) {
-          warnings.push(`could not clean up ${entry.staged}: ${String(error)}`);
-        }
-      }
-      const entriesDirectory = join(txn.runDirectory(staging, manifest.runId), 'entries');
-      if (manifest.entries.every((entry) => entry.state !== 'COMMITTED')) {
-        await rm(entriesDirectory, { recursive: true, force: true });
-        await txn.fsyncDirectory(txn.runDirectory(staging, manifest.runId));
-        manifest.steps.cleanup = 'done';
-      }
-    }
+    if (manifest.steps.cleanup !== 'done') await this.cleanupStaged(staging, manifest, warnings);
 
     const verification = await this.verify(committedIds, staging, manifest);
     manifest.steps.verify = 'done';
@@ -1326,6 +1392,7 @@ class SessionPurgeService extends TypertRemoteService {
       const targets = ids.map((id) => ({ id, directory: relocate.find((entry) => entry.id === id && entry.primary)?.source ?? relocate.find((entry) => entry.id === id).source, header: {}, duplicates: [] }));
       let fence;
       try {
+        await this.preflight(staging, { targets });
         fence = await this.fence(targets);
         for (const entry of relocate) {
           if (fence.owned.includes(entry.id)) {
@@ -1333,13 +1400,7 @@ class SessionPurgeService extends TypertRemoteService {
             warnings.push(`session "${entry.id}" came back to life before its interrupted commit could be redone; left in place`);
             continue;
           }
-          try {
-            await txn.commitEntry(entry.source, entry.staged);
-            entry.state = 'COMMITTED';
-          } catch (error) {
-            entry.state = 'FAILED';
-            warnings.push(`could not redo the commit of ${entry.source}: ${String(error)}`);
-          }
+          await this.commitOne(entry, warnings);
         }
       } catch (error) {
         for (const entry of relocate) entry.state = 'FAILED';
@@ -1378,6 +1439,20 @@ class SessionPurgeService extends TypertRemoteService {
    */
   async retryCleanup(staging, manifest) {
     const warnings = [];
+    await this.cleanupStaged(staging, manifest, warnings);
+    await txn.writeManifest(staging, manifest);
+    for (const warning of warnings) this.warn(`cleanup retry of ${manifest.runId}: ${warning}`);
+  }
+
+  /**
+   * Remove a run's committed entries from staging (the link rules live in
+   * `txn.cleanupEntry`), and once none is left, its `entries/` directory —
+   * flushed, because a removal is not durable until its parent is.
+   * @param staging - the staging root.
+   * @param manifest - the run's manifest (entry states and `steps.cleanup` are updated).
+   * @param warnings - the warning sink.
+   */
+  async cleanupStaged(staging, manifest, warnings) {
     for (const entry of manifest.entries) {
       if (entry.state !== 'COMMITTED') continue;
       try {
@@ -1389,10 +1464,9 @@ class SessionPurgeService extends TypertRemoteService {
     }
     if (manifest.entries.every((entry) => entry.state !== 'COMMITTED')) {
       await rm(join(txn.runDirectory(staging, manifest.runId), 'entries'), { recursive: true, force: true });
+      await txn.fsyncDirectory(txn.runDirectory(staging, manifest.runId)).catch((error) => warnings.push(`could not flush the removal of the staged entries: ${String(error)}`));
       manifest.steps.cleanup = 'done';
     }
-    await txn.writeManifest(staging, manifest);
-    for (const warning of warnings) this.warn(`cleanup retry of ${manifest.runId}: ${warning}`);
   }
 
   /**
@@ -1433,7 +1507,10 @@ class SessionPurgeService extends TypertRemoteService {
     }
     if (!txn.checkpointIdentityMatches(tombstone, change.value?.identity)) return;
     const table = this.checkpointTable();
-    if (table === undefined) return;
+    if (table === undefined) {
+      this.warnTableOnce();
+      return;
+    }
     table.delete(change.key).then(
       () => this.warn(`removed a checkpoint written back for deleted session "${String(change.key)}"`),
       (error) => this.warn(`could not remove a written-back checkpoint of "${String(change.key)}": ${String(error)}`),
@@ -1448,7 +1525,10 @@ class SessionPurgeService extends TypertRemoteService {
    */
   async recheckCheckpoints(manifest) {
     const table = this.checkpointTable();
-    if (table === undefined) return 0;
+    if (table === undefined) {
+      this.warnTableOnce();
+      return 0;
+    }
     let removed = 0;
     for (const target of manifest.targets) {
       const tombstone = this.tombstones.get(target.id);
@@ -1461,6 +1541,13 @@ class SessionPurgeService extends TypertRemoteService {
       }
     }
     return removed;
+  }
+
+  /** Say once that the checkpoint table cannot be reached, so the watcher is off. */
+  warnTableOnce() {
+    if (this.warnedNoTable) return;
+    this.warnedNoTable = true;
+    this.warn('the projection checkpoint table (storageDomain "session_projcache") is unreachable: a checkpoint written back for a deleted session cannot be removed until it is');
   }
 
   /**

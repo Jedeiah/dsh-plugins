@@ -324,6 +324,14 @@ async function testTransactionStore(root) {
   check('identity follows the moved entry', before !== undefined && (await txn.entryIdentity(staged)) === before);
   await txn.cleanupEntry({ stagedPath: staged, linked: false }, []);
   check('a committed directory is removed whole', !existsSync(staged));
+  // A directory flush that fails after the rename does not undo the move, so it
+  // is reported, not thrown.
+  const flaky = join(project, 'session-flaky');
+  await mkdir(flaky, { recursive: true });
+  const flakyStaged = txn.stagedPathFor(staging, manifest.runId, flaky);
+  const flushed = await txn.commitEntry(flaky, flakyStaged, async () => { throw Object.assign(new Error('EINVAL: fsync'), { code: 'EINVAL' }); });
+  check('a failed flush after the rename reports a moved, non-durable entry', flushed?.durable === false && !existsSync(flaky) && existsSync(flakyStaged), JSON.stringify(flushed));
+  await txn.cleanupEntry({ stagedPath: flakyStaged, linked: false }, []);
 
   // A linked entry whose target was swapped after the commit is left alone.
   if (process.platform !== 'win32') {
@@ -457,6 +465,7 @@ async function testGateway(app, workroot) {
   const plain = (value) => (typeof value?.get === 'function' ? value.get() : value);
   check('row configuration validates and fills defaults', plain(config.value.includeDescendants) === true && plain(config.value.purgeAttachments) === false, JSON.stringify([plain(config.value.includeDescendants), plain(config.value.purgeAttachments)]));
   check('volatile fields arrive as live references', typeof config.value.includeDescendants?.get === 'function');
+  check('the retired purgeAttachments stays a volatile field (a stored setting still validates)', typeof config.value.purgeAttachments?.get === 'function');
 
   const { tryLockExclusive } = await import(join(app, 'node-addon-system', 'lib', 'flock.js'));
   const engine = await import(join(here, 'engine.js'));
@@ -770,6 +779,7 @@ async function testGateway(app, workroot) {
         get pinnedSessionIds() { return [...pinned]; },
         archiveSession: async (id, options) => {
           calls.push(`archive:${id}:${String(options?.stopActivity === true)}`);
+          calls.push(`listening:${id}:${String(hostCtx.get('sessionPurge')?.pendingIds?.has(id) === true)}`);
           if (!archived.includes(id)) archived.push(id);
           const at = pinned.indexOf(id);
           if (at !== -1) pinned.splice(at, 1);
@@ -813,6 +823,7 @@ async function testGateway(app, workroot) {
     check('a confirmed delete of a live session is deferred, not refused', report.deferred === true && report.pendingIds.length === 3 && report.removedIds.length === 0, JSON.stringify(report));
     check('nothing is deleted yet', allThere(deferred));
     check('live targets are archived with stopActivity', recorded.calls.includes(`archive:${deferred.parentId}:true`) && recorded.calls.includes(`archive:${deferred.grandId}:true`), recorded.calls.join(' | '));
+    check('the run listens for disposals before it stops anything', recorded.calls.includes(`listening:${deferred.parentId}:true`) && !recorded.calls.some((entry) => entry.startsWith('listening:') && entry.endsWith(':false')), recorded.calls.join(' | '));
     check('an already archived target gets the stop request directly', recorded.calls.includes(`stop:${deferred.childId}`) && !recorded.calls.some((entry) => entry.startsWith(`archive:${deferred.childId}`)), recorded.calls.join(' | '));
     const [pendingRun] = await pendingOf(deferred);
     check('the pending manifest snapshots what the stop will delete', pendingRun?.manifest?.targets?.find((target) => target.id === deferred.parentId)?.prior?.reminders?.length === 2 && pendingRun.manifest.targets.find((target) => target.id === deferred.parentId).prior.pinned === true, JSON.stringify(pendingRun?.manifest?.targets?.map((target) => target.prior)));
@@ -832,9 +843,65 @@ async function testGateway(app, workroot) {
       && recorded.calls.some((entry) => entry.startsWith(`create:${deferred.parentId}:`) && entry.includes('"daily":{"time":"09:00:00.000","time_zone":"Asia/Shanghai"}'))
       && recorded.calls.some((entry) => entry.startsWith(`create:${deferred.parentId}:`) && entry.includes('"at":"2099-01-01T00:00:00.000Z"')), JSON.stringify([cancelled, recorded.calls]));
     check('cancel reads back and reports no drift', Array.isArray(cancelled.drift) && cancelled.drift.length === 0, JSON.stringify(cancelled.drift));
+    check('cancel keeps no reminder it recreated', cancelled.reminders.kept === 0);
     check('a cancelled delete leaves no run and nothing deleted', (await pendingOf(deferred)).length === 0 && allThere(deferred));
     const cancelUnknown = await hostD.attempt('cancelPending', { runId: pendingRun.runId });
     check('a run that no longer waits cannot be cancelled', cancelUnknown.error?.code === 'session-purge/run-unknown', String(cancelUnknown.error?.code));
+
+    // A stop that did not delete the reminders: cancel must not duplicate them.
+    {
+      const keep = await buildStore(join(workroot, 'gateway-store-keep'));
+      const keepHost = boot(rooted(keep));
+      const keptServices = services(keep, keepHost.ctx);
+      keepHost.ctx.provide('agents', { get: (id) => (id === keep.parentId ? { id } : undefined) });
+      await keepHost.invoke('inspect', { sessionId: keep.parentId });
+      const keepRun = await keepHost.invoke('purge', { sessionId: keep.parentId });
+      keptServices.calls.length = 0;
+      const kept = await keepHost.invoke('cancelPending', { runId: keepRun.runId });
+      check('cancel does not recreate reminders that are still there', kept.reminders.kept === 2 && kept.reminders.recreated === 0 && !keptServices.calls.some((entry) => entry.startsWith('create:')), JSON.stringify([kept.reminders, keptServices.calls]));
+    }
+
+    // Consent is per target: a target the preview showed cold is not stopped.
+    {
+      const partial = await buildStore(join(workroot, 'gateway-store-consent'));
+      const partialHost = boot(rooted(partial));
+      const partialServices = services(partial, partialHost.ctx);
+      const partialLive = new Set([partial.parentId]);
+      partialHost.ctx.provide('agents', { get: (id) => (partialLive.has(id) ? { id } : undefined) });
+      await partialHost.invoke('inspect', { sessionId: partial.parentId });
+      partialLive.add(partial.childId);
+      const refused = await partialHost.attempt('purge', { sessionId: partial.parentId });
+      check('a target that came to life after the preview is not stopped along with the consented one', refused.error?.code === 'session-purge/became-live' && refused.error.details?.sessionIds?.join(',') === partial.childId && !partialServices.calls.some((entry) => entry.startsWith('archive:')), `${String(refused.error?.code)} ${JSON.stringify(refused.error?.details)} ${partialServices.calls.join(' | ')}`);
+
+      // A failed attempt keeps the preview: retrying from the same dialog still
+      // has the consent it asked for.
+      partialLive.delete(partial.childId);
+      const reason = new Error('selftest: transient');
+      const failedOnce = await partialHost.attempt('purge', { sessionId: partial.parentId }, { aborted: true, reason });
+      const retried = await partialHost.attempt('purge', { sessionId: partial.parentId });
+      check('a retry after a failed attempt still defers with the dialog\'s consent', failedOnce.error !== undefined && retried.value?.deferred === true, `${String(failedOnce.error?.message)} / ${String(retried.error?.code ?? retried.value?.deferred)}`);
+    }
+
+    // A deferral that could never complete is refused before anything stops.
+    {
+      const never = await buildStore(join(workroot, 'gateway-store-never'));
+      const neverHost = boot(rooted(never), stubPersistence(never.sessionsRoot, { reportedRoot: join(workroot, 'elsewhere') }));
+      const neverServices = services(never, neverHost.ctx);
+      neverHost.ctx.provide('agents', { get: (id) => (id === never.parentId ? { id } : undefined) });
+      await neverHost.invoke('inspect', { sessionId: never.parentId });
+      const refused = await neverHost.attempt('purge', { sessionId: never.parentId });
+      check('a deferral the fence could never complete is refused before stopping anything', refused.error?.code === 'session-purge/fence-mismatch' && !neverServices.calls.some((entry) => entry.startsWith('archive:') || entry.startsWith('stop:')) && (await pendingOf(never)).length === 0, `${String(refused.error?.code)} ${neverServices.calls.join(' | ')}`);
+    }
+
+    // Without a Workspace registry the stop cannot archive, and the report says so.
+    {
+      const bare = await buildStore(join(workroot, 'gateway-store-bare'));
+      const bareHost = boot(rooted(bare));
+      bareHost.ctx.provide('agents', { get: (id) => (id === bare.parentId ? { id } : undefined) });
+      await bareHost.invoke('inspect', { sessionId: bare.parentId });
+      const bareReport = await bareHost.invoke('purge', { sessionId: bare.parentId });
+      check('a deferral without a registry warns that nothing was archived', bareReport.deferred === true && bareReport.warnings.some((line) => line.includes('no Workspace registry')), JSON.stringify(bareReport.warnings));
+    }
 
     // Defer again, then let the session go cold: the disposal completes it.
     await hostD.invoke('inspect', { sessionId: deferred.parentId });
@@ -847,6 +914,7 @@ async function testGateway(app, workroot) {
     const completed = await waitFor(async () => (await runsOf(deferred)).find((run) => run.runId === second.runId)?.manifest?.outcome != null && !existsSync(join(deferred.project, deferred.parentId)));
     check('an agent disposal completes the deferred delete', completed && !existsSync(join(deferred.nestedProject, deferred.grandId)));
     const done = (await runsOf(deferred)).find((run) => run.runId === second.runId)?.manifest;
+    check('pending() names the completed deferred sessions for the browser to forget', (await hostD.invoke('pending', {})).completed?.includes(deferred.parentId) === true);
     check('the completed deferred run records its outcome and keeps no titles', done?.outcome !== null && done?.path === 'deferred' && done.targets.every((target) => target.title === undefined), JSON.stringify([done?.outcome, done?.path, done?.state, done?.targets]));
 
     // A deferred delete that keeps failing stops on its own and says why.
@@ -939,6 +1007,24 @@ async function testGateway(app, workroot) {
     check('a reference written during round two is caught by the barrier', existsSync(objectPath(barrierDigest)) && collected.kept === 2, JSON.stringify(collected));
     check('nothing referenced is ever touched', [gcStore.keptDigest, gcStore.sharedDigest, uploaded, fresh].every((digest) => existsSync(objectPath(digest))));
     check('round two consumes the candidate list', (await gcHost.invoke('attachmentGc', { mode: 'status' })).candidates === 0);
+
+    // A log too large to scan is named as such, not as unreadable.
+    const capped = await engine.markAttachmentRoots({ sessionsRoot: gcStore.sessionsRoot, maxLogBytes: 10 });
+    check('a log over the scan cap stops the gc and is called too large', capped.complete === false && String(capped.reason).startsWith('log-too-large'), String(capped.reason));
+
+    // An unreadable session behind a link is just as undecidable as one in place.
+    if (leases) {
+      const outside = join(gcStore.root, 'outside-broken');
+      await mkdir(outside, { recursive: true });
+      await writeFile(join(outside, 'session.v4.jsonl.zstd'), Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x00, 0x00]));
+      const link = join(gcStore.survivorProject, 'session-l1l1l1l1-0000-4000-8000-000000000008');
+      await symlink(outside, link, 'dir');
+      check('the residue sweep never offers a link, the gc looks through it', !(await engine.scanResidue({ root: gcStore.sessionsRoot })).directories.some((entry) => entry.directory === link)
+        && (await engine.scanResidue({ root: gcStore.sessionsRoot, followLinks: true })).directories.some((entry) => entry.directory === link));
+      const linkedBlock = await gcHost.invoke('attachmentGc', { mode: 'scan' });
+      check('an unreadable linked session stops the gc too', linkedBlock.aborted === true && String(linkedBlock.reason).includes(link), JSON.stringify(linkedBlock));
+      await rm(link, { force: true });
+    }
 
     // A session-shaped directory nobody can read might hold a reference: stop.
     const unreadable = join(gcStore.survivorProject, 'session-c0c0c0c0-0000-4000-8000-000000000009');
@@ -1077,6 +1163,22 @@ async function testGateway(app, workroot) {
     await rm(`${replacement}.old`, { recursive: true, force: true });
     await boot(rooted(drifted)).service().recover();
     check('a directory that is not the one the run recorded is left alone', existsSync(join(replacement, 'session.v4.jsonl.zstd')));
+
+    // A finished run whose staged entries could not all be removed is cleaned up
+    // on the next start.
+    {
+      const leftover = await buildStore(join(workroot, 'gateway-store-leftover'));
+      const leftoverRun = await craft(leftover, { commit: [leftover.parentId] });
+      const leftoverManifest = await txn.readManifest(txn.runDirectory(leftoverRun.staging, leftoverRun.runId));
+      leftoverManifest.entries.find((entry) => entry.id === leftover.parentId).state = 'COMMITTED';
+      leftoverManifest.outcome = 'incomplete';
+      leftoverManifest.state = 'DONE';
+      leftoverManifest.completedAt = new Date().toISOString();
+      await txn.writeManifest(leftoverRun.staging, leftoverManifest);
+      await boot(rooted(leftover)).service().recover();
+      const after = await txn.readManifest(txn.runDirectory(leftoverRun.staging, leftoverRun.runId));
+      check('a finished run with staged leftovers is cleaned up on the next start', after?.steps?.cleanup === 'done' && !existsSync(join(txn.runDirectory(leftoverRun.staging, leftoverRun.runId), 'entries')), JSON.stringify(after?.steps));
+    }
 
     // A finished run: its tombstones are re-armed until it expires, then it goes.
     const finishedRun = await txn.listRuns(await txn.stagingRootFor(store.sessionsRoot));
@@ -1528,7 +1630,17 @@ async function testClientHalf(app) {
   const source = await readFile(join(here, 'client.js'), 'utf8');
 
   const registered = [];
-  const sandbox = { console, window: { __ModuleLoader__: { load: (spec) => registered.push(spec) } } };
+  const storage = new Map([
+    ['dsh.conversation.s-def', 'view'], ['dsh.user-questions.drafts.v1.s-def', 'draft'],
+    ['dsh.conversation.s-done', 'view'], ['dsh.user-questions.drafts.v1.s-done', 'draft'],
+    ['dsh.conversation.s-gone', 'view'], ['dsh.sessions.current', JSON.stringify({ sessionId: 's-def' })],
+  ]);
+  const localStorage = {
+    getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+    setItem: (key, value) => storage.set(key, String(value)),
+    removeItem: (key) => storage.delete(key),
+  };
+  const sandbox = { console, window: { __ModuleLoader__: { load: (spec) => registered.push(spec) }, localStorage } };
   vm.createContext(sandbox);
   try {
     vm.runInContext(source, sandbox, { filename: 'client.js' });
@@ -1584,8 +1696,12 @@ async function testClientHalf(app) {
   // ("cannot get property \"remote.sessionPurge\" without inject").
   const namespace = {
     inspect: async () => ({ sessionId: 'x', targets: [], sizeBytes: 0, scheduleCount: 0, spillDirectoryCount: 0, includeDescendants: true, purgeAttachments: false, live: false, blocked: null, forkIds: [], logBytes: 0, spillBytes: 0 }),
-    purge: async () => ({ sessionId: 'x', targets: [], removedIds: [], failedIds: [], forkIds: [], removed: { bytesFreed: 0 }, warnings: [] }),
+    purge: async (sessionId) => (sessionId === 's-def'
+      ? { ok: true, value: { sessionId, deferred: true, pendingIds: ['s-def'], targets: ['s-def'], removedIds: [], failedIds: [], forkIds: [], removed: { bytesFreed: 0 }, warnings: [] } }
+      : { sessionId: 'x', targets: [], removedIds: [], failedIds: [], forkIds: [], removed: { bytesFreed: 0 }, warnings: [] }),
+    pending: async () => ({ ok: true, value: { runs: [], completed: ['s-done'] } }),
   };
+  const eventHandlers = [];
   const form = {
     getSnapshot: () => ({ status: 'ready', writable: true, revision: 1, value: {} }),
     subscribe: () => () => undefined,
@@ -1599,6 +1715,10 @@ async function testClientHalf(app) {
         mounted.push(contribution);
         await Promise.resolve();
         return async () => undefined;
+      },
+      $on: (event, handler) => {
+        eventHandlers.push({ event, handler });
+        return () => undefined;
       },
     };
     if (injected) {
@@ -1651,6 +1771,12 @@ async function testClientHalf(app) {
     return;
   }
   check('apply returns a disposer', typeof disposer === 'function');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  check('on load, the browser state of deferred deletes completed meanwhile is cleared', !storage.has('dsh.conversation.s-done') && !storage.has('dsh.user-questions.drafts.v1.s-done') && storage.has('dsh.conversation.s-def'), JSON.stringify([...storage.keys()]));
+  const removedHandler = eventHandlers.find((entry) => entry.event === 'api-session/removed')?.handler;
+  check('the client listens for the Host\'s removal broadcast', typeof removedHandler === 'function');
+  removedHandler?.('s-gone');
+  check('a removal broadcast clears that session\'s browser state', !storage.has('dsh.conversation.s-gone'));
   check('the Remote namespace is read through an injected child context', injectedNames.includes('remote.sessionPurge'), injectedNames.join(', '));
   check('the bundle mounts exactly one Remote contribution', mounted.length === 1 && mounted[0].package === '@jedeiah/session-purge');
 
@@ -1673,6 +1799,14 @@ async function testClientHalf(app) {
     JSON.stringify([dialogTree?.props?.className, dialogTree?.props?.contentClassName]),
   );
   confirm?.purge.dismiss();
+
+  // A deferred delete forgets only the "current session" pointer: the session can
+  // still be cancelled, and its drafts must survive that.
+  confirm?.purge.open('s-def', 'Deferred');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await confirm?.purge.submit();
+  check('a deferred delete forgets the current pointer but keeps view state and drafts', !storage.has('dsh.sessions.current') && storage.has('dsh.conversation.s-def') && storage.has('dsh.user-questions.drafts.v1.s-def'), JSON.stringify([...storage.keys()]));
+  confirm?.purge.dismissToast();
 
   // A second materialisation, this time with a document: the only DOM write the
   // module makes is that one stylesheet, and it must be tagged so a page inspector

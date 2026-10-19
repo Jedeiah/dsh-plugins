@@ -59,6 +59,9 @@ const HEADER_PROBE_BYTES = 64 * 1024;
  */
 const MAX_SCAN_BYTES = 64 * 1024 * 1024;
 
+/** Per-log cap for the attachment gc's reference scan (read whole, one log at a time). */
+const GC_SCAN_BYTES = 1024 * 1024 * 1024;
+
 /** Tail window used when hunting for the last recorded title in a large log. */
 const TITLE_SCAN_BYTES = 8 * 1024 * 1024;
 
@@ -365,9 +368,13 @@ async function isDirectoryEntry(parent, entry) {
  * @param params.root - the session log root.
  * @param params.minimumAgeMs - skip directories modified more recently than this.
  * @param params.signal - aborts the scan between directories.
+ * @param params.followLinks - also look through symbolic links, the way the
+ *   index does. The attachment gc needs this: a linked session it cannot read
+ *   is a holder it cannot rule out. The residue sweep leaves it off and never
+ *   offers a link for deletion.
  * @returns the residue, largest first, with its total size.
  */
-export async function scanResidue({ root, minimumAgeMs = 0, signal }) {
+export async function scanResidue({ root, minimumAgeMs = 0, signal, followLinks = false }) {
   const found = [];
   let projects;
   try {
@@ -375,8 +382,9 @@ export async function scanResidue({ root, minimumAgeMs = 0, signal }) {
   } catch {
     return { directories: [], bytes: 0 };
   }
+  const isDirectory = (parent, entry) => (followLinks ? isDirectoryEntry(parent, entry) : entry.isDirectory());
   for (const project of projects) {
-    if (!project.isDirectory()) continue;
+    if (!(await isDirectory(root, project))) continue;
     const projectDirectory = join(root, project.name);
     let entries;
     try {
@@ -386,7 +394,7 @@ export async function scanResidue({ root, minimumAgeMs = 0, signal }) {
     }
     for (const entry of entries) {
       throwIfAborted(signal);
-      if (!entry.isDirectory()) continue;
+      if (!(await isDirectory(projectDirectory, entry))) continue;
       const directory = join(projectDirectory, entry.name);
       // A readable header means a real session; the index already covers those.
       if (await readSessionHeader(directory) !== undefined) continue;
@@ -529,29 +537,40 @@ export async function collectDigests(directory, sink) {
  * @returns whether every byte of the log was scanned.
  */
 export async function collectDigestsReport(directory, sink) {
+  return (await scanDigests(directory, sink)) === 'complete';
+}
+
+/**
+ * Scan one stored log for attachment digests and say how the scan ended.
+ * @param directory - the session-owned directory.
+ * @param sink - the digest sink.
+ * @param maxBytes - the size cap; `0` disables it.
+ * @returns `'complete'`, `'too-large'` or `'unreadable'`.
+ */
+export async function scanDigests(directory, sink, maxBytes = MAX_SCAN_BYTES) {
   let entries;
   try {
     entries = await readdir(directory);
   } catch {
-    return false;
+    return 'unreadable';
   }
   const file = selectLogFile(entries);
-  if (file === undefined) return false;
-  if (MAX_SCAN_BYTES !== 0 && (await fileSize(join(directory, file))) > MAX_SCAN_BYTES) return false;
+  if (file === undefined) return 'unreadable';
+  if (maxBytes !== 0 && (await fileSize(join(directory, file))) > maxBytes) return 'too-large';
   let buffer;
   try {
     buffer = await readFile(join(directory, file));
   } catch {
-    return false;
+    return 'unreadable';
   }
   const scan = (text) => {
     for (const match of text.matchAll(DIGEST_PATTERN)) sink.add(match[1]);
   };
   if (file.endsWith('.jsonl')) {
     scan(buffer.toString('utf8'));
-    return true;
+    return 'complete';
   }
-  return eachFrame(buffer, scan).skipped === 0;
+  return eachFrame(buffer, scan).skipped === 0 ? 'complete' : 'unreadable';
 }
 
 /**
@@ -627,12 +646,15 @@ export async function listAttachmentObjects(root) {
  * still points at is irreversible. So either is reported, and the gc stops.
  * @param params.sessionsRoot - the session log root.
  * @param params.manifestFiles - extra files whose `sha256:` references are roots.
+ * @param params.maxLogBytes - the per-log size cap. The gc is a manual, rare
+ *   pass, so it reads far larger logs than a delete would; a log past even this
+ *   cap is reported by name as too large, not as unreadable.
  * @param params.signal - aborts between logs.
  * @returns `{ referenced, complete, reason }`.
  */
-export async function markAttachmentRoots({ sessionsRoot, manifestFiles = [], signal }) {
+export async function markAttachmentRoots({ sessionsRoot, manifestFiles = [], maxLogBytes = GC_SCAN_BYTES, signal }) {
   const referenced = new Set();
-  const residue = await scanResidue({ root: sessionsRoot, signal });
+  const residue = await scanResidue({ root: sessionsRoot, signal, followLinks: true });
   if (residue.directories.length > 0) {
     return { referenced, complete: false, reason: `undecidable-holder: ${residue.directories[0].directory}` };
   }
@@ -640,8 +662,9 @@ export async function markAttachmentRoots({ sessionsRoot, manifestFiles = [], si
   for (const record of index.values()) {
     for (const entry of [record, ...record.duplicates]) {
       throwIfAborted(signal);
-      if (!(await collectDigestsReport(entry.directory, referenced))) {
-        return { referenced, complete: false, reason: `unreadable-log: ${entry.directory}` };
+      const scanned = await scanDigests(entry.directory, referenced, maxLogBytes);
+      if (scanned !== 'complete') {
+        return { referenced, complete: false, reason: `${scanned === 'too-large' ? 'log-too-large' : 'unreadable-log'}: ${entry.directory}` };
       }
     }
   }

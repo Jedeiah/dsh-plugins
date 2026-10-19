@@ -247,14 +247,27 @@ export function stagedPathFor(stagingRoot, runId, source) {
 /**
  * The commit of one entry: a same-volume rename out of the session tree, made
  * durable by flushing both parent directories.
+ *
+ * The rename is the commit point. A flush that fails after it (some network
+ * and FUSE filesystems refuse to fsync a directory) does not undo the move, so
+ * it is reported, not thrown: an entry that left the tree must be followed up as
+ * committed, or its session vanishes while its accounting stays behind.
  * @param source - the entry's original path.
  * @param destination - its staged path.
+ * @param sync - the directory flush (injectable for tests).
+ * @returns `{ durable, error }`; `durable` is false when a flush failed.
+ * @throws when the move itself failed — then nothing moved.
  */
-export async function commitEntry(source, destination) {
+export async function commitEntry(source, destination, sync = fsyncDirectory) {
   await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
   await rename(source, destination);
-  await fsyncDirectory(dirname(source));
-  await fsyncDirectory(dirname(destination));
+  try {
+    await sync(dirname(source));
+    await sync(dirname(destination));
+    return { durable: true, error: null };
+  } catch (error) {
+    return { durable: false, error };
+  }
 }
 
 /**
