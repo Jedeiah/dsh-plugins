@@ -1722,8 +1722,23 @@ async function testClientHalf(app) {
       },
     };
     if (injected) {
+      // The real Client API checks the argument count against each descriptor's
+      // parameters before it sends anything; the stub does the same, or a method
+      // called with a stray `undefined` passes here and fails in the browser.
+      const strict = new Proxy(namespace, {
+        get: (target, method) => {
+          const implementation = target[method];
+          if (typeof implementation !== 'function') return implementation;
+          return (...args) => {
+            const descriptor = mounted[0]?.descriptors?.find((entry) => entry.method === method);
+            const expected = descriptor?.parameters?.length ?? 0;
+            if (args.length !== expected) return Promise.reject(new Error(`client api: sessionPurge/${String(method)} expected ${String(expected)} argument(s), got ${String(args.length)}`));
+            return implementation(...args);
+          };
+        },
+      });
       Object.defineProperty(remote, 'sessionPurge', {
-        get: () => { namespaceReads += 1; return namespace; },
+        get: () => { namespaceReads += 1; return strict; },
       });
     } else {
       Object.defineProperty(remote, 'sessionPurge', {

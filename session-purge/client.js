@@ -293,7 +293,7 @@ window.__ModuleLoader__.load({
       menu: '删除会话…',
       action: '删除会话',
       dialogTitle: '彻底删除会话',
-      dialogBody: '这会从磁盘上连根删除该会话：会话日志与锁文件、投影缓存、工作区归属、绑定的提醒、工具落盘文件。删除后无法恢复，归档/取消归档不受影响。',
+      dialogBody: '这会从磁盘上连根删除该会话：会话日志与锁文件、投影缓存、工作区归属、绑定的提醒、工具落盘文件。删除后无法恢复。',
       dialogLoading: '正在统计…',
       dialogFailed: '无法读取该会话的信息：',
       targetsHeading: '将删除的会话',
@@ -317,6 +317,7 @@ window.__ModuleLoader__.load({
       statsSchedules: '绑定的提醒',
       deferWarning: '下面这些会话正在使用中，没法立刻删除。确认后会先停止它们（正在跑的任务会被中断、它们的活跃提醒会被删除）并归档，内容在下次启动 dsh 时删除；在那之前可以到插件设置页取消。',
       liveTargets: '正在使用：',
+      inUseTag: '正在使用',
       confirmDefer: '停止并在重启后删除',
       alreadyPending: '这个会话已经在等待删除了，可以到插件设置页「待完成的删除」里立即重试或取消。',
       toastDeferred: '已停止并归档 {count} 个会话，将在下次启动 dsh 时删除；可在插件设置页取消',
@@ -368,7 +369,7 @@ window.__ModuleLoader__.load({
       menu: 'Delete session…',
       action: 'Delete session',
       dialogTitle: 'Delete this session permanently',
-      dialogBody: 'This removes the session from disk: its log and lock file, its projection checkpoint, its workspace slot, its bound reminders and its spilled tool output. It cannot be undone; archive and unarchive are unaffected.',
+      dialogBody: 'This removes the session from disk: its log and lock file, its projection checkpoint, its workspace slot, its bound reminders and its spilled tool output. It cannot be undone.',
       dialogLoading: 'Loading…',
       dialogFailed: 'Could not read this session: ',
       targetsHeading: 'Sessions to delete',
@@ -392,6 +393,7 @@ window.__ModuleLoader__.load({
       statsSchedules: 'Bound reminders',
       deferWarning: 'These sessions are in use and cannot be deleted right away. Confirming stops them first (running work is interrupted and their active reminders are deleted) and archives them; their content is deleted the next time dsh starts. Until then you can cancel from the plugin settings page.',
       liveTargets: 'In use:',
+      inUseTag: 'in use',
       confirmDefer: 'Stop and delete on restart',
       alreadyPending: 'This session is already waiting to be deleted; retry or cancel it under "Pending deletions" on the plugin settings page.',
       toastDeferred: 'Stopped and archived {count} session(s); they will be deleted the next time dsh starts. You can cancel from the plugin settings page',
@@ -544,9 +546,12 @@ window.__ModuleLoader__.load({
        * namespace — reading it from the plugin's own context throws
        * "cannot get property ... without inject".
        */
-      const call = async (method, argument) => {
+      // Arguments are passed through exactly: the Client API checks the count
+      // against the descriptor's parameters, so a zero-parameter method called
+      // with one `undefined` is rejected ("expected 0 argument(s), got 1").
+      const call = async (method, ...args) => {
         const namespace = await namespaceOf();
-        const result = await namespace[method](argument);
+        const result = await namespace[method](...args);
         if (result?.ok !== true) throw result?.error ?? new Error('session-purge: the Remote call failed');
         return result.value;
       };
@@ -680,7 +685,7 @@ window.__ModuleLoader__.load({
         role,
         ' — ',
         formatBytes(target.sizeBytes),
-        target.live ? ` · ${t('liveTargets')}${target.sessionId}` : '',
+        target.live ? ` · ${t('inUseTag')}` : '',
       ]);
     }
 
@@ -722,7 +727,11 @@ window.__ModuleLoader__.load({
           blocked === null ? null : h('div', { key: 'live', role: 'alert', style: { color: 'var(--dsw-alias-state-warn-primary)', lineHeight: 1.6 } }, [
             t('deferWarning'),
             h('br'),
-            `${t('liveTargets')} ${blocked.sessionIds.join(', ')}`,
+            // Titles, not ids: the operator recognises sessions by name.
+            `${t('liveTargets')} ${blocked.sessionIds.map((id) => {
+              const target = inspection?.targets?.find((entry) => entry.sessionId === id);
+              return target === undefined || target.title === '' ? id : target.title;
+            }).join('、')}`,
           ]),
           request.phase === 'loading' ? h('div', { key: 'loading', role: 'status' }, t('dialogLoading')) : null,
           request.phase === 'error' ? h('div', { key: 'error', role: 'alert', style: { color: 'var(--dsw-alias-state-error-primary)' } }, `${t('dialogFailed')}${String(request.error)}`) : null,
