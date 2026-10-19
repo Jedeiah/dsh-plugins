@@ -310,7 +310,7 @@ window.__ModuleLoader__.load({
        * @param startsAt - context time of the strike.
        * @param volume - the configured volume.
        */
-      function strike(audio, voice, frequency, startsAt, volume) {
+      function strike(audio, voice, frequency, startsAt, volume, sources) {
         const nyquist = (audio.sampleRate || 48000) * 0.45;
         const partials = voice.partials.filter(([ratio]) => frequency * ratio < nyquist);
         // Partials add up in power, not in amplitude: scale by the root of the sum
@@ -349,9 +349,11 @@ window.__ModuleLoader__.load({
             depth.connect(oscillator.frequency);
             modulator.start(startsAt);
             modulator.stop(endsAt);
+            sources.push(modulator);
           }
           oscillator.start(startsAt);
           oscillator.stop(endsAt);
+          sources.push(oscillator);
           lastsUntil = Math.max(lastsUntil, endsAt);
         });
         return lastsUntil;
@@ -388,9 +390,28 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * Play one chime.
+       * @param reason - `finished` or `interaction`.
+       * @param settings - the projected settings (tones, voice, waveform, volume).
+       * @returns `{ durationMs, stop }`: how long the chime sounds, tail included,
+       *   and a function that silences it now (the settings page cuts one preview
+       *   off when the next starts).
+       */
       function ring(reason, settings) {
+        const silent = { durationMs: 0, stop: () => {} };
         const audio = ensure();
-        if (audio === null) return;
+        if (audio === null) return silent;
+        const sources = [];
+        const stop = () => {
+          for (const source of sources) {
+            try {
+              source.stop();
+            } catch {
+              /* already stopped */
+            }
+          }
+        };
         const tones = settings.tones?.[reason] ?? PATTERNS[reason] ?? PATTERNS.finished;
         const volume = settings.volume;
         const waveform = WAVEFORMS.includes(settings.waveform) ? settings.waveform : DEFAULTS.waveform;
@@ -399,8 +420,9 @@ window.__ModuleLoader__.load({
         if (voice !== null) {
           // The pattern's durations space the strikes; each strike rings for as
           // long as its voice does.
-          for (const tone of tones) strike(audio, voice, tone.frequency, base + tone.offsetMs / 1000, volume);
-          return;
+          let until = base;
+          for (const tone of tones) until = Math.max(until, strike(audio, voice, tone.frequency, base + tone.offsetMs / 1000, volume, sources));
+          return { durationMs: Math.round((until - base) * 1000), stop };
         }
         for (const tone of tones) {
           const startsAt = base + tone.offsetMs / 1000;
@@ -416,7 +438,10 @@ window.__ModuleLoader__.load({
           gain.connect(limiter ?? audio.destination);
           oscillator.start(startsAt);
           oscillator.stop(endsAt + 0.02);
+          sources.push(oscillator);
         }
+        const last = tones.at(-1);
+        return { durationMs: last === undefined ? 0 : last.offsetMs + last.durationMs + 30, stop };
       }
 
       return { ensure, ring };
@@ -701,11 +726,13 @@ const en = {
   summary: 'Chimes when a turn finishes or the agent waits for you.',
   pageIntro: 'Changes apply immediately.',
   groupWhen: 'When it rings',
-  groupHow: 'How it rings',
-  groupTones: 'Chimes',
-  groupRepeat: 'Repeats',
+  groupHow: 'Volume and repeats',
+  groupTones: 'Chime',
   tone: 'Chime set',
-  toneHint: 'Picking a set plays it right away.',
+  toneHint: 'Picking a set plays it right away; Preview plays both chimes in turn.',
+  customHint: 'Voice, waveform and both melodies. Picking any set above replaces them.',
+  waveformClassicOnly: 'Only the classic voice uses a waveform.',
+  stopPreview: 'Stop',
   tone_musicBox: 'Music box',
   tone_marimba: 'Marimba',
   tone_kalimba: 'Kalimba',
@@ -761,11 +788,13 @@ const zh = {
   summary: '答完一轮、或停下来等你操作时响铃。',
   pageIntro: '改完立即生效。',
   groupWhen: '什么时候响',
-  groupHow: '怎么响',
-  groupTones: '音调',
-  groupRepeat: '重复',
+  groupHow: '音量与重复',
+  groupTones: '铃声',
   tone: '提示音',
-  toneHint: '换一套会立刻试听。',
+  toneHint: '换一套会立刻试听；「试听」把两段依次播一遍。',
+  customHint: '音色、波形和两段旋律。在上面选任意一套会覆盖这里的设置。',
+  waveformClassicOnly: '只有「经典」音色用到波形。',
+  stopPreview: '停止',
   tone_musicBox: '音乐盒',
   tone_marimba: '马林巴',
   tone_kalimba: '拇指琴',
@@ -877,6 +906,8 @@ const STYLE = Object.freeze({
       /** Two columns while there is room, one when the panel narrows. */
       grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 },
       field: { display: 'flex', flexDirection: 'column', gap: 6 },
+      /** The custom panel: set off from the picker it belongs to, never floating. */
+      panel: { display: 'flex', flexDirection: 'column', gap: 14, padding: '12px 14px', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8 },
       label: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
       hint: { fontSize: 12, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' },
       row: { display: 'flex', gap: 8, alignItems: 'center' },
@@ -937,7 +968,10 @@ const STYLE = Object.freeze({
      */
     function toneSetOf(settings) {
       const voice = settings.voice ?? DEFAULTS.voice;
-      const found = TONE_SETS.find((set) => set.voice === voice && set.finished === settings.finishedPattern && set.interaction === settings.interactionPattern);
+      // A classic set is played in a sine wave; the same melody in a square wave is
+      // a different sound, so it is custom — otherwise the name would lie.
+      const waveformOk = (set) => set.voice !== 'classic' || (settings.waveform ?? DEFAULTS.waveform) === 'sine';
+      const found = TONE_SETS.find((set) => set.voice === voice && waveformOk(set) && set.finished === settings.finishedPattern && set.interaction === settings.interactionPattern);
       return found === undefined ? 'custom' : found.key;
     }
 
@@ -1056,18 +1090,19 @@ const STYLE = Object.freeze({
     }
 
     /**
-     * The chime-set picker: one menu that names the current set, plus the button
-     * that plays it. Choosing a set writes both patterns and previews the result,
-     * so the effect of a choice is audible before the menu is reopened.
-     * @param props - t, the current set key, disabled, and the pick/preview callbacks.
+     * A labelled menu button: names the current choice, opens a checked list.
+     * A real component, not a helper called during render: it keeps its own open
+     * state, and the custom panel mounts and unmounts it — a hook in a plain
+     * function call would shift the page's hook order when that happens.
+     * @param props - label, current label, items, selected id, disabled, onSelect,
+     *   an optional `trailing` element beside the button, and an optional hint.
      * @returns the field element.
      */
-    function tonePicker(props) {
-      const { t, active, disabled, onPick, onPreview, playing } = props;
+    function ChoiceMenu(props) {
+      const { label, current, items, selectedId, disabled, onSelect, trailing, hint } = props;
       const [open, setOpen] = React.useState(false);
-      const labelKey = active === 'custom' ? 'tone_custom' : `tone_${active}`;
       return h('div', { style: LAYOUT.field }, [
-        h('label', { key: 'label', style: LAYOUT.label }, t('tone')),
+        h('label', { key: 'label', style: LAYOUT.label }, label),
         h('div', { key: 'row', style: LAYOUT.row }, [
           h(primitives.Menu, {
             key: 'menu',
@@ -1083,61 +1118,19 @@ const STYLE = Object.freeze({
             }, h('span', {
               key: 'face',
               style: { display: 'inline-flex', alignItems: 'center', gap: 6 },
-            }, [t(labelKey), h(primitives.IconChevronDownOutlineRegular, { key: 'chevron' })])),
+            }, [current, h(primitives.IconChevronDownOutlineRegular, { key: 'chevron' })])),
             onClose: () => setOpen(false),
-            items: TONE_SETS.map((set) => ({ id: set.key, label: t(`tone_${set.key}`) })).concat([{ id: 'custom', label: t('tone_custom') }]),
-            selectedId: active,
+            items,
+            selectedId,
             selection: 'check',
             onSelect: (id) => {
               setOpen(false);
-              onPick(id);
+              onSelect(id);
             },
           }),
-          h(primitives.Button, {
-            key: 'preview',
-            variant: 'ghost',
-            disabled,
-            onClick: onPreview,
-          }, playing ? t('playing') : t('preview')),
+          trailing ?? null,
         ]),
-        h('span', { key: 'hint', style: LAYOUT.hint }, t('toneHint')),
-      ]);
-    }
-
-    /**
-     * The voice picker: a menu of instruments. Choosing one writes it and plays
-     * the "done" chime in it.
-     * @param props - t, the current voice, disabled, and the pick callback.
-     * @returns the field element.
-     */
-    function voicePicker(props) {
-      const { t, active, disabled, onPick } = props;
-      const [open, setOpen] = React.useState(false);
-      return h('div', { style: LAYOUT.field }, [
-        h('label', { key: 'label', style: LAYOUT.label }, t('voice')),
-        h(primitives.Menu, {
-          key: 'menu',
-          open,
-          anchor: h(primitives.Button, {
-            variant: 'outline',
-            disabled,
-            'aria-haspopup': 'menu',
-            'aria-expanded': open,
-            onClick: () => setOpen(true),
-          }, h('span', {
-            key: 'face',
-            style: { display: 'inline-flex', alignItems: 'center', gap: 6 },
-          }, [t(`voice_${active}`), h(primitives.IconChevronDownOutlineRegular, { key: 'chevron' })])),
-          onClose: () => setOpen(false),
-          items: VOICE_KEYS.map((name) => ({ id: name, label: t(`voice_${name}`) })),
-          selectedId: active,
-          selection: 'check',
-          onSelect: (id) => {
-            setOpen(false);
-            onPick(id);
-          },
-        }),
-        h('span', { key: 'hint', style: LAYOUT.hint }, t('voiceHint')),
+        hint === undefined ? null : h('span', { key: 'hint', style: LAYOUT.hint }, hint),
       ]);
     }
 
@@ -1161,15 +1154,7 @@ const STYLE = Object.freeze({
       const [drafts, setDrafts] = React.useState({});
       const [failed, setFailed] = React.useState(false);
       const [playing, setPlaying] = React.useState(null);
-      const playingTimer = React.useRef(null);
-      const playTimer = React.useRef(null);
       const [customOpen, setCustomOpen] = React.useState(false);
-      // A pending timer would otherwise fire into an unmounted tree — and the
-      // "preview both" one would ring a second chime after the page is gone.
-      React.useEffect(() => () => {
-        if (playingTimer.current !== null) window.clearTimeout(playingTimer.current);
-        if (playTimer.current !== null) window.clearTimeout(playTimer.current);
-      }, []);
 
       const write = (field, value) => {
         store.write(field, value).then((ok) => setFailed(ok === false));
@@ -1197,14 +1182,69 @@ const STYLE = Object.freeze({
         write(field, clampInteger(text, min, max, fallback) * scale);
         drop(field);
       };
-      const play = (reason, text, overrides) => {
-        const tones = parsePattern(text, PATTERNS[reason]);
-        // `overrides` lets a control preview its own pending value: the snapshot in
-        // `settings` still carries the old one until the Host writes back.
-        audio.ring(reason, { ...settings, ...overrides, tones: { ...settings.tones, [reason]: tones } });
-        setPlaying(reason);
-        if (playingTimer.current !== null) window.clearTimeout(playingTimer.current);
-        playingTimer.current = window.setTimeout(() => setPlaying(null), 700);
+      // One preview at a time: a new one silences the last, and "playing" lasts
+      // exactly as long as the sound (instrument voices ring for seconds).
+      const preview = React.useRef(null);
+      const stopPreview = () => {
+        const current = preview.current;
+        preview.current = null;
+        if (current === null) return;
+        current.stop();
+        for (const timer of current.timers) window.clearTimeout(timer);
+      };
+      React.useEffect(() => () => stopPreview(), []);
+      /**
+       * Preview one or both chimes with the page's current values, or with values
+       * a control is about to write (`overrides`): the snapshot still carries the
+       * old ones until the Host writes back.
+       * @param reasons - `['finished']`, `['interaction']` or both, played in order.
+       * @param overrides - settings to preview instead of the stored ones.
+       */
+      const play = (reasons, overrides = {}) => {
+        stopPreview();
+        const merged = { ...settings, ...overrides };
+        const texts = {
+          finished: overrides.finishedPattern ?? finished,
+          interaction: overrides.interactionPattern ?? interaction,
+        };
+        const stops = [];
+        const timers = [];
+        const current = { stop: () => { for (const halt of stops) halt(); }, timers };
+        preview.current = current;
+        let at = 0;
+        reasons.forEach((reason, index) => {
+          const tones = parsePattern(texts[reason], PATTERNS[reason]);
+          const sound = { ...merged, tones: { ...merged.tones, [reason]: tones } };
+          const start = () => {
+            if (preview.current !== current) return;
+            const played = audio.ring(reason, sound);
+            stops.push(played.stop);
+            return played.durationMs;
+          };
+          if (index === 0) {
+            at = start() ?? 0;
+          } else {
+            const gap = at + 250;
+            timers.push(window.setTimeout(() => {
+              const length = start() ?? 0;
+              timers.push(window.setTimeout(() => {
+                if (preview.current === current) {
+                  preview.current = null;
+                  setPlaying(null);
+                }
+              }, length));
+            }, gap));
+          }
+        });
+        setPlaying(reasons.length > 1 ? 'both' : reasons[0]);
+        if (reasons.length === 1) {
+          timers.push(window.setTimeout(() => {
+            if (preview.current === current) {
+              preview.current = null;
+              setPlaying(null);
+            }
+          }, at));
+        }
       };
       const disabled = settings.writable !== true;
       const finished = draftOf('finishedPattern', settings.finishedPattern);
@@ -1212,9 +1252,9 @@ const STYLE = Object.freeze({
       const finishedOk = parsePattern(finished, null) !== null;
       const interactionOk = parsePattern(interaction, null) !== null;
       const toneSet = toneSetOf(settings);
-      // A pair that matches no set is by definition custom, so the editor stays
-      // open until the person picks a set again.
-      const editingTones = toneSet === 'custom' || customOpen;
+      // "Custom" is shown when the person asked for it or when the stored sound
+      // matches no set; the panel is where voice, waveform and melodies live.
+      const custom = customOpen || toneSet === 'custom';
       const pickToneSet = (key) => {
         const set = TONE_SETS.find((candidate) => candidate.key === key);
         if (set === undefined) {
@@ -1222,11 +1262,28 @@ const STYLE = Object.freeze({
           return;
         }
         setCustomOpen(false);
-        // One batch, not two writes: the pair is a single choice, and two calls in
-        // one tick would race each other's revision.
-        store.writeAll({ voice: set.voice, finishedPattern: set.finished, interactionPattern: set.interaction });
-        play('finished', set.finished, { voice: set.voice, finishedPattern: set.finished, interactionPattern: set.interaction });
+        // One batch: a set is a single choice, and separate writes in one tick
+        // would race each other's revision. A classic set also fixes its waveform,
+        // so the set's name always means one sound.
+        const fields = { voice: set.voice, finishedPattern: set.finished, interactionPattern: set.interaction };
+        if (set.voice === 'classic') fields.waveform = 'sine';
+        store.writeAll(fields);
+        drop('finishedPattern');
+        drop('interactionPattern');
+        play(['finished'], fields);
       };
+      // The slider previews and writes once, when it is let go: writing on every
+      // step of a drag would rewrite the profile dozens of times.
+      const volume = draftOf('volume', settings.volume);
+      const commitVolume = () => {
+        const next = drafts.volume;
+        if (next === undefined) return;
+        drop('volume');
+        if (next === settings.volume) return;
+        write('volume', next);
+        play(['finished'], { volume: next });
+      };
+      const isClassic = settings.voice === 'classic';
 
       return h('div', { style: LAYOUT.page }, [
         section('when', t('groupWhen'), [
@@ -1234,11 +1291,95 @@ const STYLE = Object.freeze({
           switchRow('waiting', t('waitingLabel'), settings.notifyOnWaiting, disabled, (next) => write('notifyOnWaiting', next)),
           switchRow('mute', t('muteLabel'), settings.muted, disabled, (next) => write('muted', next), t('muteHint')),
         ]),
-        section('how', t('groupHow'), [h('div', { key: 'grid', style: LAYOUT.grid }, [
-          h('div', { key: 'volume', style: LAYOUT.field }, [
+        section('tones', t('groupTones'), [
+          h(ChoiceMenu, {
+            key: 'picker',
+            label: t('tone'),
+            current: custom ? t('tone_custom') : t(`tone_${toneSet}`),
+            items: TONE_SETS.map((set) => ({ id: set.key, label: t(`tone_${set.key}`) })).concat([{ id: 'custom', label: t('tone_custom') }]),
+            selectedId: custom ? 'custom' : toneSet,
+            disabled,
+            onSelect: pickToneSet,
+            hint: t('toneHint'),
+            trailing: h(primitives.Button, {
+              key: 'preview',
+              variant: 'outline',
+              disabled: disabled || !finishedOk || !interactionOk,
+              onClick: () => (playing === 'both' ? (stopPreview(), setPlaying(null)) : play(['finished', 'interaction'])),
+            }, playing === 'both' ? t('stopPreview') : t('preview')),
+          }),
+          custom ? h('div', { key: 'custom', style: LAYOUT.panel }, [
+            h('span', { key: 'intro', style: LAYOUT.hint }, t('customHint')),
+            h('div', { key: 'sound', style: LAYOUT.grid }, [
+              h(ChoiceMenu, {
+                key: 'voice',
+                label: t('voice'),
+                current: t(`voice_${settings.voice}`),
+                items: VOICE_KEYS.map((name) => ({ id: name, label: t(`voice_${name}`) })),
+                selectedId: settings.voice,
+                disabled,
+                onSelect: (next) => {
+                  write('voice', next);
+                  play(['finished'], { voice: next });
+                },
+                hint: t('voiceHint'),
+              }),
+              h('div', { key: 'waveform', style: LAYOUT.field }, [
+                h('label', { key: 'label', style: LAYOUT.label }, t('waveform')),
+                h(primitives.SegmentedControl, {
+                  key: 'control',
+                  id: `${BUNDLE_NAME}-waveform`,
+                  label: t('waveform'),
+                  value: settings.waveform,
+                  // Kept in place for every voice so the panel never jumps; only the
+                  // classic voice is played with it.
+                  disabled: disabled || !isClassic,
+                  options: WAVEFORMS.map((name) => ({ value: name, label: t(`waveform_${name}`) })),
+                  onChange: (next) => {
+                    write('waveform', next);
+                    play(['finished'], { waveform: next });
+                  },
+                }),
+                h('span', { key: 'hint', style: LAYOUT.hint }, isClassic ? t('waveformHint') : t('waveformClassicOnly')),
+              ]),
+            ]),
+            h('div', { key: 'melodies', style: LAYOUT.grid }, [
+              patternRow({
+                key: 'finished',
+                t,
+                label: t('finishedPattern'),
+                hint: t('finishedPatternHint'),
+                value: finished,
+                disabled,
+                invalid: !finishedOk,
+                playing: playing === 'finished',
+                onEdit: (text) => edit('finishedPattern', text),
+                onCommit: () => commit('finishedPattern'),
+                onPreview: () => play(['finished']),
+              }),
+              patternRow({
+                key: 'interaction',
+                t,
+                label: t('interactionPattern'),
+                hint: t('interactionPatternHint'),
+                value: interaction,
+                disabled,
+                invalid: !interactionOk,
+                playing: playing === 'interaction',
+                onEdit: (text) => edit('interactionPattern', text),
+                onCommit: () => commit('interactionPattern'),
+                onPreview: () => play(['interaction']),
+              }),
+            ]),
+          ]) : null,
+        ]),
+        section('how', t('groupHow'), [
+          // Capped like the other fields: a slider across the whole page puts the
+          // value a screen away from its label.
+          h('div', { key: 'volume', style: { ...LAYOUT.field, maxWidth: 520 } }, [
             h('div', { key: 'head', style: LAYOUT.row }, [
               h('label', { key: 'label', style: { ...LAYOUT.label, flex: 1 } }, t('volume')),
-              h('span', { key: 'value', style: LAYOUT.value }, settings.volume.toFixed(2)),
+              h('span', { key: 'value', style: LAYOUT.value }, Number(volume).toFixed(2)),
             ]),
             h('input', {
               key: 'slider',
@@ -1246,84 +1387,16 @@ const STYLE = Object.freeze({
               min: 0,
               max: 2,
               step: 0.05,
-              value: settings.volume,
+              value: volume,
               disabled,
-              onChange: (event) => write('volume', Number(event.target.value)),
+              onChange: (event) => edit('volume', Number(event.target.value)),
+              onPointerUp: commitVolume,
+              onKeyUp: commitVolume,
+              onBlur: commitVolume,
               style: { width: '100%' },
             }),
             h('span', { key: 'hint', style: LAYOUT.hint }, t('volumeHint')),
           ]),
-          voicePicker({
-            key: 'voice',
-            t,
-            active: settings.voice,
-            disabled,
-            onPick: (next) => {
-              write('voice', next);
-              play('finished', finished, { voice: next });
-            },
-          }),
-          settings.voice !== 'classic' ? null : h('div', { key: 'waveform', style: LAYOUT.field }, [
-            h('label', { key: 'label', style: LAYOUT.label }, t('waveform')),
-            h(primitives.SegmentedControl, {
-              key: 'control',
-              id: `${BUNDLE_NAME}-waveform`,
-              label: t('waveform'),
-              value: settings.waveform,
-              disabled,
-              options: WAVEFORMS.map((name) => ({ value: name, label: t(`waveform_${name}`) })),
-              onChange: (next) => {
-                write('waveform', next);
-                play('finished', finished, { waveform: next });
-              },
-            }),
-            h('span', { key: 'hint', style: LAYOUT.hint }, t('waveformHint')),
-          ]),
-        ])]),
-        section('tones', t('groupTones'), [
-          tonePicker({
-            key: 'picker',
-            t,
-            active: toneSet,
-            disabled,
-            playing: playing !== null,
-            onPick: pickToneSet,
-            onPreview: () => {
-              if (finishedOk) play('finished', finished);
-              if (playTimer.current !== null) window.clearTimeout(playTimer.current);
-              if (interactionOk) playTimer.current = window.setTimeout(() => play('interaction', interaction), 520);
-            },
-          }),
-          editingTones ? h('div', { key: 'grid', style: LAYOUT.grid }, [
-            patternRow({
-              key: 'finished',
-              t,
-              label: t('finishedPattern'),
-              hint: t('finishedPatternHint'),
-              value: finished,
-              disabled,
-              invalid: !finishedOk,
-              playing: playing === 'finished',
-              onEdit: (text) => edit('finishedPattern', text),
-              onCommit: () => commit('finishedPattern'),
-              onPreview: () => play('finished', finished),
-            }),
-            patternRow({
-              key: 'interaction',
-              t,
-              label: t('interactionPattern'),
-              hint: t('interactionPatternHint'),
-              value: interaction,
-              disabled,
-              invalid: !interactionOk,
-              playing: playing === 'interaction',
-              onEdit: (text) => edit('interactionPattern', text),
-              onCommit: () => commit('interactionPattern'),
-              onPreview: () => play('interaction', interaction),
-            }),
-          ]) : null,
-        ]),
-        section('repeat', t('groupRepeat'), [
           h('div', { key: 'grid', style: LAYOUT.grid }, [
             numberRow({
               key: 'count',

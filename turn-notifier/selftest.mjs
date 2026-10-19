@@ -655,6 +655,179 @@ console.log('\nPart C — the client half watches every session');
     story.errors.join(' | '));
 }
 
+
+console.log('\nPart D — the settings page: chime picker, custom panel, preview, volume');
+/**
+ * Render the row's settings page the way the Plugins page does, against a form
+ * that records every write and echoes it back as the next revision.
+ * @param value - the stored settings.
+ * @returns controls to find elements, act on them and read what happened.
+ */
+async function pageStory(value) {
+  const client = await bootClient();
+  client.gates[0]?.callback(client.ctx);
+  const entry = client.entries.find((candidate) => candidate.options.name === 'plugins.row.config');
+  const writes = [];
+  let stored = { ...value };
+  const form = {
+    state: { status: 'ready', writable: true, value: stored, user: {} },
+    mutate: (ops) => {
+      writes.push(ops);
+      for (const op of ops) if (op.op === 'set') stored = { ...stored, [op.path[0]]: op.value };
+      form.state = { ...form.state, value: stored };
+      return Promise.resolve(true);
+    },
+  };
+  const t = (key, values) => (values === undefined ? key : `${key}${JSON.stringify(values)}`);
+  const injected = entry.options.inject?.() ?? {};
+  let tree;
+  const outer = () => entry.component({ t, view: 'page', form, ...injected });
+  const groupsElement = () => walk(outer()).find((node) => typeof node.type === 'function');
+  const Groups = groupsElement().type;
+  const view = client.mount((props) => { tree = Groups(props); return tree; }, groupsElement().props);
+  const settle = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    view.render(groupsElement().props);
+  };
+  return {
+    client,
+    writes,
+    stored: () => stored,
+    nodes: () => walk(tree),
+    /** The ChoiceMenu element whose label is `labelKey`. */
+    menu: (labelKey) => walk(tree).find((node) => node.props?.label === labelKey && Array.isArray(node.props?.items)),
+    /** The button whose text is one of `texts`. */
+    button: (...texts) => walk(tree).find((node) => kindOf(node) === 'Button' && texts.includes(textOf(node))),
+    slider: () => walk(tree).find((node) => node.type === 'input' && node.props?.type === 'range'),
+    rerender: () => view.render(groupsElement().props),
+    settle,
+    unmount: () => view.unmount(),
+  };
+}
+/** Every element of a rendered tree, depth first. */
+function walk(node, out = []) {
+  if (Array.isArray(node)) { for (const child of node) walk(child, out); return out; }
+  if (node === null || typeof node !== 'object') return out;
+  out.push(node);
+  walk(node.props?.children, out);
+  walk(node.children, out);
+  if (node.props?.trailing !== undefined) walk(node.props.trailing, out);
+  return out;
+}
+/**
+ * What an element is: a host tag, a named component (`ChoiceMenu`), or — for the
+ * stub primitives, which are anonymous — the name the stub stamps on its output.
+ */
+function kindOf(node) {
+  if (typeof node?.type === 'string') return node.type;
+  if (typeof node?.type !== 'function') return undefined;
+  if (node.type.name !== '') return node.type.name;
+  try {
+    return node.type(node.props)?.type;
+  } catch {
+    return undefined;
+  }
+}
+/** The text inside an element. */
+function textOf(node) {
+  if (node === null || node === undefined || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join('');
+  return textOf(node.props?.children) + textOf(node.children);
+}
+const DOORBELL = { voice: 'bell', waveform: 'square', volume: 2, finishedPattern: '783.99:480, 523.25:900', interactionPattern: '659.25:320, 783.99:320, 880:900' };
+{
+  const page = await pageStory(DOORBELL);
+  const picker = page.menu('tone');
+  check('a stored preset shows its name, with the custom panel closed',
+    picker?.props.current === 'tone_doorbell' && page.menu('voice') === undefined, String(picker?.props.current));
+  check('the waveform of a non-classic preset does not make it "custom"', picker?.props.selectedId === 'doorbell');
+
+  picker.props.onSelect('custom');
+  page.rerender();
+  check('choosing Custom opens the panel without writing anything',
+    page.menu('voice') !== undefined && page.menu('tone')?.props.current === 'tone_custom' && page.writes.length === 0,
+    JSON.stringify(page.writes));
+  const waveform = page.nodes().find((node) => kindOf(node) === 'SegmentedControl');
+  check('the waveform control stays in place, disabled for a non-classic voice', waveform?.props.disabled === true);
+
+  const ringsBefore = page.client.rings.length;
+  page.menu('voice').props.onSelect('marimba');
+  await page.settle();
+  check('changing the voice writes only the voice and previews it',
+    JSON.stringify(page.writes.at(-1)) === JSON.stringify([{ op: 'set', path: ['voice'], value: 'marimba' }]) && page.client.rings.length === ringsBefore + 1,
+    JSON.stringify(page.writes));
+  check('after a voice change the panel stays open and the picker says Custom — nothing jumps',
+    page.menu('voice')?.props.current === 'voice_marimba' && page.menu('tone')?.props.current === 'tone_custom');
+
+  page.menu('tone').props.onSelect('bright');
+  await page.settle();
+  const fields = Object.fromEntries(page.writes.at(-1).map((op) => [op.path[0], op.value]));
+  check('picking a classic preset writes voice, waveform and both melodies in one batch',
+    fields.voice === 'classic' && fields.waveform === 'sine' && fields.finishedPattern === '880:170, 1318.5:300' && Object.keys(fields).length === 4,
+    JSON.stringify(fields));
+  check('picking a preset closes the panel and names the preset',
+    page.menu('voice') === undefined && page.menu('tone')?.props.current === 'tone_bright');
+}
+{
+  // A classic set played with another waveform is not that set any more.
+  const page = await pageStory({ voice: 'classic', waveform: 'square', finishedPattern: '880:170, 1318.5:300', interactionPattern: '1046.5:140, 1318.5:140, 1046.5:200' });
+  check('a classic set with a non-sine waveform shows as Custom with the panel open',
+    page.menu('tone')?.props.current === 'tone_custom' && page.menu('voice') !== undefined);
+  check('the waveform control is live for the classic voice',
+    page.nodes().find((node) => kindOf(node) === 'SegmentedControl')?.props.disabled === false);
+}
+{
+  // Preview both: the waiting chime starts after the finished one has rung out,
+  // not at a fixed half second, and the button reads Stop for the whole time.
+  const page = await pageStory({ voice: 'bowl', finishedPattern: '440:1600', interactionPattern: '587.33:700, 587.33:1400' });
+  const start = page.client.rings.length;
+  page.button('preview').props.onClick();
+  page.rerender();
+  check('Preview plays the finished chime at once and turns into Stop',
+    page.client.rings.length === start + 1 && page.button('stopPreview') !== undefined);
+  page.client.advance(1500);
+  page.rerender();
+  check('the waiting chime does not start while the first still rings', page.client.rings.length === start + 1, String(page.client.rings.length - start));
+  page.client.advance(6000);
+  page.rerender();
+  check('the waiting chime follows once the first has rung out', page.client.rings.length === start + 2, String(page.client.rings.length - start));
+  page.client.advance(10000);
+  page.rerender();
+  check('the button reads Preview again once the sound has ended', page.button('preview') !== undefined && page.button('stopPreview') === undefined);
+
+  page.button('preview').props.onClick();
+  page.rerender();
+  page.button('stopPreview').props.onClick();
+  page.rerender();
+  page.client.advance(20000);
+  check('Stop cancels the waiting chime still to come', page.client.rings.length === start + 3, String(page.client.rings.length - start));
+
+  page.button('preview').props.onClick();
+  page.unmount();
+  page.client.advance(20000);
+  check('leaving the page cancels a preview in progress', page.client.rings.length === start + 4, String(page.client.rings.length - start));
+}
+{
+  const page = await pageStory({ volume: 1 });
+  const start = page.client.rings.length;
+  for (const step of [1.1, 1.2, 1.3, 1.4]) {
+    page.slider().props.onChange({ target: { value: String(step) } });
+    page.rerender();
+  }
+  check('dragging the volume slider writes nothing and plays nothing yet',
+    page.writes.length === 0 && page.client.rings.length === start && page.slider().props.value === 1.4);
+  page.slider().props.onPointerUp();
+  await page.settle();
+  check('letting go writes the volume once and previews it',
+    JSON.stringify(page.writes) === JSON.stringify([[{ op: 'set', path: ['volume'], value: 1.4 }]]) && page.client.rings.length === start + 1,
+    JSON.stringify(page.writes));
+  page.slider().props.onBlur();
+  await page.settle();
+  check('a release without a change writes nothing more', page.writes.length === 1);
+}
+
 const app = appDirectory();
 if (!existsSync(app)) {
   console.log(`\nskip — no dsh installation at ${app} (pass --app <path>)`);
