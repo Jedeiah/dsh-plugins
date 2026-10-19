@@ -54,12 +54,46 @@ const DEFAULTS = Object.freeze({
   intervalMs: 5000,
   volume: 1,
   waveform: 'sine',
+  voice: 'classic',
   finishedPattern: '880:170, 1318.5:300',
   interactionPattern: '1046.5:140, 1318.5:140, 1046.5:200',
 });
 
 /** Oscillator waveforms the Host schema accepts. */
 const WAVEFORMS = Object.freeze(['sine', 'square', 'triangle']);
+
+/**
+ * Voices: how one note sounds.
+ *
+ * `classic` is the original single oscillator in the chosen waveform, cut off at
+ * the end of its note. Every other voice is additive: partials at a ratio of the
+ * note's frequency, each with its own level and decay (seconds until it is
+ * inaudible), so a note keeps ringing after the next one starts, the way a struck
+ * bar or bell does. That ring-out, the inharmonic partials of bars and bells, and
+ * a short room tail (`reverb`, the send level) are what make these sound like
+ * instruments rather than beeps. `fm` adds a decaying frequency modulation to the
+ * first partial — the bright attack of an electric-piano tine.
+ *
+ * Partial ratios follow the instruments' measured modes: a marimba bar's second
+ * mode sits near 3.93×, a kalimba tine's near 6.3×, a tubular bell has its hum an
+ * octave below the strike tone plus a minor third (1.19×) and a fifth (1.5×), a
+ * singing bowl beats between two nearly equal modes.
+ */
+const VOICES = Object.freeze({
+  classic: null,
+  musicBox: Object.freeze({ attack: 0.002, reverb: 0.25, partials: [[1, 1, 1.4], [2, 0.18, 0.5], [5.4, 0.08, 0.12]] }),
+  marimba: Object.freeze({ attack: 0.003, reverb: 0.2, partials: [[1, 1, 0.55], [3.93, 0.3, 0.14], [9.2, 0.08, 0.05]] }),
+  kalimba: Object.freeze({ attack: 0.002, reverb: 0.22, partials: [[1, 1, 1.1], [2, 0.08, 0.35], [6.27, 0.16, 0.07]] }),
+  electricPiano: Object.freeze({ attack: 0.004, reverb: 0.22, fm: Object.freeze({ ratio: 1, index: 2.2, decay: 0.35 }), partials: [[1, 1, 1.6], [14, 0.03, 0.08]] }),
+  bell: Object.freeze({ attack: 0.002, reverb: 0.3, partials: [[0.5, 0.3, 3.2], [1, 1, 2.4], [1.19, 0.4, 1.8], [1.5, 0.32, 1.5], [2, 0.36, 1.3], [2.52, 0.2, 0.9], [3.01, 0.14, 0.7], [4.07, 0.08, 0.4]] }),
+  bowl: Object.freeze({ attack: 0.03, reverb: 0.35, partials: [[1, 1, 4.5], [1.004, 0.7, 4.5], [2.71, 0.35, 2.8], [5.15, 0.12, 1.4]] }),
+});
+
+/** Voice names, in menu order; the Host schema accepts exactly these. */
+const VOICE_KEYS = Object.freeze(Object.keys(VOICES));
+
+/** Length of the generated room tail every non-classic voice sends into. */
+const REVERB_SECONDS = 1.8;
 
 /** Duration assumed for a tone written without one. */
 const DEFAULT_TONE_MS = 200;
@@ -172,6 +206,7 @@ window.__ModuleLoader__.load({
         intervalMs: clampInteger(value.intervalMs, 1000, 60000, DEFAULTS.intervalMs),
         volume: Math.min(2, Math.max(0, Number.isFinite(value.volume) ? value.volume : DEFAULTS.volume)),
         waveform: WAVEFORMS.includes(value.waveform) ? value.waveform : DEFAULTS.waveform,
+        voice: VOICE_KEYS.includes(value.voice) ? value.voice : DEFAULTS.voice,
         finishedPattern,
         interactionPattern,
         tones: {
@@ -186,6 +221,7 @@ window.__ModuleLoader__.load({
           intervalMs: user?.intervalMs !== undefined,
           volume: user?.volume !== undefined,
           waveform: user?.waveform !== undefined,
+          voice: user?.voice !== undefined,
           finishedPattern: user?.finishedPattern !== undefined,
           interactionPattern: user?.interactionPattern !== undefined,
         },
@@ -238,6 +274,88 @@ window.__ModuleLoader__.load({
     function createAudio() {
       let context = null;
       let limiter = null;
+      // The room tail: one convolver over a generated impulse (decaying stereo
+      // noise), shared by every note. `undefined` = not built yet, `null` = this
+      // context cannot do it, and the voices play dry.
+      let reverb;
+
+      function ensureReverb(audio) {
+        if (reverb !== undefined) return reverb;
+        reverb = null;
+        try {
+          if (typeof audio.createConvolver !== 'function' || typeof audio.createBuffer !== 'function') return reverb;
+          const rate = audio.sampleRate || 48000;
+          const length = Math.floor(rate * REVERB_SECONDS);
+          const impulse = audio.createBuffer(2, length, rate);
+          for (let channel = 0; channel < 2; channel += 1) {
+            const data = impulse.getChannelData(channel);
+            for (let i = 0; i < length; i += 1) data[i] = (Math.random() * 2 - 1) * Math.exp(-3.5 * (i / rate));
+          }
+          const convolver = audio.createConvolver();
+          convolver.buffer = impulse;
+          convolver.connect(limiter ?? audio.destination);
+          reverb = convolver;
+        } catch {
+          reverb = null;
+        }
+        return reverb;
+      }
+
+      /**
+       * Play one note in an additive voice. Partials above the audible band of
+       * this context are skipped instead of aliasing.
+       * @param audio - the context.
+       * @param voice - a {@link VOICES} entry.
+       * @param frequency - the note.
+       * @param startsAt - context time of the strike.
+       * @param volume - the configured volume.
+       */
+      function strike(audio, voice, frequency, startsAt, volume) {
+        const nyquist = (audio.sampleRate || 48000) * 0.45;
+        const partials = voice.partials.filter(([ratio]) => frequency * ratio < nyquist);
+        // Partials add up in power, not in amplitude: scale by the root of the sum
+        // of squares so every voice peaks near the classic one at the same volume.
+        const norm = Math.sqrt(partials.reduce((sum, [, level]) => sum + level * level, 0)) || 1;
+        const bus = audio.createGain();
+        bus.connect(limiter ?? audio.destination);
+        const room = ensureReverb(audio);
+        if (room !== null) {
+          const send = audio.createGain();
+          send.gain.setValueAtTime(voice.reverb, startsAt);
+          bus.connect(send);
+          send.connect(room);
+        }
+        let lastsUntil = startsAt;
+        partials.forEach(([ratio, level, decay], index) => {
+          const oscillator = audio.createOscillator();
+          const gain = audio.createGain();
+          oscillator.type = 'sine';
+          oscillator.frequency.setValueAtTime(frequency * ratio, startsAt);
+          const peak = Math.max(0.0002, (volume * level) / norm);
+          gain.gain.setValueAtTime(0, startsAt);
+          gain.gain.linearRampToValueAtTime(peak, startsAt + voice.attack);
+          gain.gain.exponentialRampToValueAtTime(0.0001, startsAt + voice.attack + decay);
+          oscillator.connect(gain);
+          gain.connect(bus);
+          const endsAt = startsAt + voice.attack + decay + 0.05;
+          if (index === 0 && voice.fm !== undefined) {
+            const modulator = audio.createOscillator();
+            const depth = audio.createGain();
+            modulator.type = 'sine';
+            modulator.frequency.setValueAtTime(frequency * voice.fm.ratio, startsAt);
+            depth.gain.setValueAtTime(frequency * voice.fm.index, startsAt);
+            depth.gain.exponentialRampToValueAtTime(Math.max(0.01, frequency * 0.01), startsAt + voice.fm.decay);
+            modulator.connect(depth);
+            depth.connect(oscillator.frequency);
+            modulator.start(startsAt);
+            modulator.stop(endsAt);
+          }
+          oscillator.start(startsAt);
+          oscillator.stop(endsAt);
+          lastsUntil = Math.max(lastsUntil, endsAt);
+        });
+        return lastsUntil;
+      }
 
       function ensure() {
         try {
@@ -277,6 +395,13 @@ window.__ModuleLoader__.load({
         const volume = settings.volume;
         const waveform = WAVEFORMS.includes(settings.waveform) ? settings.waveform : DEFAULTS.waveform;
         const base = audio.currentTime + 0.01;
+        const voice = VOICES[settings.voice] ?? null;
+        if (voice !== null) {
+          // The pattern's durations space the strikes; each strike rings for as
+          // long as its voice does.
+          for (const tone of tones) strike(audio, voice, tone.frequency, base + tone.offsetMs / 1000, volume);
+          return;
+        }
         for (const tone of tones) {
           const startsAt = base + tone.offsetMs / 1000;
           const endsAt = startsAt + tone.durationMs / 1000;
@@ -531,6 +656,7 @@ window.__ModuleLoader__.load({
       intervalMs: DEFAULTS.intervalMs,
       volume: DEFAULTS.volume,
       waveform: DEFAULTS.waveform,
+      voice: DEFAULTS.voice,
       finishedPattern: DEFAULTS.finishedPattern,
       interactionPattern: DEFAULTS.interactionPattern,
       overridden: Object.freeze({
@@ -541,6 +667,7 @@ window.__ModuleLoader__.load({
         intervalMs: false,
         volume: false,
         waveform: false,
+        voice: false,
         finishedPattern: false,
         interactionPattern: false,
       }),
@@ -579,10 +706,25 @@ const en = {
   groupRepeat: 'Repeats',
   tone: 'Chime set',
   toneHint: 'Picking a set plays it right away.',
-  tone_bright: 'Bright',
-  tone_soft: 'Soft',
-  tone_deep: 'Deep',
-  tone_single: 'Single',
+  tone_musicBox: 'Music box',
+  tone_marimba: 'Marimba',
+  tone_kalimba: 'Kalimba',
+  tone_electricPiano: 'Electric piano',
+  tone_doorbell: 'Doorbell',
+  tone_bowl: 'Singing bowl',
+  tone_bright: 'Classic \u00b7 bright',
+  tone_soft: 'Classic \u00b7 soft',
+  tone_deep: 'Classic \u00b7 deep',
+  tone_single: 'Classic \u00b7 single',
+  voice: 'Voice',
+  voiceHint: 'The instrument every note is played on. Instrument voices ring on and carry a short room tail.',
+  voice_classic: 'Classic (electronic)',
+  voice_musicBox: 'Music box',
+  voice_marimba: 'Marimba',
+  voice_kalimba: 'Kalimba',
+  voice_electricPiano: 'Electric piano',
+  voice_bell: 'Bell',
+  voice_bowl: 'Singing bowl',
   tone_custom: 'Custom\u2026',
   turnEndLabel: 'A turn finishes',
   waitingLabel: 'The agent waits for you',
@@ -591,7 +733,7 @@ const en = {
   volume: 'Volume',
   volumeHint: '0 is silent, 2 is the top.',
   waveform: 'Waveform',
-  waveformHint: 'Timbre shared by every tone.',
+  waveformHint: 'Timbre of the classic voice.',
   waveform_sine: 'Sine',
   waveform_square: 'Square',
   waveform_triangle: 'Triangle',
@@ -624,10 +766,25 @@ const zh = {
   groupRepeat: '重复',
   tone: '提示音',
   toneHint: '换一套会立刻试听。',
-  tone_bright: '清脆',
-  tone_soft: '柔和',
-  tone_deep: '沉稳',
-  tone_single: '单音',
+  tone_musicBox: '音乐盒',
+  tone_marimba: '马林巴',
+  tone_kalimba: '拇指琴',
+  tone_electricPiano: '电钢琴',
+  tone_doorbell: '门铃',
+  tone_bowl: '颂钵',
+  tone_bright: '经典 · 清脆',
+  tone_soft: '经典 · 柔和',
+  tone_deep: '经典 · 沉稳',
+  tone_single: '经典 · 单音',
+  voice: '音色',
+  voiceHint: '每个音用什么乐器来奏。乐器音色会自然延音，并带一点空间混响。',
+  voice_classic: '经典（电子音）',
+  voice_musicBox: '音乐盒',
+  voice_marimba: '马林巴',
+  voice_kalimba: '拇指琴',
+  voice_electricPiano: '电钢琴',
+  voice_bell: '钟',
+  voice_bowl: '颂钵',
   tone_custom: '自定义…',
   turnEndLabel: '答完一轮',
   waitingLabel: '停下来等你操作',
@@ -636,7 +793,7 @@ const zh = {
   volume: '音量',
   volumeHint: '0 是静音，2 是最大。',
   waveform: '波形',
-  waveformHint: '所有音共用的波形。',
+  waveformHint: '经典音色用的波形。',
   waveform_sine: '正弦',
   waveform_square: '方波',
   waveform_triangle: '三角',
@@ -754,11 +911,23 @@ const STYLE = Object.freeze({
      * something a person picks as a whole ("make it softer"), so editing one
      * chime at a time stays the job of the Custom escape hatch.
      */
+    /*
+     * The instrument sets share one musical rule: "done" ends on the home note of
+     * its chord, so it sounds settled; "waiting for you" ends on a note outside
+     * it, so it sounds like a question. Every note is from a major pentatonic or
+     * its triad, so nothing clashes while strikes ring into each other.
+     */
     const TONE_SETS = Object.freeze([
-      { key: 'bright', finished: '880:170, 1318.5:300', interaction: '1046.5:140, 1318.5:140, 1046.5:200' },
-      { key: 'soft', finished: '660:190, 880:320', interaction: '784:150, 988:150, 784:210' },
-      { key: 'deep', finished: '523:200, 392:340', interaction: '587:160, 523:160, 587:220' },
-      { key: 'single', finished: '880:220', interaction: '1046.5:220' },
+      { key: 'musicBox', voice: 'musicBox', finished: '1046.5:120, 1318.5:120, 1568:120, 2093:420', interaction: '1568:130, 1318.5:130, 1568:130, 1760:420' },
+      { key: 'marimba', voice: 'marimba', finished: '523.25:110, 659.25:110, 783.99:110, 1046.5:320', interaction: '1046.5:120, 880:120, 1046.5:120, 1174.66:320' },
+      { key: 'kalimba', voice: 'kalimba', finished: '587.33:150, 739.99:150, 880:150, 1174.66:420', interaction: '880:140, 739.99:140, 880:140, 987.77:420' },
+      { key: 'electricPiano', voice: 'electricPiano', finished: '523.25:90, 659.25:90, 783.99:90, 987.77:600', interaction: '783.99:150, 880:150, 1046.5:150, 1174.66:480' },
+      { key: 'doorbell', voice: 'bell', finished: '783.99:480, 523.25:900', interaction: '659.25:320, 783.99:320, 880:900' },
+      { key: 'bowl', voice: 'bowl', finished: '440:1600', interaction: '587.33:700, 587.33:1400' },
+      { key: 'bright', voice: 'classic', finished: '880:170, 1318.5:300', interaction: '1046.5:140, 1318.5:140, 1046.5:200' },
+      { key: 'soft', voice: 'classic', finished: '660:190, 880:320', interaction: '784:150, 988:150, 784:210' },
+      { key: 'deep', voice: 'classic', finished: '523:200, 392:340', interaction: '587:160, 523:160, 587:220' },
+      { key: 'single', voice: 'classic', finished: '880:220', interaction: '1046.5:220' },
     ]);
 
     /**
@@ -767,7 +936,8 @@ const STYLE = Object.freeze({
      * @returns a `TONE_SETS` key, or `'custom'` when no set matches.
      */
     function toneSetOf(settings) {
-      const found = TONE_SETS.find((set) => set.finished === settings.finishedPattern && set.interaction === settings.interactionPattern);
+      const voice = settings.voice ?? DEFAULTS.voice;
+      const found = TONE_SETS.find((set) => set.voice === voice && set.finished === settings.finishedPattern && set.interaction === settings.interactionPattern);
       return found === undefined ? 'custom' : found.key;
     }
 
@@ -934,6 +1104,43 @@ const STYLE = Object.freeze({
       ]);
     }
 
+    /**
+     * The voice picker: a menu of instruments. Choosing one writes it and plays
+     * the "done" chime in it.
+     * @param props - t, the current voice, disabled, and the pick callback.
+     * @returns the field element.
+     */
+    function voicePicker(props) {
+      const { t, active, disabled, onPick } = props;
+      const [open, setOpen] = React.useState(false);
+      return h('div', { style: LAYOUT.field }, [
+        h('label', { key: 'label', style: LAYOUT.label }, t('voice')),
+        h(primitives.Menu, {
+          key: 'menu',
+          open,
+          anchor: h(primitives.Button, {
+            variant: 'outline',
+            disabled,
+            'aria-haspopup': 'menu',
+            'aria-expanded': open,
+            onClick: () => setOpen(true),
+          }, h('span', {
+            key: 'face',
+            style: { display: 'inline-flex', alignItems: 'center', gap: 6 },
+          }, [t(`voice_${active}`), h(primitives.IconChevronDownOutlineRegular, { key: 'chevron' })])),
+          onClose: () => setOpen(false),
+          items: VOICE_KEYS.map((name) => ({ id: name, label: t(`voice_${name}`) })),
+          selectedId: active,
+          selection: 'check',
+          onSelect: (id) => {
+            setOpen(false);
+            onPick(id);
+          },
+        }),
+        h('span', { key: 'hint', style: LAYOUT.hint }, t('voiceHint')),
+      ]);
+    }
+
     // ───────────────────────────────────────────────────────────────────
     // The row page
     // ───────────────────────────────────────────────────────────────────
@@ -1017,8 +1224,8 @@ const STYLE = Object.freeze({
         setCustomOpen(false);
         // One batch, not two writes: the pair is a single choice, and two calls in
         // one tick would race each other's revision.
-        store.writeAll({ finishedPattern: set.finished, interactionPattern: set.interaction });
-        play('finished', set.finished, { finishedPattern: set.finished, interactionPattern: set.interaction });
+        store.writeAll({ voice: set.voice, finishedPattern: set.finished, interactionPattern: set.interaction });
+        play('finished', set.finished, { voice: set.voice, finishedPattern: set.finished, interactionPattern: set.interaction });
       };
 
       return h('div', { style: LAYOUT.page }, [
@@ -1046,7 +1253,17 @@ const STYLE = Object.freeze({
             }),
             h('span', { key: 'hint', style: LAYOUT.hint }, t('volumeHint')),
           ]),
-          h('div', { key: 'waveform', style: LAYOUT.field }, [
+          voicePicker({
+            key: 'voice',
+            t,
+            active: settings.voice,
+            disabled,
+            onPick: (next) => {
+              write('voice', next);
+              play('finished', finished, { voice: next });
+            },
+          }),
+          settings.voice !== 'classic' ? null : h('div', { key: 'waveform', style: LAYOUT.field }, [
             h('label', { key: 'label', style: LAYOUT.label }, t('waveform')),
             h(primitives.SegmentedControl, {
               key: 'control',

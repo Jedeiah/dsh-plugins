@@ -192,6 +192,7 @@ async function bootClient() {
   const listeners = new Map();
   /** One record per chime: when it started and the frequencies of its tones. */
   const rings = [];
+  let reverbs = 0;
   const errors = [];
   const registered = [];
 
@@ -204,6 +205,15 @@ async function bootClient() {
       return now / 1000;
     }
     resume() { return Promise.resolve(); }
+    sampleRate = 48000;
+    createBuffer(channels, length) {
+      const data = Array.from({ length: channels }, () => new Float32Array(length));
+      return { getChannelData: (channel) => data[channel] };
+    }
+    createConvolver() {
+      reverbs += 1;
+      return { buffer: null, connect() {} };
+    }
     createDynamicsCompressor() {
       const param = () => ({ value: 0 });
       return { threshold: param(), knee: param(), ratio: param(), attack: param(), release: param(), connect() {} };
@@ -307,6 +317,8 @@ async function bootClient() {
     rings,
     errors,
     mount,
+    /** How many room-tail convolvers the audio half built (a function: the story spreads this object). */
+    reverbs: () => reverbs,
     /** Run every timer due within the next `ms` milliseconds, in order. */
     advance(ms) {
       const until = now + ms;
@@ -563,6 +575,64 @@ console.log('\nPart C — the client half watches every session');
     story.rings.length === 2 && story.rings[1].at === 3000, JSON.stringify(story.rings.map((ring) => ring.at)));
 }
 {
+  // An instrument voice strikes every partial of every note, so one note shows up
+  // as several frequencies — a bell's hum an octave down, its minor third and
+  // fifth — and all of them start with the chime, not one per note slot.
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.setForm({ voice: 'bell', finishedPattern: '783.99:480, 523.25:900' });
+  story.rerender();
+  story.publish({ A: busy(), B: idle() });
+  const heard = story.rings[0]?.frequencies ?? [];
+  const near = (hz) => heard.some((value) => Math.abs(value - hz) < 0.01);
+  check('the bell voice sounds the strike tone with its hum, minor third and fifth',
+    story.rings.length === 1 && near(783.99) && near(783.99 * 0.5) && near(783.99 * 1.19) && near(783.99 * 1.5) && near(523.25),
+    JSON.stringify(heard.map((value) => Math.round(value))));
+  check('an instrument voice plays through the room tail, built once', story.reverbs() === 1, String(story.reverbs()));
+  check('the instrument voice raised no error', story.errors.length === 0, story.errors.join(' | '));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.setForm({ voice: 'electricPiano', finishedPattern: '523.25:600' });
+  story.rerender();
+  story.publish({ A: busy(), B: idle() });
+  const heard = story.rings[0]?.frequencies ?? [];
+  check('the electric piano adds its FM modulator to the note',
+    heard.filter((value) => Math.abs(value - 523.25) < 0.01).length === 2, JSON.stringify(heard));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.setForm({ voice: 'classic' });
+  story.rerender();
+  story.publish({ A: busy(), B: idle() });
+  check('the classic voice still plays one oscillator per note, dry',
+    JSON.stringify(story.rings[0]?.frequencies) === JSON.stringify([880, 1318.5]) && story.reverbs() === 0,
+    JSON.stringify([story.rings[0]?.frequencies, story.reverbs()]));
+}
+{
+  const story = await chimeStory({ A: busy(), B: busy() });
+  story.setForm({ voice: 'theremin' });
+  story.rerender();
+  story.publish({ A: busy(), B: idle() });
+  check('an unknown voice falls back to classic',
+    JSON.stringify(story.rings[0]?.frequencies) === JSON.stringify([880, 1318.5]), JSON.stringify(story.rings[0]?.frequencies));
+}
+{
+  // Every preset melody must parse with the client's own rules, and name a voice
+  // the client knows; a typo would fall back to the default without a word.
+  const source = readFileSync(join(here, 'client.js'), 'utf8');
+  const presets = [...source.matchAll(/\{ key: '(\w+)', voice: '(\w+)', finished: '([^']+)', interaction: '([^']+)' \}/g)];
+  const voices = new Set([...source.slice(source.indexOf('const VOICES = Object.freeze({'), source.indexOf('/** Voice names')).matchAll(/^ {2}(\w+):/gm)].map((match) => match[1]));
+  const pairOk = (text) => text.split(',').every((part) => {
+    const [hz, ms] = part.trim().split(':').map(Number);
+    return hz >= 20 && hz <= 20000 && ms >= 10 && ms <= 5000;
+  });
+  const bad = presets.filter(([, , voice, finished, interaction]) => !voices.has(voice) || !pairOk(finished) || !pairOk(interaction)).map((match) => match[1]);
+  check('every chime set names a known voice and two valid melodies', presets.length === 10 && bad.length === 0, `${String(presets.length)} sets; bad: ${bad.join(',')}`);
+  const keys = new Set(presets.map((match) => match[1]));
+  check('every chime set and voice has a name in both languages',
+    [...keys].every((key) => source.split(`tone_${key}:`).length === 3) && [...voices].every((voice) => source.split(`voice_${voice}:`).length === 3));
+}
+{
   const story = await chimeStory({ A: busy(), B: busy() });
   story.publish({ A: busy(), B: idle() });
   story.unmount();
@@ -628,6 +698,7 @@ console.log('\nPart A — the row configuration the client half reads');
   check('intervalMs defaults to 5000', plain(value.intervalMs) === 5000, String(plain(value.intervalMs)));
   check('volume defaults to 1', plain(value.volume) === 1, String(plain(value.volume)));
   check('waveform defaults to sine', plain(value.waveform) === 'sine', String(plain(value.waveform)));
+  check('voice defaults to classic, so an upgrade sounds the same', plain(value.voice) === 'classic', String(plain(value.voice)));
   check('finishedPattern keeps its documented default',
     plain(value.finishedPattern) === '880:170, 1318.5:300', String(plain(value.finishedPattern)));
   check('interactionPattern keeps its documented default',
@@ -635,7 +706,7 @@ console.log('\nPart A — the row configuration the client half reads');
     String(plain(value.interactionPattern)));
 
   const volatileFields = ['muted', 'notifyOnTurnEnd', 'notifyOnWaiting', 'repeatCount',
-    'intervalMs', 'volume', 'waveform', 'finishedPattern', 'interactionPattern'];
+    'intervalMs', 'volume', 'waveform', 'voice', 'finishedPattern', 'interactionPattern'];
   const notVolatile = volatileFields.filter((name) => typeof value[name]?.get !== 'function');
   check('every field is .volatile() (the Host reads them per event, not once at mount)',
     notVolatile.length === 0, notVolatile.join(','));
@@ -648,6 +719,10 @@ console.log('\nPart A2 — the schema rejects values outside its bounds');
   check('intervalMs below 1000 is rejected', validate({ intervalMs: 500 }).issues !== undefined);
   check('volume above 2 is rejected', validate({ volume: 3 }).issues !== undefined);
   check('an unknown waveform is rejected', validate({ waveform: 'sawtooth' }).issues !== undefined);
+  check('an unknown voice is rejected', validate({ voice: 'theremin' }).issues !== undefined);
+  const clientSource = readFileSync(join(here, 'client.js'), 'utf8');
+  const clientVoices = [...clientSource.slice(clientSource.indexOf('const VOICES = Object.freeze({'), clientSource.indexOf('/** Voice names')).matchAll(/^ {2}(\w+):/gm)].map((match) => match[1]);
+  check('the schema accepts every voice the client plays', clientVoices.length === 7 && clientVoices.every((voice) => validate({ voice }).issues === undefined), clientVoices.join(','));
   check('a valid in-range config is accepted',
     validate({ repeatCount: 5, intervalMs: 2000, volume: 0.5, waveform: 'square' }).issues === undefined);
 }
