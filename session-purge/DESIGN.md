@@ -8,7 +8,7 @@
 > 会话冷着就用官方写句柄把它围住再删；活着就登记意图、停活归档，等它冷了再删。
 > 所有"事实"都标了依据；没核实的写成"未实测 / 未核实"。v7 原文保留在 `DESIGN.v7.md` 供对照。
 >
-> 依据记法：`<pkg>:N` = `/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai/<pkg>/lib/index.js` 第 N 行（dsh 0.2.1-rc.2）；
+> 依据记法：`<pkg>:N` = `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/<pkg>/lib/index.js` 第 N 行（历史行号按 dsh 0.2.1-rc.2 记录；0.2.2 的 Schedule 变更见 README 审计段）；
 > `docs:<页>` = <https://deepseek-harness.github.io/deepseek-harness/en/> 下的页面。
 
 ---
@@ -93,7 +93,7 @@ dsh 的会话日志是只追加的，`seam 无删除接口`（`dsh-session-persi
 | `workspace.record.sessionIds`（原始记录） | **内部字段** | `dsh-workspace:79` | 只用于 verify，缺失记 `unverified: ['workspace-raw']` |
 | `ctx.storageDomain.get('session_projcache').table('sessions')` | **文档化的诊断入口** | `docs:reference/subsystems/storage`（"get(name) is an untyped diagnostic lookup"）；域名 `dsh-session-projection-cache:90`；表句柄稳定 `dsh-storage-domain:187-191` | 退回删文件 + 墓碑复检，告警 |
 | `domain/changed` 事件 | 公开 | `docs:reference/subsystems/storage`（"strictly after the backend acknowledged durability … in write-chain order"） | 墓碑监听不可用，只剩启动复检，告警 |
-| `schedule.catalog / delete / create` | 公开 Host 方法 | `docs:reference/subsystems/schedule`；`dsh-schedule:2083`、`:2129`、`:2164` | 提醒域记 `unverified` |
+| `schedule.catalog / edit / create` | 公开 Host 方法 | `docs:reference/subsystems/schedule`；`dsh-schedule@0.2.2-rc.1:2233`、`:2297`、`:2387` | 提醒域记 `unverified` |
 | `agent/disposed` 事件 | 公开 | `docs:reference/subsystems/core`（"Disposal removes the agent from the registry and emits agent/disposed"） | 延期路径只在启动时推进 |
 | `node-addon-system/flock` 的 `tryLockExclusive` | 公开子路径；但 `session.lock` 协议是 jsonl 后端内部的 | `node-addon-system/package.json` `exports`；协议 `dsh-session-persistence-jsonl:617-646` | 只用于"日志读不出"的后备路径（§6.3） |
 | spill 目录名 `session-<sha256(id)[:12]>` | 内部约定 | `dsh-spill-local:70` | spill 域记 `unverified` |
@@ -146,10 +146,10 @@ wait     : 监听 agent/disposed（目标 id）→ 尝试立即路径；每次�
 
 - **为什么要归档并停活**：用户已确认删除，不该让它继续跑、继续写新内容、继续被提醒唤醒。
   归档集正是 provider 的 `agent/pre-step` 闸门读的东西，停请求诱发的唤醒都会被挡住（`dsh-workspace:512-524` 注释）。
-- **代价写在明处**：`stopActivity` 会让 schedule 把该会话所有 `active` 提醒直接删掉（`dsh-schedule:2056`、`:2273-2292`）；
+- **代价写在明处**：`stopActivity` 会让 schedule 把该会话所有 `active` 提醒直接删掉（`dsh-schedule@0.2.2-rc.1:2191-2193`、`:2587-2594`）；
   归档先持久化、再清置顶、最后才发停请求，失败不回滚（`dsh-workspace:527-541`）。
 - **取消**（只有 `PENDING` 可取消）：`unarchiveSession` → `pinSession`（必须在 unarchive 之后，
-  否则抛 `WorkspaceArchivedSessionPinError`，`dsh-workspace:581`）→ 用 prior 快照经 `schedule.create(sessionId, request)` 重建提醒。
+  否则抛 `WorkspaceArchivedSessionPinError`，`dsh-workspace:581`）→ 用 prior 快照经 `schedule.create({ title, prompt, timing, target })` 重建提醒。
   重建出来的是**新 id**，投递历史不在了（`docs:reference/subsystems/schedule`："Lost history … never reconstructed"）——
   取消确认框写明这一点。没有 CAS，补偿可能覆盖期间用户的合法操作：「记录 → 补偿 → 回读」，不一致记 `compensation-drift`。
 - **重试与卡死**（吸取 Firefox Bug 1778090：待办在每次启动都静默失败、永远清不掉）：
@@ -273,7 +273,7 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 |---|---|---|
 | 工作区记账 | 对**原始记录或过滤视图里含该 id** 的工作区调用 `detachSession(id)`；再 `unarchiveSession(id)`、`unpinSession(id)` | `detachSession` 改原始记录且幂等（`dsh-workspace:148-152`）；只看过滤视图 `sessionIds`（`:102-104`）会漏掉日志已删、索引已忘的槽位；但也**不能**对每个工作区无条件调用——每次变更都会顺手修剪该工作区里所有失效的槽位（`:176-180`），无条件调用等于替别的会话做了一次修剪；unarchive/unpin 对已不存在的 id 也能用（`:553-562`、`:597-606`） |
 | 投影检查点 | `table.delete(id)`；再删 `<id>.json.bak.*` 这类表不追踪的备份文件 | 与所有写回同一条 FIFO 链，内存与磁盘一起变（`dsh-storage-domain:222-225`、`:264-276`）；拿不到表 → 删文件 + 告警 |
-| 提醒 | `catalog()` 里 `sessionId` 等于目标的**所有**行（任何 status）逐条 `delete({sessionId, id})` | `delete` 不看 status（`dsh-schedule:2164-2181`）；非活跃行还留着投递历史与指令快照（`docs:reference/subsystems/schedule`）——隐私上必须删 |
+| 提醒 | `catalog()` 里 `target.sessionId` 等于目标的**所有**行（任何 status）逐条 `edit({ id, action: 'delete' })` | `dsh-schedule@0.2.2-rc.1:2387`；非活跃行还留着投递历史与指令快照（`docs:reference/subsystems/schedule`）——隐私上必须删 |
 | spill | 在本实例活动根与 `discoverDefaultRoots` 发现的根里，只删 `session-<sha256(id)[:12]>` | 目录名由目标 id 精确算出（`dsh-spill-local:70`），不会碰别的实例的会话（I3） |
 | 浏览器状态 | 客户端半边清 `dsh.conversation.<id>` 等键（现有实现） | 广播 `api-session/removed` 只含真正提交的 id |
 | 搜索索引 | 不碰 | 每次搜索前自对账（`dsh-session-query-sqlite` README） |
@@ -291,7 +291,7 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 3. 工作区：原始 `workspace.record.sessionIds`（内部字段，feature-detect）、`archivedSessionIds`、`pinnedSessionIds` 都不含它。
    **过滤视图不能作证据**：它只放行 `sessionPaths` 里有路径的 id（`dsh-workspace:367`），日志一删、索引一刷就会把原始记录里的悬空格藏起来。
    README 的"missing-directory candidates retain their account"说的是**会话 cwd 不存在**（`dsh-workspace:892`），与日志被删无关；
-4. 提醒：`catalog()` 里没有任何 `sessionId` 等于它的行；
+4. 提醒：`catalog()` 里没有任何 `target.sessionId` 等于它的行；
 5. `runs/<runId>/entries/` 已清空。
 
 读不到的域记 `unverified: [...]`，`outcome: verified-with-gaps`，不许静默算通过。
@@ -415,12 +415,12 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 
 Windows 两条（持句柄 rename、读者占用导致 `commit-failed`）**需要真机**，自测里标 `skip` 并打印原因。
 
-**已实测的部分（2026-10-18，dsh 0.2.1-rc.2，macOS）**：标 ✅ 的行在 `selftest.mjs` Part B2 里跑在 dsh **自己的**
+**已实测的部分（2026-10-18，dsh 0.2.1-rc.2；2026-11-04 复核 dsh 0.2.2-rc.1，macOS）**：标 ✅ 的行在 `selftest.mjs` Part B2 里跑在 dsh **自己的**
 storage / storage-json / storage-domain / session / session-persistence-jsonl / session-projection-cache / agent / agent-loop 上，
 配置照抄 `dsh-base/cordis.patch.yml`；只有 llm / tools / system-prompt 用的是 dsh 自带的空 hub（resume 在开 turn 之前不调用它们）。
-Part B2 验证的是**dsh 的行为**（设计前提），不是插件——墓碑监听是测试自带的，插件里还没有。
+Part B2 验证的是**dsh 的行为**（设计前提），墓碑监听由测试自带；插件自己的墓碑监听由 Part B3 在真实服务上验证。
 **变异测试**：把监听的身份比对换成只比 id，P4 的三条立即失败（新会话的检查点被删）——这正是 §10.2 坚持按身份认人的实证。
-其余行（P3 第一行、I2、延期、卡死等）依赖尚未实现的插件逻辑，等实现时再落。
+其余行（P3 第一行、I2、延期、卡死等）的插件行为已落地，并由 Part A/B 覆盖；0.2.2 适配后 Part B3 还覆盖真实 Schedule 服务。
 
 ---
 
@@ -464,7 +464,7 @@ Part B2 验证的是**dsh 的行为**（设计前提），不是插件——墓�
 | 源码复核 v7 | 围栏在驱逐前会自锁、`stopActivity` 删提醒、过滤视图不能作证据、Windows 信号量不挡 rename 等 13 处 | 采纳；但复核后又发现 v7 自己的"可排序消除"漏了在途写回 |
 | **换路线 v8** | 驱逐路线的洞是结构性的：生命周期不归插件管（文档 + 会话控制器丢弃 handle） | 改为"官方写句柄围栏 + 延期到冷 + 墓碑收敛"；去掉全部 `store`/`detach`/私有字段依赖 |
 | **实现（落地）** | ① 工作区不能无条件 `detachSession`（会替别的会话修剪，见 §8）；② 墓碑只比 `createdAt`+`cwd`（`formatVersion` 会变）；③ 同批会话重复删 → `already-pending`；④ 计划要在互斥锁**内**计算，否则排队的第二次删除会拿过期计划报误导性的错；⑤ 延期完成中途失败时先回读清单，已推进到围栏之后的交给恢复、不把 PENDING 写回；⑥ 存储域"先落盘再改内存"、真实后端要求 cwd 派生布局——都是测试侧的时序/布局事实；⑦ 索引原先跳过软链接会话目录，§7.3 的链接规则落地前根本走不到 | 全部改进正文与代码；252 项自测 + 9 处变异测试 |
-| **代码审核（落地后）** | 14 条：① gc 的不可判定持有者检查不跟随软链接，链接后面损坏的会话会被漏掉；② rename 后目录 fsync 失败被当成提交失败；③ 取消时重建了没被删掉的提醒；④ 延期前没做预检，删不成也先停了会话；⑤ 预览在失败时就被消耗；⑥ 同意是整批的；⑦ 延期时清掉了草稿；⑧ `purgeAttachments` 去掉 `.volatile()` 改了设置契约；⑨ 监听在停活之后才注册；⑩ 超大日志永久卡住 gc 且原因误报；⑪ 两处退化不留声；⑫ 提交前装墓碑会误删存活会话的检查点；⑬⑭ 重复代码 | 全部修复；270 项自测（修复前的代码失败 18 项）+ 11 处变异测试 |
+| **代码审核（落地后）** | 14 条：① gc 的不可判定持有者检查不跟随软链接，链接后面损坏的会话会被漏掉；② rename 后目录 fsync 失败被当成提交失败；③ 取消时重建了没被删掉的提醒；④ 延期前没做预检，删不成也先停了会话；⑤ 预览在失败时就被消耗；⑥ 同意是整批的；⑦ 延期时清掉了草稿；⑧ `purgeAttachments` 去掉 `.volatile()` 改了设置契约；⑨ 监听在停活之后才注册；⑩ 超大日志永久卡住 gc 且原因误报；⑪ 两处退化不留声；⑫ 提交前装墓碑会误删存活会话的检查点；⑬⑭ 重复代码 | 全部修复；273 项自测（修复前的代码失败 18 项）+ 11 处变异测试 |
 | **v8 实测** | Part B2：I4 的四条前提 + 跨进程租约 + 持句柄 rename，26 项在真实服务上通过；对照证实冷读写回确会复活检查点；变异测试证实只按 id 认人会误删 | 前提成立；§14 标注 ✅ |
 
 **仍未解决（写在明处）**：活会话只能延期到下次启动；延期期间内容仍在磁盘上；取消延期时提醒只能以新 id 重建；
@@ -480,7 +480,7 @@ Part B2 验证的是**dsh 的行为**（设计前提），不是插件——墓�
 | 先摘工作区槽位、再删目录，失败再挂回（`index.js:307-341`） | 先围住、再移出树、再摘槽位；提交前无副作用，不需要"挂回" | `index.js:312` 的注释把 README 的 "missing-directory" 读成了"日志目录被删"，实际指 cwd 缺失（§9.1） |
 | 直接 `rm` 目录 | 持写句柄 → rename 进 staging → 清理 | 需要新的清单 / 恢复代码 |
 | 删检查点文件 | 经 `session_projcache` 表删除 + 墓碑监听 | 文件删除降为后备 |
-| 只删活跃提醒（经 Schedule 服务） | 删 `catalog()` 里该会话**所有**行 | 非活跃行带投递历史 |
+| 只删活跃提醒（经 Schedule 服务） | 删 `catalog()` 里该会话**所有**行（`target.sessionId`，`edit({ id, action: 'delete' })`） | 非活跃行带投递历史 |
 | `purgeAttachments` 删除时顺带算引用减法 | 删除不碰附件；gc 独立、两轮、带插入屏障 | 配置项语义要改，旧配置给一次性迁移提示 |
 | — | 新 Remote 方法：列出 / 取消 / 重试待完成删除 | **`typert.js` 的 `invocations` 与 `client.js` 的 `TYPERT_REMOTE.descriptors` 两处都要加**，否则设置页白屏（AGENTS.md） |
 | — | 新依赖：`@deepseek-ai/dsh-session-persistence`（只为按 name 判错时的常量，可不导入）、`@deepseek-ai/node-addon-system`（§6.3 后备） | 裸导入的必须写进 `peerDependencies` |

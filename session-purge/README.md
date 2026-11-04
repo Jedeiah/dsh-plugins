@@ -11,7 +11,7 @@
 | 1 | `<DSH_HOME>/sessions/<项目目录>/<会话目录>/` | 会话日志的全部格式代际 + `session.lock`；**含它的子 agent 会话**（子会话是同根的兄弟目录，header 带 `origin: "subagent"` + `parentSession`，默认递归一起删）。**从该会话「分叉」出来的独立会话不会被删**——fork 也带 `parentSession` 但没有 `origin`，官方同样不把它算作血缘；对话框会把它们列出来，让你知道留下了什么。会话目录是**软链接**时，删的是链接本身和目标里的会话文件，目标里别的文件原样保留 |
 | 2 | 投影检查点（`session_projcache`） | 经检查点服务自己的表删除，内存与磁盘一起变；连同存储域可能留下的 `.bak.<时间戳>` / `.tmp` |
 | 3 | `workspace.json` | 工作区归属槽位、归档集合、置顶集合——走 Workspace 注册表自己的方法，不手改文档 |
-| 4 | `schedule.json` | 绑在该会话上的**所有**提醒（含已失效的，它们还留着投递历史与指令快照）——走 Schedule 服务删除 |
+| 4 | Schedule 服务 | 绑在该会话上的**所有**提醒（含已失效的，它们还留着投递历史与指令快照）——按 `catalog()` 的 `target.sessionId` 找到，经 `edit({ id, action: 'delete' })` 删除 |
 | 5 | `<临时目录>/dsh-spill-*/session-<sha256(id)[:12]>/` | 工具大输出的落盘文件，只按目标 id 精确定位，绝不碰别的实例的 spill |
 | 6 | 浏览器 Local Storage | 由客户端半边清理 `dsh.conversation.<id>`、`dsh.sidebar-right.v1.<id>`、`dsh.user-questions.drafts.v1.<id>`，并在 `dsh.sessions.current` 指向被删会话时移除它 |
 
@@ -126,9 +126,9 @@ node selftest.mjs 2>&1 | tail -5
 | Part C | 桩模块表 | 浏览器半边真跑 `load → factory → apply`；内联客户端 manifest 与 `typert.js` 逐字段对齐；词典无缺键、无死键 |
 | Part B | 真实 Cordis + Gateway + 合成存储（持久化用带真实 `flock` 的桩） | 立即路径、活会话与围栏、按原始记录选工作区、全状态提醒、提交失败、取消的"全有或全无"性质测试、并发、`busy`、根与租约不符、软链接、四种崩溃恢复、延期删除全流程、附件两轮回收 |
 | Part B2 | dsh **真实**服务 | DESIGN v8 的前提：驻留会话挡住写打开（含跨进程）、持句柄时 resume 被拒、迟到写回确会复活（对照）且能按身份删回 |
-| Part B3 | dsh **真实**服务 | 插件端到端：真实会话的删除、真实检查点表、插件自己的监听删回真实迟到写回、真实 `archiveSession` 停活与 `agent/disposed` 驱动的延期完成 |
+| Part B3 | dsh **真实**服务 | 插件端到端：真实会话的删除、真实检查点表、真实 Schedule 提醒的删除、插件自己的监听删回真实迟到写回、真实 `archiveSession` 停活与 `agent/disposed` 驱动的延期完成 |
 
-本次记录：**270 项全部通过**；另做了 11 处变异测试（故意改坏关键逻辑：租约探测、工作区选择、失败目标的墓碑、按会话的预览同意、取消顺序、插入屏障、宽限期、上传清单、按身份认人、延期前的预检、回收时跟随软链接），全部被测试捕获；修复审核问题之前的代码在新测试上失败 18 项。计数会随测试增加而变化，以实际输出为准。
+本次记录：**273 项全部通过**（`0.2.2-rc.1`）；另做了 11 处变异测试（故意改坏关键逻辑：租约探测、工作区选择、失败目标的墓碑、按会话的预览同意、取消顺序、插入屏障、宽限期、上传清单、按身份认人、延期前的预检、回收时跟随软链接），全部被测试捕获；修复审核问题之前的代码在新测试上失败 18 项。计数会随测试增加而变化，以实际输出为准。
 
 ## 实现注记（踩过的坑）
 
@@ -159,7 +159,7 @@ node selftest.mjs 2>&1 | tail -5
 - 围栏走持久化的写句柄，Windows 上它持有的是命名内核信号量，同样有效；
 - **Windows 上没有 `flock`**：跨进程的全局互斥与"租约探测"两项关闭（只剩进程内串行与根目录比对），插件会在日志里说一声；持句柄时 `rename` 目录、以及别的读者占用文件导致提交失败这两条行为**未在 Windows 真机上验证**；
 - 目录的 fsync 在 Windows 上是空操作；macOS 上 Node 的 fsync 经 libuv 发 `F_FULLFSYNC`；
-- `selftest.mjs` 的 `--app` 默认指向 macOS 安装路径，其它平台用 `--app <你的 @deepseek-ai 目录>`，找不到安装时 Part B/B2/B3/C 会自动跳过。
+- `selftest.mjs` 的 `--app` 默认由仓库根的 `selftest-app.mjs` 自动探测 `Resources/app.asar/dsh/node_modules/@deepseek-ai`（Electron 下会先复制到临时目录）；其它安装位置用 `--app <你的 @deepseek-ai 目录>`，找不到安装时 Part B/B2/B3/C 会自动跳过。
 
 ### 不在覆盖范围内
 

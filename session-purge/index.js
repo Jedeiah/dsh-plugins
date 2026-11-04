@@ -659,7 +659,9 @@ class SessionPurgeService extends TypertRemoteService {
         prior: {
           archived: archived.has(target.id),
           pinned: pinned.has(target.id),
-          reminders: reminders.filter((row) => row.sessionId === target.id && row.status === 'active').map(reminderSnapshot),
+          reminders: reminders
+            .filter((row) => row.status === 'active' && scheduleTaskSessionIds(row).includes(target.id))
+            .map(reminderSnapshot),
         },
       }))),
       entries: [],
@@ -868,7 +870,10 @@ class SessionPurgeService extends TypertRemoteService {
       // that cannot be told, so nothing is recreated.
       let existing;
       try {
-        existing = typeof schedule?.catalog === 'function' ? new Set((await schedule.catalog()).map((row) => `${String(row.sessionId)}/${String(row.id)}`)) : undefined;
+        existing = typeof schedule?.catalog === 'function'
+          ? new Set((await schedule.catalog()).flatMap((row) => scheduleTaskSessionIds(row)
+            .map((sessionId) => `${sessionId}/${String(row.id)}`)))
+          : undefined;
       } catch {
         existing = undefined;
       }
@@ -887,13 +892,13 @@ class SessionPurgeService extends TypertRemoteService {
             report.reminders.kept += 1;
             continue;
           }
-          const request = reminderRequest(snapshot);
+          const request = reminderRequest(snapshot, target.id);
           if (request === undefined || typeof schedule?.create !== 'function' || existing === undefined) {
             report.reminders.failed.push({ sessionId: target.id, title: String(snapshot.title ?? ''), reason: request === undefined ? 'cannot-recreate' : 'schedule-unavailable' });
             continue;
           }
           try {
-            await schedule.create(target.id, request);
+            await schedule.create(request);
             report.reminders.recreated += 1;
           } catch (error) {
             report.reminders.failed.push({ sessionId: target.id, title: String(snapshot.title ?? ''), reason: String(error?.message ?? error) });
@@ -1288,7 +1293,9 @@ class SessionPurgeService extends TypertRemoteService {
         try {
           const wanted = new Set(ids);
           for (const task of await schedule.catalog()) {
-            if (wanted.has(task.sessionId)) failures.push(`reminder "${String(task.id)}" is still bound to "${String(task.sessionId)}"`);
+            for (const sessionId of scheduleTaskSessionIds(task)) {
+              if (wanted.has(sessionId)) failures.push(`reminder "${String(task.id)}" is still bound to "${sessionId}"`);
+            }
           }
         } catch {
           unverified.add('schedule');
@@ -1801,17 +1808,20 @@ class SessionPurgeService extends TypertRemoteService {
   /**
    * Read every task bound to the targets through the Schedule service, which
    * owns the durable rows. `catalog()` lists every row whatever its status
-   * (`dsh-schedule:2129-2136`); an inactive row still carries its delivery
-   * history and instruction snapshots, so it is just as much the session's.
+   * (`dsh-schedule@0.2.2-rc.1:2297,2523-2535`); an inactive row still carries
+   * its delivery history and instruction snapshots, so it is just as much the
+   * session's. A row's destination Session is `target.sessionId`; `new` and
+   * `new_once` targets keep their involvement separately.
    * @param ids - the session ids.
-   * @returns the matching task records, each carrying its own session binding.
+   * @returns the matching task records, each carrying its own target binding.
    */
   async scheduleTasks(ids) {
     const schedule = this.ctx.get('schedule');
     if (schedule === undefined || typeof schedule.catalog !== 'function') return [];
     const wanted = new Set(ids);
     try {
-      return (await schedule.catalog()).filter((task) => wanted.has(task.sessionId));
+      return (await schedule.catalog()).filter((task) => scheduleTaskSessionIds(task)
+        .some((sessionId) => wanted.has(sessionId)));
     } catch {
       return [];
     }
@@ -1825,11 +1835,11 @@ class SessionPurgeService extends TypertRemoteService {
    */
   async removeSchedules(ids, warnings) {
     const schedule = this.ctx.get('schedule');
-    if (schedule === undefined || typeof schedule.delete !== 'function' || typeof schedule.catalog !== 'function') return { count: 0, available: false };
+    if (schedule === undefined || typeof schedule.edit !== 'function' || typeof schedule.catalog !== 'function') return { count: 0, available: false };
     let count = 0;
     for (const task of await this.scheduleTasks(ids)) {
       try {
-        const result = await schedule.delete({ sessionId: task.sessionId, id: task.id });
+        const result = await schedule.edit({ id: task.id, action: 'delete' });
         if (result?.deleted === true) count += 1;
       } catch (error) {
         warnings.push(`could not delete reminder ${String(task.id)}: ${String(error)}`);
@@ -1963,6 +1973,19 @@ function becameLiveError(ids) {
 }
 
 /**
+ * The Session ids a Schedule catalog row is bound to.
+ *
+ * `dsh-schedule@0.2.2-rc.1` stores the delivery destination as `target`.
+ * `involvedSessionIds` also names the acting Session, so it must not be treated
+ * as the destination.
+ * @param task - a `schedule.catalog()` row.
+ * @returns the destination Session ids.
+ */
+function scheduleTaskSessionIds(task) {
+  return typeof task?.target?.sessionId === 'string' ? [task.target.sessionId] : [];
+}
+
+/**
  * The minimal reminder record a cancelled deferred delete needs to rebuild a
  * reminder that `stopActivity` deleted (DESIGN.md §5.3).
  * @param row - a `schedule.catalog()` row.
@@ -1970,36 +1993,56 @@ function becameLiveError(ids) {
  */
 function reminderSnapshot(row) {
   const snapshot = {};
-  for (const field of ['id', 'kind', 'title', 'prompt', 'scheduledAt', 'afterSeconds', 'everySeconds', 'time', 'timeZone', 'weekdays', 'expression']) {
+  for (const field of ['id', 'kind', 'title', 'prompt', 'scheduledAt', 'afterSeconds', 'everySeconds', 'time', 'timeZone', 'weekdays', 'expression', 'rrule']) {
     if (row?.[field] !== undefined) snapshot[field] = row[field];
   }
   return snapshot;
 }
 
 /**
- * The `schedule.create` request that recreates a snapshot (`ScheduleCreateRequest`,
- * `docs:reference/subsystems/schedule`; selectors read at `dsh-schedule:2084-2094`).
- * A one-shot keeps its absolute target; a past one cannot be recreated.
+ * The `ScheduleTiming` that recreates a snapshot.
  * @param snapshot - a {@link reminderSnapshot}.
- * @returns the request, or `undefined` when it cannot be recreated.
+ * @returns the timing, or `undefined` when it cannot be recreated.
  */
-function reminderRequest(snapshot) {
-  const base = { title: snapshot.title, prompt: snapshot.prompt };
+function reminderTiming(snapshot) {
   switch (snapshot.kind) {
     case 'at':
     case 'after':
-      return Date.parse(snapshot.scheduledAt) > Date.now() ? { ...base, at: snapshot.scheduledAt } : undefined;
+      return Date.parse(snapshot.scheduledAt) > Date.now() ? { kind: 'at', at: snapshot.scheduledAt } : undefined;
     case 'every':
-      return typeof snapshot.everySeconds === 'number' ? { ...base, every_seconds: snapshot.everySeconds } : undefined;
+      return typeof snapshot.everySeconds === 'number' ? { kind: 'every', every_seconds: snapshot.everySeconds } : undefined;
     case 'daily':
-      return { ...base, daily: { time: snapshot.time, time_zone: snapshot.timeZone } };
+      return { kind: 'daily', daily: { time: snapshot.time, time_zone: snapshot.timeZone } };
     case 'weekly':
-      return { ...base, weekly: { time: snapshot.time, time_zone: snapshot.timeZone, weekdays: snapshot.weekdays } };
+      return { kind: 'weekly', weekly: { time: snapshot.time, time_zone: snapshot.timeZone, weekdays: snapshot.weekdays } };
     case 'cron':
-      return { ...base, cron: { expression: snapshot.expression, time_zone: snapshot.timeZone } };
+      return { kind: 'cron', cron: { expression: snapshot.expression, time_zone: snapshot.timeZone } };
+    case 'rrule':
+      return typeof snapshot.rrule === 'string' ? { kind: 'rrule', rrule: snapshot.rrule } : undefined;
     default:
       return undefined;
   }
+}
+
+/**
+ * The `schedule.create` request that recreates a snapshot
+ * (`ScheduleCreateRequest`, `docs:reference/subsystems/schedule`; the new
+ * signature is read at `dsh-schedule@0.2.2-rc.1:2233`).
+ * A one-shot keeps its absolute target; a past one cannot be recreated.
+ * @param snapshot - a {@link reminderSnapshot}.
+ * @param sessionId - the Session the reminder must deliver to.
+ * @returns the request, or `undefined` when it cannot be recreated.
+ */
+function reminderRequest(snapshot, sessionId) {
+  const timing = reminderTiming(snapshot);
+  if (timing === undefined || typeof snapshot.title !== 'string' || snapshot.title.trim() === ''
+    || typeof snapshot.prompt !== 'string' || snapshot.prompt.trim() === '') return undefined;
+  return {
+    title: snapshot.title,
+    prompt: snapshot.prompt,
+    timing,
+    target: { kind: 'session', sessionId },
+  };
 }
 
 /**

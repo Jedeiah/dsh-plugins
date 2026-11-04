@@ -12,7 +12,6 @@
 | `session-purge/` | 删除会话：把会话连同子 agent 会话真正从磁盘删掉 |
 | `chrome-devtools-mcp/` | 浏览器调试：接入 chrome-devtools-mcp（MCP + 7 个可选技能） |
 | `rea-dsh/` | 逆向工程：接入 REA 的 MCP 服务器（MCP + 1 个可选技能） |
-| `web-fetch-fakeip/` | 代理抓取：让 `web_fetch` 在 TUN + fake-ip 代理下可用 |
 
 每个插件目录自带 `README.md`，写它自己的设计取舍与踩坑。
 
@@ -32,7 +31,8 @@
      `cordis-api/`（context / events / fiber / inherited / registry / service）、`cordis-primer`、
      `subsystems/`（tools / skills / settings / client-modules / client-resources / typert / invariants / session …）。
    - 文档没讲清的，才去读源码
-     `/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai/*/lib/index.js`。
+     `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/*/lib/index.js`
+     （0.2.2 起 dsh 收进了 `app.asar`；Node ESM 不能直接 import asar 内路径，读源码时用 Electron 的 fs 或先解包）。
    - 结论里注明依据：**文档哪一节**，还是**源码哪一行**。两者都没有，就不要当成事实写进代码或文档。
 
    **踩过的坑（记为教训）**：`config` 里的 `!!js` 只在**条目激活时**求值 —— 这写在文档
@@ -91,8 +91,9 @@ open "/Applications/DeepSeek Harness.app"
   这种函数**一定要带空结果告警** —— 否则形状一变就静默丢光全部默认值。
 - **`selftest.mjs` 要绕过裸导入。** bundle 顶部有 `import('@deepseek-ai/…')`，而 clone 没有自己的
   `node_modules`（profile 是 `link:` 过来的）。用 `module.register` 把 `@deepseek-ai/*` 锚到 `--app`
-  目录（默认 `/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai`），
-  不在磁盘上留任何东西。让纯函数接受可注入的目录参数，测试才不碰 bundle 自己的目录。
+  目录；默认由仓库根的 `selftest-app.mjs` 探测 `Resources/app.asar/dsh/node_modules/@deepseek-ai`，
+  并用 Electron 的 asar 文件系统复制到 `$TMPDIR/dsh-selftest-runtime/<版本>/` 再导入（Node ESM
+  不能直接 import asar 路径）。让纯函数接受可注入的目录参数，测试才不碰 bundle 自己的目录。
 - **停用再启用带客户端半边的插件，`apply` 不保证重跑**（[deepseek-harness#8452](https://github.com/deepseek-ai/deepseek-harness/discussions/8452)）。
   配置页要注册在 `ctx.inject(['remote.<本插件自己的服务>', …], cb)` 依赖门里，靠 Host 半边重建把页面重新挂上。
 - **要提供互斥的两种连接方式（例："自己拉起 Chrome" / "接管我的浏览器"），就定义两条行、由开关改写
@@ -154,12 +155,12 @@ open "/Applications/DeepSeek Harness.app"
   连 `gateway/peer-disposed` 都轮不到。`session-purge` 的 Part B 因此用 `dsh-client-connection` 导出的 `Peer`
   （`new Peer(ctx, { principal: { kind: 'owner' } })`）为每次调用命名 Peer。浏览器端不受影响。
 - **桌面运行时的路径会跟着 dsh 版本挪。**（2026-10，0.2.1）
-  0.2.1 把 payload 收进了 `Resources/runtime/primary-runtime/dependencies/{node,pnpm}`，0.2.0 是
+  0.2.1/0.2.2 把 payload 收进了 `Resources/runtime/primary-runtime/dependencies/{node,pnpm}`，0.2.0 是
   `Resources/runtime/{node,pnpm}`。**两处都探**，别写死一处；`rea-dsh` 的"自带 node + 自带 pnpm"那一级
   就因为只认旧路径而静默退化成 `npx`——在没装 node 的机器上等于起不来。`rea-dsh/selftest.mjs` Part D 守这条。
 - **显示资源要从 `exports` 里导出。**（2026-10，0.2.1）
   dsh 读 `meta.title`/`meta.description` 走 `exports["./locale/*.json"]`，图标走 `exports["./icon"]`；
-  顶层 `icon` 字段仍然优先、仍然能用，但已是旧写法。五个包的 `selftest.mjs` Part 0 都断言了这两条导出、
+  顶层 `icon` 字段仍然优先、仍然能用，但已是旧写法。每个包的 `selftest.mjs` Part 0 都断言了这两条导出、
   图标是 SVG 且在 256 KiB 内、`files` 里带上了它们。
 
 - **失败路径必须把"先做的事"还回去——更好的是让不可逆的事排在所有检查之后。**（2026-10，功能审计；2026-10 v8 改写）

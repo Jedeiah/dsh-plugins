@@ -43,15 +43,15 @@ import { register } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { resolveAppDirectory } from '../selftest-app.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PACKAGE = '@jedeiah/turn-notifier';
-const DEFAULT_APP = '/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai';
 
 /** @returns the directory holding the installation's `@deepseek-ai/*` packages. */
 function appDirectory() {
   const index = process.argv.indexOf('--app');
-  return index === -1 ? DEFAULT_APP : process.argv[index + 1];
+  return resolveAppDirectory(index === -1 ? undefined : process.argv[index + 1]);
 }
 
 let failures = 0;

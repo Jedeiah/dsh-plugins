@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "Proxy Fetch",
-    "description": "Keeps web_fetch working behind a TUN proxy such as Clash or Shadowrocket."
-  }
-}

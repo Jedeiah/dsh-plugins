@@ -35,14 +35,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import zlib from 'node:zlib';
+import { resolveAppDirectory } from '../selftest-app.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_APP = '/Applications/DeepSeek Harness.app/Contents/Resources/app/dsh/node_modules/@deepseek-ai';
 
-/** @returns the app package directory from argv or the default location. */
+/** @returns the app package directory from argv or the detected installation. */
 function appDirectory() {
   const index = process.argv.indexOf('--app');
-  return index === -1 ? DEFAULT_APP : process.argv[index + 1];
+  return resolveAppDirectory(index === -1 ? undefined : process.argv[index + 1]);
 }
 
 let failures = 0;
@@ -622,16 +622,16 @@ async function testGateway(app, workroot) {
       unpinSession: (id) => { calls.push(`unpin:${id}`); pinned.splice(0, pinned.length, ...pinned.filter((entry) => entry !== id)); },
     });
     const rows = [
-      { id: 'task-1', sessionId: third.parentId, status: 'active' },
-      { id: 'task-2', sessionId: 'unrelated', status: 'active' },
-      { id: 'task-3', sessionId: third.childId, status: 'inactive' },
+      { id: 'task-1', target: { kind: 'session', sessionId: third.parentId }, involvedSessionIds: [third.parentId], status: 'active' },
+      { id: 'task-2', target: { kind: 'session', sessionId: 'unrelated' }, involvedSessionIds: ['unrelated'], status: 'active' },
+      { id: 'task-3', target: { kind: 'session', sessionId: third.childId }, involvedSessionIds: [third.childId], status: 'inactive' },
     ];
     host3.ctx.provide('schedule', {
-      catalog: async () => rows.map((row) => ({ ...row })),
-      delete: async ({ id, sessionId }) => {
-        calls.push(`schedule:${sessionId}/${id}`);
-        const at = rows.findIndex((row) => row.id === id && row.sessionId === sessionId);
-        if (at === -1) return { id, deleted: false };
+      catalog: async () => rows.map((row) => ({ ...row, target: { ...row.target }, involvedSessionIds: [...row.involvedSessionIds] })),
+      edit: async ({ id, action }) => {
+        const at = rows.findIndex((row) => row.id === id);
+        if (action !== 'delete' || at === -1) return { id, deleted: false };
+        calls.push(`schedule:${rows[at].target.sessionId}/${id}`);
         rows.splice(at, 1);
         return { id, deleted: true };
       },
@@ -793,18 +793,24 @@ async function testGateway(app, workroot) {
         unpinSession: async (id) => { const at = pinned.indexOf(id); if (at !== -1) pinned.splice(at, 1); },
       });
       const rows = [
-        { id: 'r-daily', sessionId: target.parentId, status: 'active', kind: 'daily', title: 'Stand-up', prompt: 'say hi', time: '09:00:00.000', timeZone: 'Asia/Shanghai', scheduledAt: '2099-01-01T01:00:00.000Z' },
-        { id: 'r-at', sessionId: target.parentId, status: 'active', kind: 'at', title: 'Later', prompt: 'ping', scheduledAt: '2099-01-01T00:00:00.000Z' },
-        { id: 'r-old', sessionId: target.parentId, status: 'inactive', kind: 'at', title: 'Done', prompt: 'was', scheduledAt: '2000-01-01T00:00:00.000Z' },
+        { id: 'r-daily', target: { kind: 'session', sessionId: target.parentId }, involvedSessionIds: [target.parentId], status: 'active', kind: 'daily', title: 'Stand-up', prompt: 'say hi', time: '09:00:00.000', timeZone: 'Asia/Shanghai', scheduledAt: '2099-01-01T01:00:00.000Z' },
+        { id: 'r-at', target: { kind: 'session', sessionId: target.parentId }, involvedSessionIds: [target.parentId], status: 'active', kind: 'at', title: 'Later', prompt: 'ping', scheduledAt: '2099-01-01T00:00:00.000Z' },
+        { id: 'r-old', target: { kind: 'session', sessionId: target.parentId }, involvedSessionIds: [target.parentId], status: 'inactive', kind: 'at', title: 'Done', prompt: 'was', scheduledAt: '2000-01-01T00:00:00.000Z' },
       ];
       hostCtx.provide('schedule', {
-        catalog: async () => rows.map((row) => ({ ...row })),
-        delete: async ({ id, sessionId }) => { const at = rows.findIndex((row) => row.id === id && row.sessionId === sessionId); if (at === -1) return { id, deleted: false }; rows.splice(at, 1); return { id, deleted: true }; },
-        create: async (sessionId, request) => { calls.push(`create:${sessionId}:${JSON.stringify(request)}`); return { id: `new-${String(calls.length)}` }; },
+        catalog: async () => rows.map((row) => ({ ...row, target: { ...row.target }, involvedSessionIds: [...row.involvedSessionIds] })),
+        edit: async ({ id, action }) => {
+          const at = rows.findIndex((row) => row.id === id);
+          if (action !== 'delete' || at === -1) return { id, deleted: false };
+          calls.push(`schedule:${rows[at].target.sessionId}/${id}`);
+          rows.splice(at, 1);
+          return { id, deleted: true };
+        },
+        create: async (request) => { calls.push(`create:${request.target.sessionId}:${JSON.stringify(request)}`); return { id: `new-${String(calls.length)}` }; },
       });
-      // What `stopActivity` does to reminders (dsh-schedule:2273-2292): the active ones go.
+      // What `stopActivity` does to reminders (`dsh-schedule@0.2.2-rc.1:2191-2193,2587-2594`): the active ones go.
       hostCtx.on('workspace/session-stop', ({ sessionId }) => { calls.push(`stop:${sessionId}`); });
-      const stopReminders = (id) => { for (let at = rows.length - 1; at >= 0; at -= 1) if (rows[at].sessionId === id && rows[at].status === 'active') rows.splice(at, 1); };
+      const stopReminders = (id) => { for (let at = rows.length - 1; at >= 0; at -= 1) if (rows[at].target.sessionId === id && rows[at].status === 'active') rows.splice(at, 1); };
       return { calls, archived, pinned, rows, stopReminders };
     };
 
@@ -1292,6 +1298,7 @@ async function testRealTree(app, workroot, { host, manifest, Context, TypertRegi
   for (const name of ['dsh-llm', 'dsh-tools', 'dsh-system-prompt', 'dsh-agent']) await mount(name);
   await mount('dsh-agent-loop', { maxParallelToolCalls: 10, agents: [] });
   await mount('dsh-workspace');
+  await mount('dsh-schedule');
   new TypertRegistry(ctx);
   ctx.typert.register(manifest);
   const gateway = new TypertGatewayService(ctx, {});
@@ -1341,8 +1348,16 @@ async function testRealTree(app, workroot, { host, manifest, Context, TypertRegi
     check('a resident real session is refused', refused.error?.code === 'session-purge/session-live', String(refused.error?.code));
     await live.dispose();
 
+    const reminder = await ctx.schedule.create({
+      title: 'Stand-up',
+      prompt: 'say hi',
+      timing: { kind: 'at', at: new Date(Date.now() + 60 * 60 * 1000).toISOString() },
+      target: { kind: 'session', sessionId: parent },
+    });
+    check('the real Schedule service stores a reminder bound to the target', (await ctx.schedule.catalog()).some((task) => task.id === reminder.id && task.target?.sessionId === parent), JSON.stringify(await ctx.schedule.catalog()));
     const inspection = await attempt('inspect', { sessionId: parent });
     check('the preview finds the real subagent child', inspection.value?.targets?.length === 2 && inspection.value.targets.some((target) => target.sessionId === child), JSON.stringify(inspection.value?.targets?.map((target) => target.sessionId) ?? String(inspection.error)));
+    check('the preview counts the real reminder', inspection.value?.scheduleCount === 1, JSON.stringify(inspection.value?.scheduleCount));
 
     // Read the log the way a cold reader would, before the commit.
     const reader = await ctx.sessionPersistence.open(parent, 'read');
@@ -1355,9 +1370,8 @@ async function testRealTree(app, workroot, { host, manifest, Context, TypertRegi
     check('the real purge removes both sessions', report?.removedIds?.length === 2 && report.failedIds.length === 0, JSON.stringify(report ?? String(purged.error)));
     check('the backend no longer lists them', !(await ctx.sessionPersistence.list()).some((snapshot) => snapshot.header.id === parent || snapshot.header.id === child));
     check('their checkpoints are gone from the table and the disk', table.get(parent) === undefined && table.get(child) === undefined && !existsSync(recordFile(parent)) && !existsSync(recordFile(child)));
-    // The real table and the real Workspace registry are both readable here; only
-    // Schedule is not mounted in this tree.
-    check('with the real table and registry only Schedule stays unverified', report?.outcome === 'verified-with-gaps' && JSON.stringify(report.unverified) === JSON.stringify(['schedule']), JSON.stringify([report?.outcome, report?.unverified]));
+    check('the real purge deletes the reminder bound to the target', (await ctx.schedule.catalog()).length === 0, JSON.stringify(await ctx.schedule.catalog()));
+    check('with the real table, registry, and Schedule all readable the outcome is verified', report?.outcome === 'verified' && report.unverified.length === 0, JSON.stringify([report?.outcome, report?.unverified]));
 
     // The late cold read lands after the purge; the plugin's watcher removes it.
     const deleted = nextChange(parent, 'deleted');
