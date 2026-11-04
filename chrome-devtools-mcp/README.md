@@ -20,6 +20,8 @@
 
 ## 技能
 
+这 7 个技能来自 `chrome-devtools-mcp` 上游包的 `skills/`，不是 dsh 自带；本包只负责随包分发和开关。
+
 | 技能 | 用途 |
 |---|---|
 | `chrome-devtools` | 总览：怎么用这套工具 |
