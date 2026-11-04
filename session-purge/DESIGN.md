@@ -8,7 +8,7 @@
 > 会话冷着就用官方写句柄把它围住再删；活着就登记意图、停活归档，等它冷了再删。
 > 所有"事实"都标了依据；没核实的写成"未实测 / 未核实"。v7 原文保留在 `DESIGN.v7.md` 供对照。
 >
-> 依据记法：`<pkg>:N` = `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/<pkg>/lib/index.js` 第 N 行（历史行号按 dsh 0.2.1-rc.2 记录；0.2.2 的 Schedule 变更见 README 审计段）；
+> 依据记法：`<pkg>:N` = `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/<pkg>/lib/index.js` 第 N 行（历史行号按 dsh 0.2.1-rc.2 记录；0.2.2 的 Schedule 适配以当前代码与源码为准）；
 > `docs:<页>` = <https://deepseek-harness.github.io/deepseek-harness/en/> 下的页面。
 
 ---

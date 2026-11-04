@@ -2,7 +2,7 @@
 
 自用的 **dsh 插件集**：每个插件一个顶层目录，各自是一个可独立安装的组合包（bundle）。
 
-> 非官方项目，与 deepseek-ai 无隶属关系。总览、版本与四种安装方式见 [README.md](README.md)。
+> 非官方项目，与 deepseek-ai 无隶属关系。总览、版本与安装方式见 [README.md](README.md)。
 
 ## 仓库结构
 
@@ -13,7 +13,7 @@
 | `chrome-devtools-mcp/` | 浏览器调试：接入 chrome-devtools-mcp（MCP + 7 个可选技能） |
 | `rea-dsh/` | 逆向工程：接入 REA 的 MCP 服务器（MCP + 1 个可选技能） |
 
-每个插件目录自带 `README.md`，写它自己的设计取舍与踩坑。
+每个插件目录自带 `README.md`，只面向使用、配置与限制；设计取舍与开发过程写在 `DESIGN.md` / `AGENTS.md`，不要混进 README。
 
 ## 硬约定
 
@@ -102,7 +102,7 @@ open "/Applications/DeepSeek Harness.app"
   `mcp-client` 的 `serverName is already in use`（这一秒我们的轮询还没轮到）。不同名则那一瞬间两条
   可以并存，Host 半随后按设置页的值纠正 —— 也才谈得上"把列表里的点击当成切换意图"（写行 +
   `ctx.settings.update(ns, {…})` 把设置页的值也改过去，`ns` 是 profile 条目 id）。
-  本仓库 `chrome-devtools-mcp` 就是这么做的，README 里有那张"两行状态 → 含义 → 处理"的表。
+  本仓库 `chrome-devtools-mcp` 就是这么做的。
 - **profile 的 `cordis.patch.yml` 必须是顶层数组；空文件与纯注释文件都过不了。**（2026-10 实测）
   用 dsh 自己的 schema（`JSON_SCHEMA.extend(JsExpr)`）测：`""`→`undefined`、`"\n"`→`undefined`、
   `"# 注释\n"`→`null`，而 `"[]\n"`→`[]`；`Include.read()` 对非数组直接抛
