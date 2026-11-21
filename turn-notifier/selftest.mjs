@@ -29,8 +29,9 @@
  * fake activity listeners and a fake `AudioContext` that records every chime.
  * It pins the fix for "only the session on screen rings": the entry lives in the
  * root `shell.overlay` slot and a session other than the one on screen rings
- * too, while subagent turns stay silent and near-simultaneous triggers fold into
- * one alert instead of stacking chimes.
+ * too, while subagent turns stay silent, a parent waiting on a working subagent
+ * does not ring, and near-simultaneous triggers fold into one alert instead of
+ * stacking chimes.
  *
  * Nothing outside a temporary directory is written, and nothing in the bundle is
  * touched.
@@ -360,6 +361,7 @@ const SESSION_LIST = Object.freeze({
     C: { id: 'C' },
     D: { id: 'D' },
     S: { id: 'S', origin: 'subagent', parentId: 'A' },
+    T: { id: 'T', origin: 'subagent', parentId: 'S' },
   },
   phase: 'ready',
 });
@@ -375,17 +377,19 @@ const WAITING_HZ = 1046.5;
  * handed the entry, so a component that still filtered by it would stay deaf to
  * every other session and fail the checks below.
  * @param initial - session id → status for the first render.
- * @param options - `hooks: false` drops `useSessionStatus`, `sessions: false` drops `useSessions`.
+ * @param options - `hooks: false` drops `useSessionStatus`, `sessions: false` drops `useSessions`;
+ *   `sessionList` overrides the default row fixture.
  * @returns the booted client plus `publish(statuses)` and `unmount()`.
  */
 async function chimeStory(initial, options = {}) {
   const client = await bootClient();
   const chime = client.entries.find((entry) => entry.options.id === 'turn-notifier-alert');
   let status = new Map(Object.entries(initial));
+  const sessionList = options.sessionList ?? SESSION_LIST;
   const props = () => ({
     sessionId: 'A',
     ...(options.hooks === false ? {} : { useSessionStatus: (selector) => selector(status) }),
-    ...(options.sessions === false ? {} : { useSessions: (selector) => selector(SESSION_LIST) }),
+    ...(options.sessions === false ? {} : { useSessions: (selector) => selector(sessionList) }),
   });
   const view = client.mount(chime.component, props());
   return {
@@ -458,6 +462,41 @@ console.log('\nPart C — the client half watches every session');
   story.publish({ A: busy(), S: asking() });
   check('a subagent waiting for the user still rings',
     story.rings.length === 1 && story.rings[0].frequencies[0] === WAITING_HZ, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), S: busy() });
+  story.publish({ A: idle(), S: busy() });
+  check('a parent finishing while its subagent is still working stays silent',
+    story.rings.length === 0, JSON.stringify(story.rings));
+}
+{
+  const sessionList = {
+    ...SESSION_LIST,
+    byId: { ...SESSION_LIST.byId, S: { ...SESSION_LIST.byId.S, running: true } },
+  };
+  const story = await chimeStory({ A: busy() }, { sessionList });
+  story.publish({ A: idle() });
+  check('a session row reporting a working subagent suppresses its parent finish too',
+    story.rings.length === 0, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), S: idle(), T: busy() });
+  story.publish({ A: idle(), S: idle(), T: busy() });
+  check('a parent with a working nested subagent stays silent',
+    story.rings.length === 0, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), S: busy(), B: busy() });
+  story.publish({ A: busy(), S: busy(), B: idle() });
+  check('an unrelated session finishing while another parent\'s subagent works still rings',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === FINISHED_HZ, JSON.stringify(story.rings));
+}
+{
+  const story = await chimeStory({ A: busy(), S: busy() });
+  story.publish({ A: busy(), S: idle() });
+  story.publish({ A: idle(), S: idle() });
+  check('the parent rings only after its subagent is no longer working',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === FINISHED_HZ, JSON.stringify(story.rings));
 }
 {
   const story = await chimeStory({ A: busy(), B: busy() });

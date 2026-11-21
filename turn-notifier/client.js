@@ -19,7 +19,8 @@
  * without reloading the module. Status signals come from the root
  * `useSessionStatus` standard prop: one map from every session id this window
  * knows to `{ running, pendingInteraction, completionUnread }`. The root
- * `useSessions` prop tells subagent runs apart, whose finished turns stay silent.
+ * `useSessions` prop tells subagent runs apart: their finished turns stay
+ * silent, and a parent waiting on a working subagent is not a finished turn.
  */
 
 // These client.js files are loaded as plain scripts into one shared scope, so a
@@ -494,6 +495,37 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Whether a session has any descendant subagent that is still working.
+     *
+     * A parent's `running` flag can drop while it waits for a subagent to
+     * finish. That is not a completed user-facing turn: the parent will be
+     * woken when the subagent finishes and continue its own turn. Check the
+     * whole descendant chain so nested subagents are covered too.
+     * @param sessionId - parent session to inspect.
+     * @param rows - `useSessions` rows by id, including subagent rows.
+     * @param status - current status map; its running value wins over a stale row.
+     * @returns whether any descendant subagent is currently running.
+     */
+    function hasWorkingSubagent(sessionId, rows, status) {
+      if (rows === undefined) return false;
+      for (const [id, row] of Object.entries(rows)) {
+        if (row?.origin !== 'subagent') continue;
+        let parentId = row.parentId;
+        const seen = new Set();
+        while (parentId !== undefined && !seen.has(parentId)) {
+          if (parentId === sessionId) {
+            const live = status.get(id);
+            if ((live?.running ?? row.running) === true) return true;
+            break;
+          }
+          seen.add(parentId);
+          parentId = rows[parentId]?.parentId;
+        }
+      }
+      return false;
+    }
+
+    /**
      * Which sessions newly need the user between two status snapshots.
      *
      * Only a change seen on both sides counts: a session entering the map (first
@@ -504,10 +536,12 @@ window.__ModuleLoader__.load({
      * @param isSubagent - whether a session id names a subagent run. Its finished
      *   turns are steps of its parent's turn and stay silent; its questions and
      *   approvals still need the user and still ring.
+     * @param hasWorkingSubagent - whether a parent still has a working descendant;
+     *   its running transition is an intermediate wait, not a completed turn.
      * @param wanted - which reasons the settings let ring.
      * @returns session id → reason, the more urgent reason when one session has both.
      */
-    function triggersBetween(before, after, isSubagent, wanted) {
+    function triggersBetween(before, after, isSubagent, hasWorkingSubagent, wanted) {
       const triggers = new Map();
       if (before === undefined || before === after) return triggers;
       for (const [sessionId, status] of after) {
@@ -516,7 +550,9 @@ window.__ModuleLoader__.load({
         const waiting = wanted.interaction
           && status.pendingInteraction !== undefined && previous.pendingInteraction === undefined;
         const finished = wanted.finished
-          && previous.running === true && status.running !== true && !isSubagent(sessionId);
+          && previous.running === true && status.running !== true
+          && !isSubagent(sessionId)
+          && !hasWorkingSubagent(sessionId);
         if (waiting) triggers.set(sessionId, 'interaction');
         else if (finished) triggers.set(sessionId, 'finished');
       }
@@ -648,10 +684,16 @@ window.__ModuleLoader__.load({
             if (playing.causes.size === 0) stopAlert(alertRef);
           }
 
-          const triggers = triggersBetween(before, status, (sessionId) => rows?.[sessionId]?.origin === 'subagent', {
-            interaction: settings.notifyOnWaiting !== false,
-            finished: settings.notifyOnTurnEnd !== false,
-          });
+          const triggers = triggersBetween(
+            before,
+            status,
+            (sessionId) => rows?.[sessionId]?.origin === 'subagent',
+            (sessionId) => hasWorkingSubagent(sessionId, rows, status),
+            {
+              interaction: settings.notifyOnWaiting !== false,
+              finished: settings.notifyOnTurnEnd !== false,
+            },
+          );
           if (triggers.size === 0) return;
           const reason = [...triggers.values()].includes('interaction') ? 'interaction' : 'finished';
           const sessions = [...triggers].filter(([, why]) => why === reason).map(([sessionId]) => sessionId);
