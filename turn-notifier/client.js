@@ -143,11 +143,8 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     // The shell's controls, so this page looks like the rest of the interface
     // instead of hand-rolled buttons. They are *not* a plugin API: dsh's own
-    // authoring guide (`cordis-plugin-development/references/practices.md` in the
-    // agent preset) tells plugins to vendor them, and the 0.2.1 release dropped
-    // `projectUserText` from this package with no deprecation. Keeping the import
-    // is still worth the styling match, but a removed export must never take the
-    // whole surface down — hence the check below and the gate at the page.
+    // authoring guide tells plugins to vendor them. A removed export must never
+    // take the whole surface down — hence the check below and the gate at the page.
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
 
     /** Every primitive this half renders with; checked before the page registers. */
@@ -156,7 +153,7 @@ window.__ModuleLoader__.load({
     const missingPrimitives = REQUIRED_PRIMITIVES.filter((name) => primitives?.[name] === undefined);
     if (missingPrimitives.length > 0) {
       console.error(`[turn-notifier] @deepseek-ai/dsh-client-ui-primitives no longer exports ${missingPrimitives.join(', ')}. `
-        + 'The settings page stays hidden; the chime itself keeps working. See the repo README, "已知的 dsh 侧问题".');
+        + 'The settings page stays hidden; the chime itself keeps working.');
     }
 
     /** Clamp a value into an integer range, falling back when unusable. */
@@ -615,7 +612,7 @@ window.__ModuleLoader__.load({
       if (!statusHookReported) {
         statusHookReported = true;
         console.error('[turn-notifier] the slot supplies no useSessionStatus prop, so the chime cannot fire. '
-          + 'dsh likely renamed it; see the repo README, "已知的 dsh 侧问题".');
+          + 'dsh likely renamed it.');
       }
       return selector(EMPTY_STATUS);
     }
@@ -637,7 +634,7 @@ window.__ModuleLoader__.load({
       if (!sessionsHookReported) {
         sessionsHookReported = true;
         console.error('[turn-notifier] the slot supplies no useSessions prop, so subagent runs cannot be told apart; '
-          + 'their finished turns and a parent waiting on them may chime too. dsh likely renamed it; see the repo README, "已知的 dsh 侧问题".');
+          + 'their finished turns and a parent waiting on them may chime too. dsh likely renamed it.');
       }
       return selector(EMPTY_SESSIONS);
     }

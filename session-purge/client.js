@@ -41,11 +41,8 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     // The shell's controls, so these entries look like the rest of the session
     // list instead of hand-rolled ones. They are *not* a plugin API: dsh's own
-    // authoring guide (`cordis-plugin-development/references/practices.md` in the
-    // agent preset) tells plugins to vendor them, and the 0.2.1 release dropped
-    // `projectUserText` from this package with no deprecation. Keeping the import
-    // is still worth the styling match, but a removed export must never take the
-    // whole surface down — hence the check below and the gate in `apply`.
+    // authoring guide tells plugins to vendor them. A removed export must never
+    // take the whole surface down — hence the check below and the gate in `apply`.
     const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
 
     /** Every primitive this half renders with; checked before any entry registers. */
@@ -54,7 +51,7 @@ window.__ModuleLoader__.load({
     const missingPrimitives = REQUIRED_PRIMITIVES.filter((name) => primitives?.[name] === undefined);
     if (missingPrimitives.length > 0) {
       console.error(`[session-purge] @deepseek-ai/dsh-client-ui-primitives no longer exports ${missingPrimitives.join(', ')}. `
-        + 'The session-row delete entries stay hidden; the Host half keeps running. See the repo README, "已知的 dsh 侧问题".');
+        + 'The session-row delete entries stay hidden; the Host half keeps running.');
     }
 
     /** This bundle's package name: the browser module id and the Remote package id. */

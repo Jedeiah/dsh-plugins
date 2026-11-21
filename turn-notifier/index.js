@@ -1,9 +1,9 @@
 import z from '@deepseek-ai/schemastery';
 
 /*
- * Imported through `import()` rather than a static import: measured on dsh
- * 0.2.0-rc.2, a static import of a dsh package inside a profile-linked bundle can
- * fail to resolve, and the loader then reports only "failed to import".
+ * Imported through `import()` rather than a static import: inside a profile-linked
+ * bundle a static import of a dsh package can fail to resolve, and the loader
+ * then reports only "failed to import".
  */
 let TypertRemoteService;
 try {

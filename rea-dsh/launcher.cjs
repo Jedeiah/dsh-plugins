@@ -129,10 +129,10 @@ function resolveSpec(explicit) {
 /**
  * Bundled `pnpm.mjs` locations inside one resources root, best first.
  *
- * dsh 0.2.1 moved the desktop payload out of a flat `runtime/` into a versioned
- * `runtime/primary-runtime/dependencies/`; 0.2.0 and earlier used the flat path.
- * Both are probed, so one bundle serves either installation. The node candidate
- * list below already carried both shapes — only pnpm's was left behind.
+ * The desktop payload has lived in both a flat `runtime/` and a versioned
+ * `runtime/primary-runtime/dependencies/` layout. Both are probed, so one bundle
+ * serves either installation. The node candidate list below already carried both
+ * shapes — only pnpm's was left behind.
  * @param root - a candidate `…/Contents/Resources`.
  * @returns candidate absolute paths, newest layout first.
  */

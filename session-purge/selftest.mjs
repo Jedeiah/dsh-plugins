@@ -85,8 +85,8 @@ console.log('\nPart 0 — the package manifest\'s display resources');
 {
   const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'));
   const exported = manifest.exports ?? {};
-  // dsh 0.2.1 reads display text from the exported locale JSON and the icon from
-  // an exported resource (`<package>/icon`), without activating the plugin. The
+  // dsh reads display text from the exported locale JSON and the icon from an
+  // exported resource (`<package>/icon`), without activating the plugin. The
   // top-level `icon` field still wins, but it is the legacy spelling.
   check('exports the locale dictionaries', exported['./locale/*.json'] === './locale/*.json');
   check('exports the icon at ./icon', exported['./icon'] === './icon.svg', String(exported['./icon']));
@@ -434,9 +434,9 @@ async function testGateway(app, workroot) {
   const { Context } = await import(join(app, 'cordis', 'lib', 'index.js'));
   const { TypertRegistry } = await import(join(app, 'dsh-typert-registry', 'lib', 'index.js'));
   const { TypertGatewayService } = await import(join(app, 'dsh-api-gateway', 'lib', 'index.js'));
-  // 0.2.1 made every Remote call name its Peer: `prepareInvocation` reads
-  // `request.peer.signal` and `.principal`, and the Gateway no longer falls back
-  // to an operator peer (0.2.0 called `request.peer ?? this.operatorPeer()`).
+  // Every Remote call must name its Peer: `prepareInvocation` reads
+  // `request.peer.signal` and `.principal`, and the Gateway does not fall back
+  // to an operator peer.
   const { Peer } = await import(join(app, 'dsh-client-connection', 'lib', 'index.js'));
   const { validateTypertManifest } = await import(join(app, 'dsh-typert-loader', 'lib', 'index.js'));
   const host = await import(join(bundle, 'index.js'));
@@ -808,7 +808,7 @@ async function testGateway(app, workroot) {
         },
         create: async (request) => { calls.push(`create:${request.target.sessionId}:${JSON.stringify(request)}`); return { id: `new-${String(calls.length)}` }; },
       });
-      // What `stopActivity` does to reminders (`dsh-schedule@0.2.2-rc.1:2191-2193,2587-2594`): the active ones go.
+      // What `stopActivity` does to reminders (current `dsh-schedule`): the active ones go.
       hostCtx.on('workspace/session-stop', ({ sessionId }) => { calls.push(`stop:${sessionId}`); });
       const stopReminders = (id) => { for (let at = rows.length - 1; at >= 0; at -= 1) if (rows[at].target.sessionId === id && rows[at].status === 'active') rows.splice(at, 1); };
       return { calls, archived, pinned, rows, stopReminders };

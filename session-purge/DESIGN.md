@@ -8,7 +8,7 @@
 > 会话冷着就用官方写句柄把它围住再删；活着就登记意图、停活归档，等它冷了再删。
 > 所有"事实"都标了依据；没核实的写成"未实测 / 未核实"。v7 原文保留在 `DESIGN.v7.md` 供对照。
 >
-> 依据记法：`<pkg>:N` = `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/<pkg>/lib/index.js` 第 N 行（历史行号按 dsh 0.2.1-rc.2 记录；0.2.2 的 Schedule 适配以当前代码与源码为准）；
+> 依据记法：`<pkg>:N` = `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/<pkg>/lib/index.js` 第 N 行（行号仅作定位，实际以当前安装源码为准）；
 > `docs:<页>` = <https://deepseek-harness.github.io/deepseek-harness/en/> 下的页面。
 
 ---
@@ -93,7 +93,7 @@ dsh 的会话日志是只追加的，`seam 无删除接口`（`dsh-session-persi
 | `workspace.record.sessionIds`（原始记录） | **内部字段** | `dsh-workspace:79` | 只用于 verify，缺失记 `unverified: ['workspace-raw']` |
 | `ctx.storageDomain.get('session_projcache').table('sessions')` | **文档化的诊断入口** | `docs:reference/subsystems/storage`（"get(name) is an untyped diagnostic lookup"）；域名 `dsh-session-projection-cache:90`；表句柄稳定 `dsh-storage-domain:187-191` | 退回删文件 + 墓碑复检，告警 |
 | `domain/changed` 事件 | 公开 | `docs:reference/subsystems/storage`（"strictly after the backend acknowledged durability … in write-chain order"） | 墓碑监听不可用，只剩启动复检，告警 |
-| `schedule.catalog / edit / create` | 公开 Host 方法 | `docs:reference/subsystems/schedule`；`dsh-schedule@0.2.2-rc.1:2233`、`:2297`、`:2387` | 提醒域记 `unverified` |
+| `schedule.catalog / edit / create` | 公开 Host 方法 | `docs:reference/subsystems/schedule`；`dsh-schedule` 的 `catalog` / `edit` / `create` | 提醒域记 `unverified` |
 | `agent/disposed` 事件 | 公开 | `docs:reference/subsystems/core`（"Disposal removes the agent from the registry and emits agent/disposed"） | 延期路径只在启动时推进 |
 | `node-addon-system/flock` 的 `tryLockExclusive` | 公开子路径；但 `session.lock` 协议是 jsonl 后端内部的 | `node-addon-system/package.json` `exports`；协议 `dsh-session-persistence-jsonl:617-646` | 只用于"日志读不出"的后备路径（§6.3） |
 | spill 目录名 `session-<sha256(id)[:12]>` | 内部约定 | `dsh-spill-local:70` | spill 域记 `unverified` |
@@ -146,7 +146,7 @@ wait     : 监听 agent/disposed（目标 id）→ 尝试立即路径；每次�
 
 - **为什么要归档并停活**：用户已确认删除，不该让它继续跑、继续写新内容、继续被提醒唤醒。
   归档集正是 provider 的 `agent/pre-step` 闸门读的东西，停请求诱发的唤醒都会被挡住（`dsh-workspace:512-524` 注释）。
-- **代价写在明处**：`stopActivity` 会让 schedule 把该会话所有 `active` 提醒直接删掉（`dsh-schedule@0.2.2-rc.1:2191-2193`、`:2587-2594`）；
+- **代价写在明处**：`stopActivity` 会让 schedule 把该会话所有 `active` 提醒直接删掉（`dsh-schedule` 的 `stopActivity` 行为）；
   归档先持久化、再清置顶、最后才发停请求，失败不回滚（`dsh-workspace:527-541`）。
 - **取消**（只有 `PENDING` 可取消）：`unarchiveSession` → `pinSession`（必须在 unarchive 之后，
   否则抛 `WorkspaceArchivedSessionPinError`，`dsh-workspace:581`）→ 用 prior 快照经 `schedule.create({ title, prompt, timing, target })` 重建提醒。
@@ -273,7 +273,7 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 |---|---|---|
 | 工作区记账 | 对**原始记录或过滤视图里含该 id** 的工作区调用 `detachSession(id)`；再 `unarchiveSession(id)`、`unpinSession(id)` | `detachSession` 改原始记录且幂等（`dsh-workspace:148-152`）；只看过滤视图 `sessionIds`（`:102-104`）会漏掉日志已删、索引已忘的槽位；但也**不能**对每个工作区无条件调用——每次变更都会顺手修剪该工作区里所有失效的槽位（`:176-180`），无条件调用等于替别的会话做了一次修剪；unarchive/unpin 对已不存在的 id 也能用（`:553-562`、`:597-606`） |
 | 投影检查点 | `table.delete(id)`；再删 `<id>.json.bak.*` 这类表不追踪的备份文件 | 与所有写回同一条 FIFO 链，内存与磁盘一起变（`dsh-storage-domain:222-225`、`:264-276`）；拿不到表 → 删文件 + 告警 |
-| 提醒 | `catalog()` 里 `target.sessionId` 等于目标的**所有**行（任何 status）逐条 `edit({ id, action: 'delete' })` | `dsh-schedule@0.2.2-rc.1:2387`；非活跃行还留着投递历史与指令快照（`docs:reference/subsystems/schedule`）——隐私上必须删 |
+| 提醒 | `catalog()` 里 `target.sessionId` 等于目标的**所有**行（任何 status）逐条 `edit({ id, action: 'delete' })` | `dsh-schedule` 的 `edit({ id, action: 'delete' })`；非活跃行还留着投递历史与指令快照（`docs:reference/subsystems/schedule`）——隐私上必须删 |
 | spill | 在本实例活动根与 `discoverDefaultRoots` 发现的根里，只删 `session-<sha256(id)[:12]>` | 目录名由目标 id 精确算出（`dsh-spill-local:70`），不会碰别的实例的会话（I3） |
 | 浏览器状态 | 客户端半边清 `dsh.conversation.<id>` 等键（现有实现） | 广播 `api-session/removed` 只含真正提交的 id |
 | 搜索索引 | 不碰 | 每次搜索前自对账（`dsh-session-query-sqlite` README） |
@@ -415,7 +415,7 @@ POSIX：`flock(<stagingRoot>/.lock, LOCK_EX|LOCK_NB)`，拿不到 → `busy`。W
 
 Windows 两条（持句柄 rename、读者占用导致 `commit-failed`）**需要真机**，自测里标 `skip` 并打印原因。
 
-**已实测的部分（2026-10-18，dsh 0.2.1-rc.2；2026-11-04 复核 dsh 0.2.2-rc.1，macOS）**：标 ✅ 的行在 `selftest.mjs` Part B2 里跑在 dsh **自己的**
+**已实测的部分（2026-11-22，dsh 0.2.2-rc.5，macOS）**：标 ✅ 的行在 `selftest.mjs` Part B2 里跑在 dsh **自己的**
 storage / storage-json / storage-domain / session / session-persistence-jsonl / session-projection-cache / agent / agent-loop 上，
 配置照抄 `dsh-base/cordis.patch.yml`；只有 llm / tools / system-prompt 用的是 dsh 自带的空 hub（resume 在开 turn 之前不调用它们）。
 Part B2 验证的是**dsh 的行为**（设计前提），墓碑监听由测试自带；插件自己的墓碑监听由 Part B3 在真实服务上验证。

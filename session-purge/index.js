@@ -44,9 +44,9 @@ import {
 import * as txn from './txn.js';
 
 /*
- * Imported through `import()` rather than a static import: measured on dsh
- * 0.2.0-rc.2, a static import of a dsh package inside a profile-linked bundle can
- * fail to resolve, and the loader then reports only "failed to import".
+ * Imported through `import()` rather than a static import: inside a profile-linked
+ * bundle a static import of a dsh package can fail to resolve, and the loader
+ * then reports only "failed to import".
  */
 /**
  * How old a directory with no readable header must be before the residue sweep
@@ -1808,7 +1808,7 @@ class SessionPurgeService extends TypertRemoteService {
   /**
    * Read every task bound to the targets through the Schedule service, which
    * owns the durable rows. `catalog()` lists every row whatever its status
-   * (`dsh-schedule@0.2.2-rc.1:2297,2523-2535`); an inactive row still carries
+   * (`dsh-schedule`); an inactive row still carries
    * its delivery history and instruction snapshots, so it is just as much the
    * session's. A row's destination Session is `target.sessionId`; `new` and
    * `new_once` targets keep their involvement separately.
@@ -1975,7 +1975,7 @@ function becameLiveError(ids) {
 /**
  * The Session ids a Schedule catalog row is bound to.
  *
- * `dsh-schedule@0.2.2-rc.1` stores the delivery destination as `target`.
+ * `dsh-schedule` stores the delivery destination as `target`.
  * `involvedSessionIds` also names the acting Session, so it must not be treated
  * as the destination.
  * @param task - a `schedule.catalog()` row.
@@ -2027,7 +2027,7 @@ function reminderTiming(snapshot) {
 /**
  * The `schedule.create` request that recreates a snapshot
  * (`ScheduleCreateRequest`, `docs:reference/subsystems/schedule`; the new
- * signature is read at `dsh-schedule@0.2.2-rc.1:2233`).
+ * signature is read from the current `dsh-schedule` implementation).
  * A one-shot keeps its absolute target; a past one cannot be recreated.
  * @param snapshot - a {@link reminderSnapshot}.
  * @param sessionId - the Session the reminder must deliver to.

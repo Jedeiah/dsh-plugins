@@ -64,8 +64,8 @@ console.log('\nPart 0 — the package manifest\'s display resources');
 {
   const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'));
   const exported = manifest.exports ?? {};
-  // dsh 0.2.1 reads display text from the exported locale JSON and the icon from
-  // an exported resource (`<package>/icon`), without activating the plugin. The
+  // dsh reads display text from the exported locale JSON and the icon from an
+  // exported resource (`<package>/icon`), without activating the plugin. The
   // top-level `icon` field still wins, but it is the legacy spelling.
   check('exports the locale dictionaries', exported['./locale/*.json'] === './locale/*.json');
   check('exports the icon at ./icon', exported['./icon'] === './icon.svg', String(exported['./icon']));

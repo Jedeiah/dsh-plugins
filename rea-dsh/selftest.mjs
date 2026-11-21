@@ -74,8 +74,8 @@ console.log('\nPart 0 — the package manifest\'s display resources');
 {
   const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'));
   const exported = manifest.exports ?? {};
-  // dsh 0.2.1 reads display text from the exported locale JSON and the icon from
-  // an exported resource (`<package>/icon`), without activating the plugin. The
+  // dsh reads display text from the exported locale JSON and the icon from an
+  // exported resource (`<package>/icon`), without activating the plugin. The
   // top-level `icon` field still wins, but it is the legacy spelling.
   check('exports the locale dictionaries', exported['./locale/*.json'] === './locale/*.json');
   check('exports the icon at ./icon', exported['./icon'] === './icon.svg', String(exported['./icon']));
@@ -469,8 +469,8 @@ console.log('\nPart D — one spec source, one launch plan');
       typeof derived === 'string' && derived.endsWith(join('Contents', 'Resources')), String(derived));
     check('the bundled pnpm is found under the derived root',
       typeof launcher.bundledPnpmIn(derived ?? '') === 'string',
-      // 0.2.1 moved it into runtime/primary-runtime/dependencies/pnpm; the probe
-      // accepts either layout, so assert on the resolved path, not one shape.
+      // The bundled pnpm path moved across dsh versions; the probe accepts either
+      // layout, so assert on the resolved path, not one shape.
       String(launcher.bundledPnpmIn(derived ?? '')));
     const withPath = launcher.resolveSpawnPlan({ spec: '6.4.0' });
     const savedPath = process.env.PATH;
