@@ -8,7 +8,7 @@
 
 | 插件 | 作用 | 版本 | 安装 spec |
 |---|---|---|---|
-| **[turn-notifier](turn-notifier/README.md)** | **提示铃**：智能体需要你注意时响铃提醒；点组件行的箭头可设置铃声、音色、音量与重复次数。 | 1.9.1 | `github:Jedeiah/dsh-plugins#path:turn-notifier` |
+| **[turn-notifier](turn-notifier/README.md)** | **提示铃**：智能体需要你注意时响铃提醒；点组件行的箭头可设置铃声、音色、音量与重复次数。 | 1.9.2 | `github:Jedeiah/dsh-plugins#path:turn-notifier` |
 | **[session-purge](session-purge/README.md)** | **删除会话**：在会话列表里添加「删除会话」，把会话真正从磁盘上删掉；点组件行的箭头可设置清理范围。 | 2.0.1 | `github:Jedeiah/dsh-plugins#path:session-purge` |
 | **[chrome-devtools-mcp](chrome-devtools-mcp/README.md)** | **浏览器调试**：接入 chrome-devtools-mcp，让模型能调试真实浏览器；点组件行的箭头可设置技能开关，以及让智能体操作哪个浏览器。 | 1.3.1 | `github:Jedeiah/dsh-plugins#path:chrome-devtools-mcp` |
 | **[rea-dsh](rea-dsh/README.md)** | **逆向工程**：接入 REA 的 MCP 服务器，让模型能逆向分析二进制、应用与网页；技能自动跟随 REA 版本；点组件行的箭头可查看状态与自检、并设置技能开关和版本。 | 1.5.1 | `github:Jedeiah/dsh-plugins#path:rea-dsh` |

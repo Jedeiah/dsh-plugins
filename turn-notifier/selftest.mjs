@@ -356,12 +356,16 @@ const asking = (interaction = { kind: 'approval' }) => ({ running: true, pending
 const SESSION_LIST = Object.freeze({
   ids: ['A', 'B', 'C', 'D'],
   byId: {
-    A: { id: 'A' },
-    B: { id: 'B' },
-    C: { id: 'C' },
-    D: { id: 'D' },
-    S: { id: 'S', origin: 'subagent', parentId: 'A' },
-    T: { id: 'T', origin: 'subagent', parentId: 'S' },
+    A: { id: 'A', running: false },
+    B: { id: 'B', running: false },
+    C: { id: 'C', running: false },
+    D: { id: 'D', running: false },
+    S: { id: 'S', origin: 'subagent', parentId: 'A', running: false },
+    T: { id: 'T', origin: 'subagent', parentId: 'S', running: false },
+  },
+  projectionsBySession: {
+    A: { values: { subagentCatalog: [{ id: 'S', mode: 'continuable', label: 'S' }] } },
+    S: { values: { subagentCatalog: [{ id: 'T', mode: 'continuable', label: 'T' }] } },
   },
   phase: 'ready',
 });
@@ -385,7 +389,7 @@ async function chimeStory(initial, options = {}) {
   const client = await bootClient();
   const chime = client.entries.find((entry) => entry.options.id === 'turn-notifier-alert');
   let status = new Map(Object.entries(initial));
-  const sessionList = options.sessionList ?? SESSION_LIST;
+  let sessionList = options.sessionList ?? SESSION_LIST;
   const props = () => ({
     sessionId: 'A',
     ...(options.hooks === false ? {} : { useSessionStatus: (selector) => selector(status) }),
@@ -397,6 +401,11 @@ async function chimeStory(initial, options = {}) {
     /** Publish a new status map (a new identity, as ui-session does) and re-render. */
     publish(next) {
       status = new Map(Object.entries(next));
+      view.render(props());
+    },
+    /** Publish a new session-list snapshot independently of status. */
+    setSessionList(next) {
+      sessionList = next;
       view.render(props());
     },
     rerender: () => view.render(props()),
@@ -480,10 +489,69 @@ console.log('\nPart C — the client half watches every session');
     story.rings.length === 0, JSON.stringify(story.rings));
 }
 {
+  const sessionList = {
+    ids: ['A', 'F', 'S'],
+    byId: {
+      A: { id: 'A' },
+      F: { id: 'F', parentId: 'A' }, // normal fork, not a subagent
+      S: { id: 'S', origin: 'subagent', parentId: 'F' },
+    },
+    phase: 'ready',
+  };
+  const story = await chimeStory({ A: busy(), S: busy() }, { sessionList });
+  story.publish({ A: idle(), S: busy() });
+  check('a working subagent under a normal fork does not suppress the fork parent\'s finish',
+    story.rings.length === 1 && story.rings[0].frequencies[0] === FINISHED_HZ, JSON.stringify(story.rings));
+}
+{
   const story = await chimeStory({ A: busy(), S: idle(), T: busy() });
   story.publish({ A: idle(), S: idle(), T: busy() });
   check('a parent with a working nested subagent stays silent',
     story.rings.length === 0, JSON.stringify(story.rings));
+}
+{
+  const sessionList = {
+    ids: ['A'],
+    byId: { A: { id: 'A', running: false } },
+    projectionsBySession: {
+      A: { values: { subagentCatalog: [{ id: 'S', mode: 'continuable', label: 'S' }] } },
+    },
+    phase: 'ready',
+  };
+  const story = await chimeStory({ A: busy(), S: busy() }, { sessionList });
+  story.publish({ A: idle(), S: busy() });
+  check('a subagent visible only in the parent catalog suppresses the parent finish',
+    story.rings.length === 0, JSON.stringify(story.rings));
+}
+{
+  const sessionList = {
+    ids: ['A'],
+    byId: { A: { id: 'A', running: false } },
+    projectionsBySession: {
+      A: { values: { subagentCatalog: [{ id: 'S', mode: 'continuable', label: 'S' }] } },
+      S: { values: { subagentCatalog: [{ id: 'T', mode: 'continuable', label: 'T' }] } },
+    },
+    phase: 'ready',
+  };
+  const story = await chimeStory({ A: busy(), T: busy() }, { sessionList });
+  story.publish({ A: idle(), T: busy() });
+  check('a nested subagent visible through catalogs without its middle row suppresses the parent finish',
+    story.rings.length === 0, JSON.stringify(story.rings));
+}
+{
+  const emptyList = {
+    ids: ['A'], byId: { A: { id: 'A', running: false } }, projectionsBySession: {}, phase: 'ready',
+  };
+  const story = await chimeStory({ A: busy() }, { sessionList: emptyList });
+  story.publish({ A: idle() });
+  story.setSessionList({
+    ...emptyList,
+    byId: { A: { id: 'A', running: false }, S: { id: 'S', origin: 'subagent', parentId: 'A', running: true } },
+    projectionsBySession: { A: { values: { subagentCatalog: [{ id: 'S', mode: 'continuable', label: 'S' }] } } },
+  });
+  story.advance(20000);
+  check('a late-arriving working subagent stops an already-playing finished alert',
+    story.rings.length === 1, JSON.stringify(story.rings));
 }
 {
   const story = await chimeStory({ A: busy(), S: busy(), B: busy() });

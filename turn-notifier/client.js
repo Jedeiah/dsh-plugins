@@ -499,27 +499,54 @@ window.__ModuleLoader__.load({
      *
      * A parent's `running` flag can drop while it waits for a subagent to
      * finish. That is not a completed user-facing turn: the parent will be
-     * woken when the subagent finishes and continue its own turn. Check the
-     * whole descendant chain so nested subagents are covered too.
+     * woken when the subagent finishes and continue its own turn. Prefer the
+     * published `subagentCatalog` projections (which preserve the tree even
+     * when an intermediate row is absent), and fall back to `byId` rows when
+     * the snapshot has no projections.
      * @param sessionId - parent session to inspect.
-     * @param rows - `useSessions` rows by id, including subagent rows.
+     * @param sessionList - `useSessions` state: `byId` rows plus projections.
      * @param status - current status map; its running value wins over a stale row.
      * @returns whether any descendant subagent is currently running.
      */
-    function hasWorkingSubagent(sessionId, rows, status) {
-      if (rows === undefined) return false;
+    function hasWorkingSubagent(sessionId, sessionList, status) {
+      if (sessionList === undefined || sessionList === null) return false;
+      const rows = sessionList.byId ?? {};
+      const running = (id, row) => {
+        const live = status?.get(id);
+        return (live?.running ?? row?.running) === true;
+      };
+      const visited = new Set();
+      const visitCatalog = (parentId) => {
+        if (visited.has(parentId)) return false;
+        visited.add(parentId);
+        const catalog = sessionList.projectionsBySession?.[parentId]?.values?.subagentCatalog;
+        if (!Array.isArray(catalog)) return false;
+        for (const child of catalog) {
+          // External subagents have no local Session row and are outside the
+          // local status/list contract.
+          if (child?.mode === 'external') continue;
+          if (running(child.id, rows[child.id])) return true;
+          if (visitCatalog(child.id)) return true;
+        }
+        return false;
+      };
+      if (visitCatalog(sessionId)) return true;
+
+      // Older/synthetic snapshots may carry only byId rows. Walk their parent
+      // links, but stop at normal forks: `parentId` alone is not a subagent edge.
       for (const [id, row] of Object.entries(rows)) {
         if (row?.origin !== 'subagent') continue;
         let parentId = row.parentId;
         const seen = new Set();
         while (parentId !== undefined && !seen.has(parentId)) {
           if (parentId === sessionId) {
-            const live = status.get(id);
-            if ((live?.running ?? row.running) === true) return true;
+            if (running(id, row)) return true;
             break;
           }
           seen.add(parentId);
-          parentId = rows[parentId]?.parentId;
+          const parent = rows[parentId];
+          if (parent == null || parent.origin !== 'subagent') break;
+          parentId = parent.parentId;
         }
       }
       return false;
@@ -609,8 +636,8 @@ window.__ModuleLoader__.load({
     function readNoSessions(selector) {
       if (!sessionsHookReported) {
         sessionsHookReported = true;
-        console.error('[turn-notifier] the slot supplies no useSessions prop, so subagent runs cannot be told apart '
-          + 'and their finished turns chime too. dsh likely renamed it; see the repo README, "已知的 dsh 侧问题".');
+        console.error('[turn-notifier] the slot supplies no useSessions prop, so subagent runs cannot be told apart; '
+          + 'their finished turns and a parent waiting on them may chime too. dsh likely renamed it; see the repo README, "已知的 dsh 侧问题".');
       }
       return selector(EMPTY_SESSIONS);
     }
@@ -618,8 +645,8 @@ window.__ModuleLoader__.load({
     /** Select the whole status map: the chime watches every session, not one. */
     const selectStatusMap = (snapshot) => snapshot;
 
-    /** Select the session rows by id; a row's `origin` marks a subagent run. */
-    const selectSessionRows = (list) => list?.byId;
+    /** Select the whole session list: byId rows and the subagentCatalog projections. */
+    const selectSessionList = (list) => list;
 
     /** Browser-side mirror of `typert.js`; the Gateway reads these descriptors. */
     const TYPERT_REMOTE = {
@@ -659,7 +686,8 @@ window.__ModuleLoader__.load({
         const useStatus = typeof useSessionStatus === 'function' ? useSessionStatus : readEmptyStatus;
         const useRows = typeof useSessions === 'function' ? useSessions : readNoSessions;
         const status = useStatus(selectStatusMap);
-        const rows = useRows(selectSessionRows);
+        const sessionList = useRows(selectSessionList);
+        const rows = sessionList?.byId;
 
         const previous = React.useRef(undefined);
         const alertRef = React.useRef(null);
@@ -679,7 +707,10 @@ window.__ModuleLoader__.load({
           const playing = alertRef.current;
           if (playing !== null) {
             for (const sessionId of playing.causes) {
-              if (!causeHolds(status.get(sessionId), playing.reason)) playing.causes.delete(sessionId);
+              const stillHolds = causeHolds(status.get(sessionId), playing.reason);
+              const waitingOnChild = playing.reason === 'finished'
+                && hasWorkingSubagent(sessionId, sessionList, status);
+              if (!stillHolds || waitingOnChild) playing.causes.delete(sessionId);
             }
             if (playing.causes.size === 0) stopAlert(alertRef);
           }
@@ -688,7 +719,7 @@ window.__ModuleLoader__.load({
             before,
             status,
             (sessionId) => rows?.[sessionId]?.origin === 'subagent',
-            (sessionId) => hasWorkingSubagent(sessionId, rows, status),
+            (sessionId) => hasWorkingSubagent(sessionId, sessionList, status),
             {
               interaction: settings.notifyOnWaiting !== false,
               finished: settings.notifyOnTurnEnd !== false,
@@ -705,7 +736,7 @@ window.__ModuleLoader__.load({
             return;
           }
           startAlert(alertRef, audio, settings, reason, new Set(sessions));
-        }, [status, rows, settings]);
+        }, [status, sessionList, settings]);
 
         React.useEffect(() => () => stopAlert(alertRef), []);
 
